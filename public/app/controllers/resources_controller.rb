@@ -106,7 +106,11 @@ class ResourcesController < ApplicationController
     end
 
     page = Integer(params.fetch(:page, "1"))
-    @results = archivesspace.advanced_search('/search', page, @criteria)
+    @results = if pui_shadow_resource_search_eligible?(params)
+                 archivesspace.shadow_resource_search(repo_id, res_id, pui_shadow_resource_query(params), page, 'page_size' => @criteria['page_size'])
+               else
+                 archivesspace.advanced_search('/search', page, @criteria)
+               end
     if @results['total_hits'].blank? || @results['total_hits'] == 0
       flash[:notice] = I18n.t('search_results.no_results')
       redirect_back(fallback_location: PrefixHelper.app_prefix(res_id))
@@ -137,7 +141,6 @@ class ResourcesController < ApplicationController
       render 'search/search_results'
     end
   end
-
 
   def show
     uri = "/repositories/#{params[:rid]}/resources/#{params[:id]}"
@@ -288,6 +291,40 @@ class ResourcesController < ApplicationController
 
   CONTAINER_QUERY = "types:pui AND types:pui_container"
   DIGITAL_QUERY   = "types:pui AND types:pui_digital_object"
+
+  def pui_shadow_resource_search_eligible?(params)
+    return false unless AppConfig[:pui_shadow_search_sidecar_enabled]
+
+    query = pui_shadow_resource_query(params)
+    return false if query.blank? || query == '*'
+
+    field_values = Array(params.fetch(:field, []))
+    return false unless field_values.empty? || field_values.all? { |field| field.blank? || field == 'keyword' || field == 'title' }
+
+    op_values = Array(params.fetch(:op, []))
+    return false unless op_values.empty? || op_values.all?(&:blank?)
+
+    filter_query_values = Array(params.fetch(:filter_q, []))
+    return false unless filter_query_values.empty? || filter_query_values.one? { |filter_query| filter_query.to_s.strip == query }
+
+    unsupported_arrays = [:from_year, :to_year, :filter_fields, :filter_values, :recordtypes]
+    return false unless unsupported_arrays.all? { |key| Array(params.fetch(key, [])).all?(&:blank?) }
+
+    unsupported_scalars = [:filter_from_year, :filter_to_year, :sort, :limit]
+    return false unless unsupported_scalars.all? { |key| params.fetch(key, '').blank? }
+
+    true
+  end
+
+  def pui_shadow_resource_query(params)
+    query_values = Array(params.fetch(:q, []))
+    filter_query_values = Array(params.fetch(:filter_q, []))
+
+    direct_query = query_values.one? ? query_values.first.to_s.strip : ''
+    return direct_query unless direct_query.blank? || direct_query == '*'
+
+    filter_query_values.one? ? filter_query_values.first.to_s.strip : ''
+  end
 
   def has_containers?(resource_uri)
     qry = "collection_uri_u_sstr:\"#{resource_uri}\" AND (#{CONTAINER_QUERY})"

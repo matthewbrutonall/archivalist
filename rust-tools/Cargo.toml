@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/aspace-client",
+    "crates/aspace-cli"
+]
+resolver = "2"

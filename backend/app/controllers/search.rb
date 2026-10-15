@@ -61,6 +61,11 @@ class ArchivesSpaceService < Sinatra::Base
                 "will be raw Solr field names rather than the extended export's flattened " \
                 "JSONModel property names. Used by the top container CSV export, which " \
                 "needs raw Solr field names.",
+                :optional => true],
+            ["shadow_sidecar",
+                BooleanParam,
+                "If true and backend sidecar is enabled, route eligible simple " \
+                "resource-scoped searches to the shadow search sidecar fast path.",
                 :optional => true])
     .paged(true)
     .permissions([:view_repository])

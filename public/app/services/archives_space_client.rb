@@ -106,6 +106,20 @@ class ArchivesSpaceClient
     SolrResults.new(results, search_opts)
   end
 
+  def shadow_resource_search(repo_id, resource_uri, query, page = 1, search_opts = {})
+    search_opts = DEFAULT_SEARCH_OPTS.merge(search_opts)
+    url = build_url("/repositories/#{repo_id}/search", {
+                      :q => query,
+                      :root_record => resource_uri,
+                      :shadow_sidecar => true,
+                      :page => page,
+                      :page_size => search_opts['page_size']
+                    })
+    results = do_search(url)
+
+    SolrResults.new(results, search_opts)
+  end
+
   def get_types_counts(record_type_list, repo_uri = nil)
     opts = {"record_types[]" => record_type_list}
     opts["repo_uri"] = repo_uri if repo_uri

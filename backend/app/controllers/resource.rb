@@ -1,4 +1,6 @@
 require_relative 'tree_docs'
+require_relative '../model/shadow_resource_tree_waypoint'
+require_relative '../model/shadow_resource_tree_path'
 
 class ArchivesSpaceService < Sinatra::Base
 
@@ -174,7 +176,21 @@ class ArchivesSpaceService < Sinatra::Base
     .permissions([:view_repository])
     .returns([200, TreeDocs::ROOT_DOCS]) \
   do
-    json_response(large_tree_for_resource.root)
+    resource = Resource.get_or_die(params[:id])
+    large_tree = large_tree_for_resource({}, resource)
+
+    if ShadowResourceTreeWaypoint.root_enabled?(params[:published_only])
+      tree = large_tree.root(waypoint_candidate: ShadowResourceTreeWaypoint.method(:root_candidate?)) do |child_count|
+        ShadowResourceTreeWaypoint.fetch_root(repo_id: params[:repo_id],
+                                              resource_id: params[:id],
+                                              child_count: child_count,
+                                              published_only: params[:published_only])
+      end
+    else
+      tree = large_tree.root
+    end
+
+    json_response(tree)
   end
 
   Endpoint.get('/repositories/:repo_id/resources/:id/tree/waypoint')
@@ -194,15 +210,25 @@ class ArchivesSpaceService < Sinatra::Base
     .returns([200, TreeDocs::WAYPOINT_DOCS]) \
   do
     offset = params[:offset]
+    resource = Resource.get_or_die(params[:id])
 
-    parent_id = if params[:parent_node]
-                  JSONModel.parse_reference(params[:parent_node]).fetch(:id)
-                else
-                  # top-level record
-                  nil
-                end
+    shadow_waypoint = ShadowResourceTreeWaypoint.fetch(repo_id: params[:repo_id],
+                                                       resource_id: params[:id],
+                                                       offset: offset,
+                                                       parent_node: params[:parent_node],
+                                                       published_only: params[:published_only])
+    if shadow_waypoint
+      json_response(shadow_waypoint)
+    else
+      parent_id = if params[:parent_node]
+                    JSONModel.parse_reference(params[:parent_node]).fetch(:id)
+                  else
+                    # top-level record
+                    nil
+                  end
 
-    json_response(large_tree_for_resource.waypoint(parent_id, offset))
+      json_response(large_tree_for_resource({}, resource).waypoint(parent_id, offset))
+    end
   end
 
   Endpoint.get('/repositories/:repo_id/resources/:id/tree/node')
@@ -221,8 +247,23 @@ class ArchivesSpaceService < Sinatra::Base
     .returns([200, TreeDocs::NODE_DOCS]) \
   do
     ao_id = JSONModel.parse_reference(params[:node_uri]).fetch(:id)
+    resource = Resource.get_or_die(params[:id])
+    node_record = ArchivalObject.get_or_die(ao_id)
+    large_tree = large_tree_for_resource({}, resource)
 
-    json_response(large_tree_for_resource.node(ArchivalObject.get_or_die(ao_id)))
+    if ShadowResourceTreeWaypoint.node_enabled?(params[:published_only])
+      tree = large_tree.node(node_record, waypoint_candidate: ShadowResourceTreeWaypoint.method(:node_candidate?)) do |child_count|
+        ShadowResourceTreeWaypoint.fetch_node(repo_id: params[:repo_id],
+                                              resource_id: params[:id],
+                                              node_uri: params[:node_uri],
+                                              child_count: child_count,
+                                              published_only: params[:published_only])
+      end
+    else
+      tree = large_tree.node(node_record)
+    end
+
+    json_response(tree)
   end
 
   Endpoint.get('/repositories/:repo_id/resources/:id/tree/node_from_root')
@@ -240,13 +281,20 @@ class ArchivesSpaceService < Sinatra::Base
     .permissions([:view_repository])
     .returns([200, TreeDocs::NODE_FROM_ROOT_DOCS]) \
   do
-    json_response(large_tree_for_resource.node_from_root(params[:node_ids], params[:repo_id]))
+    resource = Resource.get_or_die(params[:id])
+    shadow_paths = ShadowResourceTreePath.fetch(repo_id: params[:repo_id],
+                                                resource_id: params[:id],
+                                                root_title: resource.title,
+                                                node_ids: params[:node_ids],
+                                                published_only: params[:published_only])
+    paths = shadow_paths || large_tree_for_resource({}, resource).node_from_root(params[:node_ids], params[:repo_id])
+    json_response(paths)
   end
 
   private
 
-  def large_tree_for_resource(largetree_opts = {})
-    resource = Resource.get_or_die(params[:id])
+  def large_tree_for_resource(largetree_opts = {}, resource = nil)
+    resource ||= Resource.get_or_die(params[:id])
 
     large_tree = LargeTree.new(resource, {:published_only => params[:published_only]}.merge(largetree_opts))
     large_tree.add_decorator(LargeTreeResource.new)

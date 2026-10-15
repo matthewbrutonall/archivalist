@@ -967,3 +967,17 @@ AppConfig[:iiif_viewer] = 'universal_viewer'
 # Additionally, to be a candidate for embedding in the PUI, the File Version
 # and any parent records must also be published.
 #
+
+# Rust shadow search sidecar integration
+AppConfig[:shadow_search_sidecar_enabled] = false
+AppConfig[:shadow_search_sidecar_url] = "http://127.0.0.1:4570"
+AppConfig[:shadow_search_sidecar_timeout_seconds] = 1
+AppConfig[:pui_shadow_search_sidecar_enabled] = false
+
+# Rust shadow resource tree waypoint integration
+AppConfig[:shadow_resource_tree_sidecar_enabled] = false
+AppConfig[:shadow_resource_tree_sidecar_url] = "http://127.0.0.1:4570"
+AppConfig[:shadow_resource_tree_sidecar_timeout_seconds] = 1
+AppConfig[:shadow_resource_tree_root_min_children] = 200
+AppConfig[:shadow_resource_tree_node_min_children] = 100
+AppConfig[:shadow_resource_tree_path_min_nodes] = 64

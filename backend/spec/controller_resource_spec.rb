@@ -134,6 +134,178 @@ describe 'Resources controller' do
   end
 
 
+  it "serves resource paths from the shadow sidecar adapter" do
+    resource = create(:json_resource, :title => "Resource path root")
+    archival_object = create(:json_archival_object, :resource => {:ref => resource.uri})
+    shadow_paths = {
+      archival_object.id.to_s => [{"node" => nil,
+                                   "root_record_uri" => resource.uri,
+                                   "offset" => 0,
+                                   "jsonmodel_type" => "resource",
+                                   "title" => resource.title,
+                                   "parsed_title" => resource.title}],
+    }
+
+    expect(ShadowResourceTreePath).to receive(:fetch).with(repo_id: resource.uri.split('/')[2].to_i,
+                                                           resource_id: resource.id,
+                                                           root_title: resource.title,
+                                                           node_ids: [archival_object.id],
+                                                           published_only: nil)
+                                                    .and_return(shadow_paths)
+
+    url = URI("#{JSONModel::HTTP.backend_url}#{resource.uri}/tree/node_from_root?node_ids%5B%5D=#{archival_object.id}")
+    result = ASUtils.json_parse(JSONModel::HTTP.get_response(url).body)
+    expect(result).to eq(shadow_paths)
+  end
+
+
+  it "falls back to LargeTree when the shadow path adapter declines the request" do
+    resource = create(:json_resource)
+    archival_object = create(:json_archival_object,
+                             :resource => {:ref => resource.uri},
+                             :title => "LargeTree path fallback")
+    expect(ShadowResourceTreePath).to receive(:fetch).and_return(nil)
+
+    url = URI("#{JSONModel::HTTP.backend_url}#{resource.uri}/tree/node_from_root?node_ids%5B%5D=#{archival_object.id}")
+    result = ASUtils.json_parse(JSONModel::HTTP.get_response(url).body)
+    expect(result[archival_object.id.to_s].first['root_record_uri']).to eq(resource.uri)
+  end
+
+
+  it "checks that a resource exists before requesting its shadow path" do
+    expect(ShadowResourceTreePath).not_to receive(:fetch)
+
+    url = URI("#{JSONModel::HTTP.backend_url}/repositories/2/resources/999999999/tree/node_from_root?node_ids%5B%5D=1")
+    response = JSONModel::HTTP.get_response(url)
+    expect(response.code).to eq('404')
+  end
+
+
+  it "injects an eligible shadow waypoint into the resource tree root" do
+    resource = create(:json_resource)
+    archival_object = create(:json_archival_object,
+                             :resource => {:ref => resource.uri})
+    shadow_node = {"uri" => archival_object.uri, "title" => "Shadow root marker"}
+
+    allow(ShadowResourceTreeWaypoint).to receive(:root_enabled?).and_return(true)
+    allow(ShadowResourceTreeWaypoint).to receive(:root_candidate?).and_return(true)
+    expect(ShadowResourceTreeWaypoint).to receive(:fetch_root).with(repo_id: resource.uri.split('/')[2].to_i,
+                                                                    resource_id: resource.id,
+                                                                    child_count: 1,
+                                                                    published_only: nil)
+                                                             .and_return([shadow_node])
+
+    tree = JSONModel::HTTP.get_json("#{resource.uri}/tree/root")
+    expect(tree['precomputed_waypoints']['']['0']).to eq([shadow_node])
+  end
+
+
+  it "falls back to LargeTree when a shadow root waypoint has a stale node count" do
+    resource = create(:json_resource)
+    archival_objects = 2.times.map do
+      create(:json_archival_object, :resource => {:ref => resource.uri})
+    end
+
+    allow(ShadowResourceTreeWaypoint).to receive(:root_enabled?).and_return(true)
+    allow(ShadowResourceTreeWaypoint).to receive(:root_candidate?).and_return(true)
+    allow(ShadowResourceTreeWaypoint).to receive(:fetch_root).and_return([{"uri" => archival_objects.first.uri,
+                                                                           "title" => "Stale shadow marker"}])
+
+    tree = JSONModel::HTTP.get_json("#{resource.uri}/tree/root")
+    waypoint = tree['precomputed_waypoints']['']['0']
+    expect(waypoint.map {|node| node['uri']}).to eq(archival_objects.map(&:uri))
+    expect(waypoint.map {|node| node['title']}).not_to include("Stale shadow marker")
+  end
+
+
+  it "injects an eligible shadow waypoint into a resource tree node" do
+    resource = create(:json_resource)
+    parent = create(:json_archival_object, :resource => {:ref => resource.uri})
+    children = 2.times.map do
+      create(:json_archival_object,
+             :resource => {:ref => resource.uri},
+             :parent => {:ref => parent.uri})
+    end
+    shadow_waypoint = children.map.with_index do |child, index|
+      {"uri" => child.uri, "title" => "Shadow node marker #{index}"}
+    end
+
+    allow(ShadowResourceTreeWaypoint).to receive(:node_enabled?).and_return(true)
+    allow(ShadowResourceTreeWaypoint).to receive(:node_candidate?).and_return(true)
+    expect(ShadowResourceTreeWaypoint).to receive(:fetch_node).with(repo_id: resource.uri.split('/')[2].to_i,
+                                                                    resource_id: resource.id,
+                                                                    node_uri: parent.uri,
+                                                                    child_count: 2,
+                                                                    published_only: nil)
+                                                             .and_return(shadow_waypoint)
+
+    tree = JSONModel::HTTP.get_json("#{resource.uri}/tree/node", :node_uri => parent.uri)
+    expect(tree['precomputed_waypoints'][parent.uri]['0']).to eq(shadow_waypoint)
+  end
+
+
+  it "falls back to LargeTree when a shadow node waypoint has a stale node count" do
+    resource = create(:json_resource)
+    parent = create(:json_archival_object, :resource => {:ref => resource.uri})
+    children = 2.times.map do
+      create(:json_archival_object,
+             :resource => {:ref => resource.uri},
+             :parent => {:ref => parent.uri})
+    end
+
+    allow(ShadowResourceTreeWaypoint).to receive(:node_enabled?).and_return(true)
+    allow(ShadowResourceTreeWaypoint).to receive(:node_candidate?).and_return(true)
+    allow(ShadowResourceTreeWaypoint).to receive(:fetch_node).and_return([{"uri" => children.first.uri,
+                                                                           "title" => "Stale shadow marker"}])
+
+    tree = JSONModel::HTTP.get_json("#{resource.uri}/tree/node", :node_uri => parent.uri)
+    waypoint = tree['precomputed_waypoints'][parent.uri]['0']
+    expect(waypoint.map {|node| node['uri']}).to eq(children.map(&:uri))
+    expect(waypoint.map {|node| node['title']}).not_to include("Stale shadow marker")
+  end
+
+
+  it "serves an eligible resource waypoint from the shadow sidecar adapter" do
+    resource = create(:json_resource)
+    repo_id = resource.uri.split('/')[2].to_i
+    shadow_waypoint = [{"uri" => "/repositories/#{repo_id}/archival_objects/999999",
+                        "title" => "Shadow waypoint marker"}]
+
+    expect(ShadowResourceTreeWaypoint).to receive(:fetch).with(repo_id: repo_id,
+                                                               resource_id: resource.id,
+                                                               offset: 0,
+                                                               parent_node: nil,
+                                                               published_only: nil)
+                                                        .and_return(shadow_waypoint)
+
+    waypoint = JSONModel::HTTP.get_json("#{resource.uri}/tree/waypoint", :offset => 0)
+    expect(waypoint).to eq(shadow_waypoint)
+  end
+
+
+  it "falls back to LargeTree when the shadow waypoint adapter declines the request" do
+    resource = create(:json_resource)
+    archival_object = create(:json_archival_object,
+                             :resource => {:ref => resource.uri},
+                             :title => "LargeTree fallback marker")
+
+    expect(ShadowResourceTreeWaypoint).to receive(:fetch).and_return(nil)
+
+    waypoint = JSONModel::HTTP.get_json("#{resource.uri}/tree/waypoint", :offset => 0)
+    expect(waypoint.first['uri']).to eq(archival_object.uri)
+    expect(waypoint.first['title']).to eq("LargeTree fallback marker")
+  end
+
+
+  it "checks that a resource exists before requesting its shadow waypoint" do
+    expect(ShadowResourceTreeWaypoint).not_to receive(:fetch)
+
+    url = URI("#{JSONModel::HTTP.backend_url}/repositories/2/resources/999999999/tree/waypoint?offset=0")
+    response = JSONModel::HTTP.get_response(url)
+    expect(response.code).to eq('404')
+  end
+
+
   it "lets you create a resource with a subject" do
 
     vocab = create(:json_vocabulary)

@@ -81,67 +81,108 @@ class LargeTree
     filter
   end
 
-  def root
-    DB.open do |db|
-      child_count = db[@node_table]
-                    .filter(:root_record_id => @root_record.id,
-                            :parent_id => nil)
-                    .filter(published_filter)
-                    .count
+  def root(precomputed_waypoint = nil, child_count = nil, waypoint_candidate: nil, &waypoint_loader)
+    candidate_child_count = nil
 
+    response = DB.open do |db|
+      child_count ||= count_root_children(db)
 
-      # ANW-617: generate a slugged URL for inclusion in the JSON for the root node that's being returned to the LargeTree JS so it can be used in place of the URIs if needed.
-      digital_instance = relates_digital_instance?(@root_type) ? has_digital_instance?(db, @root_table, @root_record.id) : false
-      response = waypoint_response(child_count).merge("title" => @root_record.title,
-                                                      "uri" => @root_record.uri,
-                                                      "slugged_url" => SlugHelpers.get_slugged_url_for_largetree(@root_record.class.to_s, @root_record.repo_id, @root_record.slug),
-                                                      "jsonmodel_type" => @root_table.to_s,
-                                                      "parsed_title" => MixedContentParser.parse(@root_record.title, '/'),
-                                                      "suppressed" => @root_record.suppressed,
-                                                      "has_digital_instance" => digital_instance)
-      @decorators.each do |decorator|
-        response = decorator.root(response, @root_record)
+      if waypoint_candidate && waypoint_loader && waypoint_candidate.call(child_count)
+        candidate_child_count = child_count
+        nil
+      else
+        build_root_response(db, child_count, precomputed_waypoint)
       end
+    end
 
-      precalculate_waypoints(response, nil)
+    return response unless candidate_child_count
+
+    precomputed_waypoint = waypoint_loader.call(candidate_child_count)
+    root(precomputed_waypoint, candidate_child_count)
+  end
+
+  def build_root_response(db, child_count, precomputed_waypoint)
+    # ANW-617: generate a slugged URL for inclusion in the JSON for the root node that's being returned to the LargeTree JS so it can be used in place of the URIs if needed.
+    digital_instance = relates_digital_instance?(@root_type) ? has_digital_instance?(db, @root_table, @root_record.id) : false
+    response = waypoint_response(child_count).merge("title" => @root_record.title,
+                                                    "uri" => @root_record.uri,
+                                                    "slugged_url" => SlugHelpers.get_slugged_url_for_largetree(@root_record.class.to_s, @root_record.repo_id, @root_record.slug),
+                                                    "jsonmodel_type" => @root_table.to_s,
+                                                    "parsed_title" => MixedContentParser.parse(@root_record.title, '/'),
+                                                    "suppressed" => @root_record.suppressed,
+                                                    "has_digital_instance" => digital_instance)
+    @decorators.each do |decorator|
+      response = decorator.root(response, @root_record)
+    end
+
+    if precomputed_waypoint &&
+       (!precomputed_waypoint.is_a?(Array) || precomputed_waypoint.length != [child_count, WAYPOINT_SIZE].min)
+      Log.warn("Shadow resource tree root waypoint count mismatch, falling back to LargeTree")
+      precomputed_waypoint = nil
+    end
+
+    precalculate_waypoints(response, nil, precomputed_waypoint)
+
+    response
+  end
+
+  private :build_root_response
+
+  def node(node_record, waypoint_candidate: nil, &waypoint_loader)
+    candidate_child_count = nil
+
+    response = DB.open do |db|
+      child_count = count_node_children(db, node_record.id)
+
+      response = build_node_response(db, node_record, child_count)
+
+      if waypoint_candidate && waypoint_loader && waypoint_candidate.call(child_count)
+        candidate_child_count = child_count
+      else
+        precalculate_waypoints(response, node_record.id)
+      end
 
       response
     end
-  end
 
-  def node(node_record)
-    DB.open do |db|
-      child_count = db[@node_table]
-                    .filter(:root_record_id => @root_record.id,
-                            :parent_id => node_record.id)
-                    .filter(published_filter)
-                    .count
+    return response unless candidate_child_count
 
-      my_position = node_record.position
-
-      node_position = db[@node_table]
-                      .filter(:root_record_id => @root_record.id,
-                              :parent_id => node_record.parent_id)
-                      .filter(published_filter)
-                      .where { position < my_position }
-                      .count + 1
-
-      digital_instance = relates_digital_instance?(@node_type) ? has_digital_instance?(db, @node_table, node_record.id) : false
-      response = waypoint_response(child_count).merge("title" => node_record.display_string,
-                                                      "uri" => node_record.uri,
-                                                      "position" => node_position,
-                                                      "jsonmodel_type" => @node_table.to_s,
-                                                      "has_digital_instance" => digital_instance)
-
-      @decorators.each do |decorator|
-        response = decorator.node(response, node_record)
-      end
-
-      precalculate_waypoints(response, node_record.id)
-
-      response
+    precomputed_waypoint = waypoint_loader.call(candidate_child_count)
+    if precomputed_waypoint &&
+       (!precomputed_waypoint.is_a?(Array) || precomputed_waypoint.length != [candidate_child_count, WAYPOINT_SIZE].min)
+      Log.warn("Shadow resource tree node waypoint count mismatch, falling back to LargeTree")
+      precomputed_waypoint = nil
     end
+
+    precalculate_waypoints(response, node_record.id, precomputed_waypoint)
+    response
   end
+
+  def build_node_response(db, node_record, child_count)
+    my_position = node_record.position
+
+    node_position = db[@node_table]
+                    .filter(:root_record_id => @root_record.id,
+                            :parent_id => node_record.parent_id)
+                    .filter(published_filter)
+                    .where { position < my_position }
+                    .count + 1
+
+    digital_instance = relates_digital_instance?(@node_type) ? has_digital_instance?(db, @node_table, node_record.id) : false
+    response = waypoint_response(child_count).merge("title" => node_record.display_string,
+                                                    "uri" => node_record.uri,
+                                                    "position" => node_position,
+                                                    "jsonmodel_type" => @node_table.to_s,
+                                                    "has_digital_instance" => digital_instance)
+
+    @decorators.each do |decorator|
+      response = decorator.node(response, node_record)
+    end
+
+    response
+  end
+
+  private :build_node_response
 
   def node_from_root(node_ids, repo_id)
     child_to_parent_map = {}
@@ -296,6 +337,22 @@ class LargeTree
 
   private
 
+  def count_root_children(db)
+    db[@node_table]
+      .filter(:root_record_id => @root_record.id,
+              :parent_id => nil)
+      .filter(published_filter)
+      .count
+  end
+
+  def count_node_children(db, node_id)
+    db[@node_table]
+      .filter(:root_record_id => @root_record.id,
+              :parent_id => node_id)
+      .filter(published_filter)
+      .count
+  end
+
   def digital_instances(db, table, ids)
     published_filter = @published_only ? [1] : [0, 1]
     db[:instance_do_link_rlshp]
@@ -313,14 +370,14 @@ class LargeTree
   # immediate ask us for the first one in the list.  So, let's have the option
   # of sending them back in the initial response for a given node to save it the
   # extra request.
-  def precalculate_waypoints(response, parent_id)
+  def precalculate_waypoints(response, parent_id, precomputed_waypoint = nil)
     response['precomputed_waypoints'] = {}
 
     uri = parent_id ? response['uri'] : ""
 
     if response['waypoints'] > 0
       response['precomputed_waypoints'][uri] ||= {}
-      response['precomputed_waypoints'][uri][0] = waypoint(parent_id, 0)
+      response['precomputed_waypoints'][uri][0] = precomputed_waypoint || waypoint(parent_id, 0)
     end
 
     response

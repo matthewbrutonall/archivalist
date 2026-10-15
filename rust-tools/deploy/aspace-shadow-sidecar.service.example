@@ -1,0 +1,68 @@
+# /etc/systemd/system/aspace-shadow-sidecar.service.example
+#
+# Safe systemd service template for aspace-shadow-sidecar.
+#
+# WARNING: This file is an example template and is NOT installed automatically.
+# DO NOT copy or enable this unit without adapting the paths, user, and group
+# to your actual deployment environment.
+#
+# The sidecar runs strictly read-only against the ArchivesSpace shadow Solr core.
+# It refuses queries targeting the live 'archivesspace' collection.
+#
+# Setup instructions (manual):
+#   1. Build the release binary:
+#      cd /path/to/archivesspace/rust-tools
+#      cargo build --release -p aspace-cli --bin aspace-shadow-sidecar
+#   2. Copy binary to your deployment bin path (e.g. /usr/local/bin/aspace-shadow-sidecar).
+#   3. Adapt User, Group, WorkingDirectory, and ExecStart in this file.
+#   4. Copy this file to /etc/systemd/system/aspace-shadow-sidecar.service
+#   5. Reload and start:
+#      sudo systemctl daemon-reload
+#      sudo systemctl enable --now aspace-shadow-sidecar.service
+
+[Unit]
+Description=ArchivesSpace Shadow Solr Query Sidecar
+Wants=network-online.target
+After=network-online.target
+Documentation=https://github.com/archivesspace/archivesspace
+
+[Service]
+Type=simple
+
+# Adapt User and Group to your system service account (e.g. archivesspace, www-data, or local user)
+User=archivesspace
+Group=archivesspace
+
+# Adapt WorkingDirectory to your deployment directory
+WorkingDirectory=/opt/archivesspace-rust-tools
+
+# Release binary invocation with required arguments:
+# - bind host: 127.0.0.1 (local interface only)
+# - port: 4570
+# - solr-url: http://localhost:8985/solr
+# - collection: archivesspace_shadow
+ExecStart=/usr/local/bin/aspace-shadow-sidecar \
+    --host 127.0.0.1 \
+    --port 4570 \
+    --solr-url http://localhost:8985/solr \
+    --collection archivesspace_shadow
+
+# Fail startup if the process is live but the configured shadow Solr collection
+# cannot be queried. Adapt the curl path if it differs on the target host.
+ExecStartPost=/usr/bin/curl --fail --silent --show-error \
+    --retry 12 --retry-delay 5 --retry-all-errors \
+    http://127.0.0.1:4570/ready
+TimeoutStartSec=75s
+
+# Process lifecycle
+Restart=on-failure
+RestartSec=5s
+
+# Security sandbox directives (adapt as appropriate for target systemd version)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<config>
+  <schemaFactory class="ClassicIndexSchemaFactory"/>
+  <luceneMatchVersion>LATEST</luceneMatchVersion>
+  <dataDir>${solr.data.dir:}</dataDir>
+  <directoryFactory name="DirectoryFactory" class="${solr.directoryFactory:solr.NRTCachingDirectoryFactory}" />
+  <updateHandler class="solr.DirectUpdateHandler2">
+    <autoCommit>
+      <maxDocs>1000</maxDocs>
+      <maxTime>60000</maxTime>
+      <openSearcher>false</openSearcher>
+    </autoCommit>
+  </updateHandler>
+  <query>
+    <maxBooleanClauses>1024</maxBooleanClauses>
+    <filterCache class="solr.CaffeineCache" size="1024" initialSize="512" autowarmCount="0" async="true" />
+    <queryResultCache class="solr.CaffeineCache" size="512" initialSize="512" autowarmCount="128" />
+    <documentCache class="solr.CaffeineCache" size="512" initialSize="512" autowarmCount="0" />
+    <enableLazyFieldLoading>true</enableLazyFieldLoading>
+    <queryResultWindowSize>20</queryResultWindowSize>
+    <queryResultMaxDocsCached>200</queryResultMaxDocsCached>
+    <useColdSearcher>false</useColdSearcher>
+    <maxWarmingSearchers>2</maxWarmingSearchers>
+  </query>
+  <requestDispatcher handleSelect="false">
+    <requestParsers enableRemoteStreaming="true" multipartUploadLimitInKB="2048000" />
+    <httpCaching never304="true" />
+  </requestDispatcher>
+  <requestHandler name="/select" class="solr.SearchHandler">
+    <lst name="defaults">
+      <str name="defType">edismax</str>
+      <str name="echoParams">explicit</str>
+      <int name="rows">10</int>
+      <str name="df">fullrecord</str>
+      <str name="pf">four_part_id^50</str>
+      <str name="bq">primary_type:resource^100</str>
+      <str name="bq">primary_type:accession^100</str>
+      <str name="bq">primary_type:subject^50</str>
+      <str name="bq">primary_type:agent_person^50</str>
+      <str name="bq">primary_type:agent_corporate_entity^30</str>
+      <str name="bq">primary_type:agent_family^30</str>
+    </lst>
+  </requestHandler>
+  <requestHandler name="/update" class="solr.UpdateRequestHandler"></requestHandler>
+  <requestHandler name="/analysis/document" class="solr.DocumentAnalysisRequestHandler" startup="lazy" />
+  <requestHandler name="/analysis/field" startup="lazy" class="solr.FieldAnalysisRequestHandler" />
+  <requestHandler name="/replication" class="solr.ReplicationHandler" startup="lazy" />
+  <queryResponseWriter name="json" class="solr.JSONResponseWriter">
+    <str name="content-type">text/plain; charset=UTF-8</str>
+  </queryResponseWriter>
+  <admin>
+    <defaultQuery>*:*</defaultQuery>
+  </admin>
+  <requestHandler name="/admin/luke" class="org.apache.solr.handler.admin.LukeRequestHandler" />
+  <indexConfig>
+    <lockType>${solr.lock.type:native}</lockType>
+  </indexConfig>
+</config>

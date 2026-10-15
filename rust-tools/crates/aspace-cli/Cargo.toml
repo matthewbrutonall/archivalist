@@ -1,0 +1,17 @@
+[package]
+name = "aspace-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+aspace-client = { path = "../aspace-client" }
+tokio = { version = "1.0", features = ["full"] }
+clap = { version = "4.4", features = ["derive", "env"] }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.151"
+csv = "1.4.0"
+futures = "0.3"
+[dev-dependencies]
+mockito = "1.7.2"

@@ -1,3 +1,5 @@
+require 'net/http'
+require 'uri'
 require_relative 'search_resolver'
 
 class Search
@@ -7,6 +9,11 @@ class Search
     show_published_only = RequestContext.get(:current_username) === User.PUBLIC_USERNAME
 
     Log.debug("backend search received params: #{params.inspect}")
+
+    if shadow_sidecar_eligible?(params, repo_id)
+      sidecar_result = execute_shadow_sidecar_search(params, repo_id)
+      return sidecar_result if sidecar_result
+    end
 
     query = if params[:q]
               Solr::Query.create_keyword_search(params[:q])
@@ -232,6 +239,141 @@ class Search
         page +=1
       end
     end
+  end
+
+  def self.param_get(params, key)
+    params[key] || params[key.to_s]
+  end
+
+  def self.shadow_sidecar_eligible?(params, repo_id)
+    return false unless repo_id
+
+    return false unless AppConfig.has_key?(:shadow_search_sidecar_enabled) && AppConfig[:shadow_search_sidecar_enabled]
+
+    # params[:shadow_sidecar] is true-like OR "true" OR "1" OR "yes"
+    sidecar_flag = param_get(params, :shadow_sidecar)
+    return false unless sidecar_flag == true || %w[true 1 yes].include?(sidecar_flag.to_s.strip.downcase)
+
+    # params[:dt] is absent or "json"
+    dt = param_get(params, :dt).to_s.strip.downcase
+    return false unless dt.empty? || dt == 'json'
+
+    # params[:q] is present and contains a simple keyword string
+    q = param_get(params, :q)
+    return false unless q.is_a?(String) && !q.strip.empty?
+
+    # params[:root_record] is present and is a resource URI like /repositories/:repo_id/resources/:id matching current repo_id
+    root_record = param_get(params, :root_record)
+    return false unless root_record.is_a?(String)
+    match = root_record.match(%r{\A/repositories/(\d+)/resources/\d+\z})
+    return false unless match && match[1] == repo_id.to_s
+
+    # params[:aq], params[:filter], params[:filter_query], params[:facet], params[:resolve], params[:hl], params[:exclude] are absent/empty
+    [:aq, :filter, :filter_query, :facet, :resolve, :hl, :exclude].each do |param_key|
+      val = param_get(params, param_key)
+      next if val.nil?
+
+      if val.respond_to?(:empty?)
+        return false unless val.empty?
+      else
+        return false
+      end
+    end
+
+    true
+  end
+
+  def self.execute_shadow_sidecar_search(params, repo_id)
+    base_url = (AppConfig[:shadow_search_sidecar_url] || 'http://127.0.0.1:4570').to_s.chomp('/')
+    sidecar_uri = URI.parse("#{base_url}/shadow/search")
+
+    page_val = param_get(params, :page)
+    page_size_val = param_get(params, :page_size)
+
+    page = [page_val.to_i, 1].max
+    page_size = page_size_val ? page_size_val.to_i : (AppConfig[:default_page_size] || 10).to_i
+    page_size = 10 if page_size <= 0
+
+    start = (page - 1) * page_size
+    rows = page_size
+
+    query_params = {
+      'q' => param_get(params, :q).to_s.strip,
+      'resource_uri' => param_get(params, :root_record).to_s.strip,
+      'start' => start.to_s,
+      'rows' => rows.to_s
+    }
+    sidecar_uri.query = URI.encode_www_form(query_params)
+
+    timeout = (AppConfig[:shadow_search_sidecar_timeout_seconds] || 1).to_f
+    timeout = 1.0 if timeout <= 0
+
+    req = Net::HTTP::Get.new(sidecar_uri.request_uri)
+
+    res = ASHTTP.start_uri(sidecar_uri, :open_timeout => timeout, :read_timeout => timeout) do |http|
+      http.request(req)
+    end
+
+    return nil unless res && res.code.to_s =~ /\A2\d\d\z/
+
+    data = ASUtils.json_parse(res.body)
+    return nil unless data.is_a?(Hash) && data['num_found'] && data['docs'].is_a?(Array)
+
+    transform_sidecar_search_response(data, page, page_size, start)
+  rescue StandardError => e
+    Log.warn("Shadow search sidecar request failed, falling back to Solr search: #{e.class} - #{e.message}")
+    nil
+  end
+
+  def self.transform_sidecar_search_response(data, page, page_size, start)
+    num_found = data['num_found'].to_i
+    last_page = (num_found / page_size.to_f).ceil
+
+    results = (data['docs'] || []).map do |doc|
+      next unless doc.is_a?(Hash)
+
+      uri = doc['id']
+      title = doc['title'] || doc['display_string']
+      display_string = doc['display_string'] || doc['title']
+
+      item = {
+        'uri' => uri,
+        'title' => title,
+        'primary_type' => 'archival_object'
+      }
+
+      item['resource'] = doc['resource_uri'] if doc['resource_uri']
+      item['display_string'] = doc['display_string'] if doc.key?('display_string')
+      item['parent_uri'] = doc['parent_uri'] if doc.key?('parent_uri')
+      item['ancestor_uris'] = doc['ancestor_uris'] if doc.key?('ancestor_uris')
+      item['ancestor_levels'] = doc['ancestor_levels'] if doc.key?('ancestor_levels')
+      item['date_expressions'] = doc['date_expressions'] if doc.key?('date_expressions')
+
+      json_record = {
+        'jsonmodel_type' => 'archival_object',
+        'uri' => uri,
+        'title' => title,
+        'display_string' => display_string
+      }
+      json_record['resource'] = { 'ref' => doc['resource_uri'] } if doc['resource_uri']
+      item['json'] = json_record
+
+      item
+    end.compact
+
+    offset_first = num_found.zero? ? 0 : start + 1
+    offset_last = num_found.zero? ? 0 : [start + page_size, num_found].min
+
+    {
+      'page_size' => page_size,
+      'first_page' => 1,
+      'last_page' => last_page,
+      'this_page' => page,
+      'offset_first' => offset_first,
+      'offset_last' => offset_last,
+      'total_hits' => num_found,
+      'results' => results
+    }
   end
 
 end
