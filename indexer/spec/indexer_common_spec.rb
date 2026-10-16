@@ -26,6 +26,26 @@ describe "indexer common" do
 
   describe "Mapping JSONModel(:type) records to documents for Solr" do
 
+    it "falls back to the native document builder when the Rust builder is unavailable" do
+      values = {
+        'title' => 'Fallback record',
+        'publish' => true,
+        'system_generated' => false,
+      }
+      prepared = [{
+        :uri => '/repositories/2/resources/7',
+        :record_type => 'resource',
+        :values => values,
+      }]
+      allow(indexer).to receive(:rust_index_document_builder_enabled?).and_return(true)
+      allow_any_instance_of(RustIndexDocumentBuilder).to receive(:build).and_raise(Errno::ECONNREFUSED)
+
+      expect(indexer.rust_index_documents(prepared)).to be_nil
+      fallback = indexer.native_index_document(prepared[0][:uri], prepared[0][:record_type], values)
+      expect(fallback['publish']).to be(true)
+      expect(fallback['primary_type']).to eq('resource')
+    end
+
     it "creates published-only versions of 'fullrecord' and 'notes' index fields" do
       allow(IndexBatch).to receive(:new) { [] }
 

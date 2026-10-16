@@ -6,8 +6,9 @@
 # DO NOT copy or enable this unit without adapting the paths, user, and group
 # to your actual deployment environment.
 #
-# The sidecar runs strictly read-only against the ArchivesSpace shadow Solr core.
-# It refuses queries targeting the live 'archivesspace' collection.
+# The sidecar is read-only against Solr and prepares index documents for Ruby.
+# It refuses queries targeting the live 'archivesspace' collection and never writes
+# to either Solr or the ArchivesSpace database.
 #
 # Setup instructions (manual):
 #   1. Build the release binary:
@@ -21,7 +22,7 @@
 #      sudo systemctl enable --now aspace-shadow-sidecar.service
 
 [Unit]
-Description=Archivalist Rust Shadow Solr Query Sidecar
+Description=Archivalist Rust Acceleration Sidecar
 Wants=network-online.target
 After=network-online.target
 Documentation=https://github.com/matthewbrutonall/archivalist

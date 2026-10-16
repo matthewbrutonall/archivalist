@@ -17,10 +17,14 @@ pub const DEFAULT_SHADOW_COLLECTION: &str = "archivesspace_shadow";
 /// Default Solr base URL.
 pub const DEFAULT_SOLR_URL: &str = "http://localhost:8985/solr";
 
+/// Bound request memory while allowing realistic indexer batches.
+pub const MAX_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_HTTP_HEADER_BYTES: usize = 32 * 1024;
+
 #[derive(Parser, Debug)]
 #[command(name = "aspace-shadow-sidecar")]
 #[command(
-    about = "Long-running read-only HTTP sidecar prototype for ArchivesSpace shadow Solr queries"
+    about = "Long-running HTTP sidecar for ArchivesSpace shadow queries and index preparation"
 )]
 struct SidecarArgs {
     /// Port to listen on.
@@ -203,19 +207,21 @@ pub enum SidecarRoute<'a> {
     Search(&'a str),
     ResourceTreeWaypoint(&'a str),
     ResourceTreeNodeFromRoot(&'a str),
+    IndexDocuments,
     NotFound(&'a str),
 }
 
 pub fn route_request<'a>(method: &str, full_path: &'a str) -> Result<SidecarRoute<'a>, String> {
-    if method != "GET" {
-        return Err(format!(
-            "Method '{method}' not allowed; only GET is supported"
-        ));
-    }
     let (path, query_str) = match full_path.split_once('?') {
         Some((p, q)) => (p, q),
         None => (full_path, ""),
     };
+    if method == "POST" && path == "/index/documents" {
+        return Ok(SidecarRoute::IndexDocuments);
+    }
+    if method != "GET" {
+        return Err(format!("Method '{method}' not allowed for '{path}'"));
+    }
     match path {
         "/health" => Ok(SidecarRoute::Health),
         "/ready" => Ok(SidecarRoute::Ready),
@@ -639,26 +645,103 @@ impl Drop for ActiveRequestGuard {
     }
 }
 
-async fn handle_connection(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {
-    let mut buffer = [0u8; 4096];
-    let bytes_read = stream.read(&mut buffer).await?;
-    if bytes_read == 0 {
-        return Ok(());
-    }
-    let _request_guard = ActiveRequestGuard::begin(Arc::clone(&state.metrics));
+#[derive(Debug, PartialEq, Eq)]
+struct HttpRequest {
+    method: String,
+    full_path: String,
+    body: Vec<u8>,
+}
 
-    let request_str = String::from_utf8_lossy(&buffer[..bytes_read]);
-    let mut lines = request_str.lines();
-    let request_line = match lines.next() {
-        Some(line) => line,
-        None => return Ok(()),
+fn find_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn parse_content_length(headers: &str) -> Result<usize> {
+    let mut content_length = None;
+    for line in headers.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+            bail!("Transfer-Encoding is not supported");
+        }
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                bail!("duplicate Content-Length header");
+            }
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .context("invalid Content-Length header")?,
+            );
+        }
+    }
+    Ok(content_length.unwrap_or(0))
+}
+
+async fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>> {
+    let mut bytes = Vec::with_capacity(4096);
+    let header_end = loop {
+        if let Some(position) = find_header_end(&bytes) {
+            break position;
+        }
+        if bytes.len() >= MAX_HTTP_HEADER_BYTES {
+            bail!("HTTP headers exceed {MAX_HTTP_HEADER_BYTES} bytes");
+        }
+        let mut chunk = [0u8; 4096];
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            bail!("connection closed before HTTP headers completed");
+        }
+        bytes.extend_from_slice(&chunk[..read]);
     };
 
+    let headers =
+        std::str::from_utf8(&bytes[..header_end]).context("HTTP headers are not UTF-8")?;
+    let request_line = headers
+        .lines()
+        .next()
+        .context("missing HTTP request line")?;
     let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let full_path = parts.next().unwrap_or("");
+    let method = parts.next().context("missing HTTP method")?.to_string();
+    let full_path = parts.next().context("missing HTTP path")?.to_string();
+    let content_length = parse_content_length(headers)?;
+    if content_length > MAX_HTTP_BODY_BYTES {
+        bail!("HTTP request body exceeds {MAX_HTTP_BODY_BYTES} bytes");
+    }
 
-    let route = match route_request(method, full_path) {
+    let body_start = header_end + 4;
+    let target_length = body_start + content_length;
+    while bytes.len() < target_length {
+        let mut chunk = [0u8; 8192];
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            bail!("connection closed before HTTP request body completed");
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.len() > target_length {
+            bytes.truncate(target_length);
+        }
+    }
+
+    Ok(Some(HttpRequest {
+        method,
+        full_path,
+        body: bytes[body_start..target_length].to_vec(),
+    }))
+}
+
+async fn handle_connection(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {
+    let Some(request) = read_http_request(&mut stream).await? else {
+        return Ok(());
+    };
+    let _request_guard = ActiveRequestGuard::begin(Arc::clone(&state.metrics));
+
+    let route = match route_request(&request.method, &request.full_path) {
         Ok(r) => r,
         Err(err_msg) => {
             let response_body = serde_json::to_string(&ErrorResponse { error: err_msg })?;
@@ -673,6 +756,45 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<AppState>) -> Resul
     };
 
     match route {
+        SidecarRoute::IndexDocuments => {
+            let batch = match serde_json::from_slice::<aspace_client::IndexDocumentBatchRequest>(
+                &request.body,
+            ) {
+                Ok(batch) => batch,
+                Err(err) => {
+                    let response_body = serde_json::to_string(&ErrorResponse {
+                        error: format!("Invalid index document request: {err}"),
+                    })?;
+                    let response = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response_body.len(), response_body
+                    );
+                    stream.write_all(response.as_bytes()).await?;
+                    return Ok(());
+                }
+            };
+            match aspace_client::build_index_document_batch(batch) {
+                Ok(output) => {
+                    let response_body = serde_json::to_string(&output)?;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response_body.len(), response_body
+                    );
+                    stream.write_all(response.as_bytes()).await?;
+                }
+                Err(err) => {
+                    let response_body = serde_json::to_string(&ErrorResponse {
+                        error: format!("Invalid index document batch: {err}"),
+                    })?;
+                    let response = format!(
+                        "HTTP/1.1 422 Unprocessable Entity\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response_body.len(), response_body
+                    );
+                    stream.write_all(response.as_bytes()).await?;
+                }
+            }
+            return Ok(());
+        }
         SidecarRoute::Health => {
             let health = build_health_response(&state.solr_url, &state.collection);
             let response_body = serde_json::to_string(&health)?;
@@ -1646,6 +1768,10 @@ mod tests {
         assert_eq!(route_request("GET", "/ready"), Ok(SidecarRoute::Ready));
         assert_eq!(route_request("GET", "/metrics"), Ok(SidecarRoute::Metrics));
         assert_eq!(
+            route_request("POST", "/index/documents"),
+            Ok(SidecarRoute::IndexDocuments)
+        );
+        assert_eq!(
             route_request("GET", "/shadow/descendants?rows=5"),
             Ok(SidecarRoute::Descendants("rows=5"))
         );
@@ -1677,8 +1803,29 @@ mod tests {
         );
         assert_eq!(
             route_request("POST", "/health"),
-            Err("Method 'POST' not allowed; only GET is supported".to_string())
+            Err("Method 'POST' not allowed for '/health'".to_string())
         );
+        assert_eq!(
+            route_request("GET", "/index/documents"),
+            Ok(SidecarRoute::NotFound("/index/documents"))
+        );
+    }
+
+    #[test]
+    fn test_parse_content_length() {
+        assert_eq!(
+            parse_content_length("POST /index/documents HTTP/1.1\r\nContent-Length: 42").unwrap(),
+            42
+        );
+        assert_eq!(parse_content_length("GET /health HTTP/1.1").unwrap(), 0);
+        assert!(parse_content_length(
+            "POST /index/documents HTTP/1.1\r\nTransfer-Encoding: chunked"
+        )
+        .is_err());
+        assert!(parse_content_length(
+            "POST /index/documents HTTP/1.1\r\nContent-Length: 1\r\ncontent-length: 1"
+        )
+        .is_err());
     }
 
     #[test]

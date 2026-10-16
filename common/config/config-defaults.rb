@@ -984,3 +984,9 @@ AppConfig[:shadow_resource_tree_sidecar_timeout_seconds] = 1
 AppConfig[:shadow_resource_tree_root_min_children] = 200
 AppConfig[:shadow_resource_tree_node_min_children] = 100
 AppConfig[:shadow_resource_tree_path_min_nodes] = 64
+
+# Rust index document preparation. Ruby remains the scheduler, hook runner, and Solr writer.
+AppConfig[:rust_index_document_builder_enabled] = false
+AppConfig[:rust_index_document_builder_url] = "http://127.0.0.1:4570"
+AppConfig[:rust_index_document_builder_timeout_seconds] = 2
+AppConfig[:rust_index_document_builder_max_batch] = 1000

@@ -15,6 +15,7 @@ require_relative 'index_batch'
 require_relative 'indexer_common_config'
 require_relative 'indexer_timing'
 require_relative 'fake_solr_timeout_response'
+require_relative 'rust_index_document_builder'
 
 class IndexerCommon
 
@@ -1253,12 +1254,70 @@ class IndexerCommon
     return json
   end
 
+  def native_index_document(uri, record_type, values)
+    doc = {}
+    doc['id'] = uri
+    doc['uri'] = uri
+    doc['title'] = values['title']
+    doc['primary_type'] = record_type
+    doc['types'] = [record_type]
+    doc['json'] = ASUtils.to_json(values)
+    doc['suppressed'] = values.has_key?('suppressed') && values['suppressed']
+    if doc['suppressed']
+      doc['publish'] = false
+    elsif is_repository_unpublished?(uri, values)
+      doc['publish'] = false
+    elsif values['has_unpublished_ancestor']
+      doc['publish'] = false
+    else
+      doc['publish'] = values.has_key?('publish') && values['publish']
+    end
+    doc['system_generated'] = values.has_key?('system_generated') ? values['system_generated'].to_s : 'false'
+    doc['repository'] = get_record_scope(uri)
+    doc
+  end
+
+  def rust_index_document_builder_enabled?
+    AppConfig.has_key?(:rust_index_document_builder_enabled) &&
+      AppConfig[:rust_index_document_builder_enabled]
+  end
+
+  def rust_index_documents(prepared_records)
+    return nil unless rust_index_document_builder_enabled?
+
+    maximum = (AppConfig[:rust_index_document_builder_max_batch] || 1000).to_i
+    if prepared_records.length > maximum
+      Log.warn("Rust index document builder skipped batch of #{prepared_records.length}; maximum is #{maximum}")
+      return nil
+    end
+
+    inputs = prepared_records.map do |prepared|
+      prepared[:values] = sanitize_json(prepared[:values])
+      prepared[:sanitized] = true
+      {
+        'uri' => prepared[:uri],
+        'record_type' => prepared[:record_type],
+        'repository' => get_record_scope(prepared[:uri]),
+        'record' => prepared[:values],
+      }
+    end
+    builder = RustIndexDocumentBuilder.new(
+      AppConfig[:rust_index_document_builder_url] || 'http://127.0.0.1:4570',
+      AppConfig[:rust_index_document_builder_timeout_seconds] || 2
+    )
+    builder.build(inputs)
+  rescue => error
+    Log.warn("Rust index document builder unavailable; using native indexer: #{error.class}: #{error.message}")
+    nil
+  end
+
   def index_records(records, timing = IndexerTiming.new)
     batch = IndexBatch.new
 
     records = dedupe_by_uri(records)
 
     timing.time_block(:conversion_ms) do
+      prepared_records = []
       records.each do |record|
         values = record['record']
         uri = record['uri']
@@ -1270,26 +1329,24 @@ class IndexerCommon
           next
         end
 
-        doc = {}
+        prepared_records << {
+          :record => record,
+          :values => values,
+          :uri => uri,
+          :record_type => record_type,
+        }
+      end
 
-        doc['id'] = uri
-        doc['uri'] = uri
-        doc['title'] = values['title']
-        doc['primary_type'] = record_type
-        doc['types'] = [record_type]
-        doc['json'] = ASUtils.to_json(sanitize_json(values))
-        doc['suppressed'] = values.has_key?('suppressed') && values['suppressed']
-        if doc['suppressed']
-          doc['publish'] = false
-        elsif is_repository_unpublished?(uri, values)
-          doc['publish'] = false
-        elsif values['has_unpublished_ancestor']
-          doc['publish'] = false
-        else
-          doc['publish'] = values.has_key?('publish') && values['publish']
-        end
-        doc['system_generated'] = values.has_key?('system_generated') ? values['system_generated'].to_s : 'false'
-        doc['repository'] = get_record_scope(uri)
+      rust_documents = rust_index_documents(prepared_records)
+
+      prepared_records.each do |prepared|
+        record = prepared[:record]
+        values = prepared[:values]
+        values = sanitize_json(values) unless prepared[:sanitized]
+        uri = prepared[:uri]
+        record_type = prepared[:record_type]
+        doc = rust_documents && rust_documents[uri]
+        doc ||= native_index_document(uri, record_type, values)
 
         @document_prepare_hooks.each do |hook|
           hook.call(doc, record)

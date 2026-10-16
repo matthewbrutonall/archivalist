@@ -120,8 +120,34 @@ AppConfig[:shadow_resource_tree_path_sidecar_enabled] = true
 This keeps root and nested waypoint responses on LargeTree while accelerating only
 eligible 64–128-node `node_from_root` batches.
 
+## 6. Index-document preparation gate
+
+This gate changes only preparation of the common document envelope. Ruby still
+runs every document hook, schedules batches, and writes to Solr. First run the
+contract repeatedly against a representative non-production resource:
+
+```bash
+REPO_ID=2 RESOURCE_ID=18 ADMIN_PASSWORD='canary-password' \
+  scripts/canary_index_document_builder.sh
+```
+
+Then enable only this gate and restart the indexer:
+
+```ruby
+AppConfig[:rust_index_document_builder_enabled] = true
+AppConfig[:rust_index_document_builder_url] = "http://127.0.0.1:4570"
+AppConfig[:rust_index_document_builder_timeout_seconds] = 2
+AppConfig[:rust_index_document_builder_max_batch] = 1000
+```
+
+Reindex a disposable repository and compare its Solr document count and search
+results with the native baseline. Stop the sidecar during one batch and confirm the
+index completes through the native builder with a fallback warning. This flag is
+independent of the search and resource-tree flags.
+
 ## Rollback
 
-Set all four sidecar enable flags to `false` and restart Archivalist. The sidecar
+Set all sidecar enable flags, including `rust_index_document_builder_enabled`, to
+`false` and restart Archivalist. The sidecar
 can then be stopped independently. Do not point the service at the primary Solr
 collection and do not enable these paths by default until the canary gates pass.

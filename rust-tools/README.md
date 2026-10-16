@@ -1,7 +1,7 @@
 # Archivalist Rust Tools
 
-This workspace contains read-only command-line and sidecar tools for validating,
-measuring, and accelerating selected archival-management operations.
+This workspace contains command-line and sidecar tools for validating, measuring,
+and accelerating selected archival-management operations.
 
 ## Components
 
@@ -10,8 +10,8 @@ measuring, and accelerating selected archival-management operations.
   and the `aspace-shadow-sidecar` binary.
 
 The application API remains authoritative. The tools do not write directly to the
-application database, and the sidecar refuses requests targeting the primary
-`archivesspace` Solr collection.
+application database or primary Solr collection. The index-document endpoint only
+returns prepared JSON to the Ruby indexer, which remains the sole Solr writer.
 
 ## Build and test
 
@@ -75,7 +75,7 @@ row counts, and rejects the primary collection before issuing a network request.
 
 ## Sidecar
 
-Start the long-running read-only service with:
+Start the long-running loopback service with:
 
 ```bash
 cargo run -p aspace-cli --bin aspace-shadow-sidecar -- \
@@ -91,6 +91,7 @@ Endpoints:
 - `GET /shadow/descendants`: descendant retrieval with optional tree assembly.
 - `GET /shadow/resource-tree/waypoint`: resource-tree waypoint lookup.
 - `GET /shadow/resource-tree/node-from-root`: batched root-to-node path lookup.
+- `POST /index/documents`: bounded preparation of common Solr document fields.
 
 The example systemd unit in `deploy/` binds to loopback by default. Put authentication
 and transport security in front of the sidecar before exposing it beyond the local
@@ -99,8 +100,9 @@ host.
 Release archives can be built reproducibly with
 `scripts/package_sidecar_release.sh`. See `deploy/CANARY.md` for the staged
 non-production rollout, parity gate, outage fallback test, and rollback procedure.
-The search and resource-tree gates are automated by `scripts/canary_shadow_search.sh`
-and `scripts/canary_resource_tree.sh`.
+The search, resource-tree, and index-document gates are automated by
+`scripts/canary_shadow_search.sh`, `scripts/canary_resource_tree.sh`, and
+`scripts/canary_index_document_builder.sh`.
 
 ## Test and benchmark helpers
 
