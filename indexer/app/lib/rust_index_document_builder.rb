@@ -47,6 +47,28 @@ class RustIndexDocumentBuilder
       raise "response publication mismatch for #{uri}" unless document['publish'] == expected_publish
       expected_generated = record.has_key?('system_generated') ? record['system_generated'].to_s : 'false'
       raise "response system-generated mismatch for #{uri}" unless document['system_generated'] == expected_generated
+      if input['enrich']
+        expected_fields = ['common_metadata', 'fullrecord']
+        unless document['_archivalist_rust_fields'] == expected_fields
+          raise "response enrichment marker mismatch for #{uri}"
+        end
+        required = ['fullrecord_published', 'fullrecord']
+        required.concat(['subjects', 'subject_uris']) if record.has_key?('subjects')
+        if record.has_key?('linked_agents')
+          required.concat(['agents', 'agent_uris', 'published_agents', 'published_agent_uris'])
+        end
+        required.concat(['notes_published', 'notes']) if record.has_key?('notes')
+        required.concat(['dates']) if record.has_key?('dates')
+        required.concat(['level']) if record.has_key?('level')
+        required.concat(['extents']) if record.has_key?('extents')
+        ['created_by', 'last_modified_by', 'user_mtime', 'system_mtime', 'create_time'].each do |field|
+          required << field if record.has_key?(field)
+        end
+        missing = required.uniq.reject {|field| document.has_key?(field)}
+        raise "response enrichment fields missing for #{uri}: #{missing.join(', ')}" unless missing.empty?
+      elsif document.has_key?('_archivalist_rust_fields')
+        raise "unexpected response enrichment marker for #{uri}"
+      end
       result[uri] = document
     end
   end

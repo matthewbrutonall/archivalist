@@ -58,4 +58,27 @@ describe RustIndexDocumentBuilder do
     allow(builder).to receive(:perform_request).and_return(response('503', 'error' => 'offline'))
     expect { builder.build([input]) }.to raise_error(/HTTP 503/)
   end
+
+  it 'rejects an incomplete enrichment response' do
+    input['enrich'] = true
+    document = {
+      'id' => input['uri'],
+      'uri' => input['uri'],
+      'title' => 'Sánchez papers',
+      'primary_type' => 'resource',
+      'types' => ['resource'],
+      'json' => ASUtils.to_json(input['record']),
+      'suppressed' => false,
+      'publish' => true,
+      'system_generated' => 'false',
+      'repository' => 2,
+      '_archivalist_rust_fields' => ['common_metadata', 'fullrecord'],
+    }
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [document])
+    )
+
+    expect { builder.build([input]) }.to raise_error(/enrichment fields missing.*fullrecord_published/)
+  end
 end

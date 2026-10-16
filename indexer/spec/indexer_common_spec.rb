@@ -26,6 +26,16 @@ describe "indexer common" do
 
   describe "Mapping JSONModel(:type) records to documents for Solr" do
 
+    it "partitions published and unpublished note strings in native hook order" do
+      notes = [
+        {'type' => 'abstract', 'publish' => true, 'content' => ['Public abstract']},
+        {'type' => 'scopecontent', 'publish' => false, 'content' => ['Private note']},
+      ]
+      published, unpublished = IndexerCommon.extract_string_values(notes)
+      expect(published).to eq(['abstract', 'Public abstract'])
+      expect(unpublished).to eq(['scopecontent', 'Private note'])
+    end
+
     it "falls back to the native document builder when the Rust builder is unavailable" do
       values = {
         'title' => 'Fallback record',

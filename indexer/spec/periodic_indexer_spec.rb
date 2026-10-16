@@ -174,4 +174,37 @@ describe "periodic indexer" do
       expect(doc.fetch('identifier')).to eq('0123')
     end
   end
+
+  describe "Rust document enrichment" do
+    it "retains Rust fields, skips their native hooks, and removes handoff metadata" do
+      resource = build(:json_resource,
+                       'uri' => '/repositories/2/resources/77',
+                       'title' => 'Rust-enriched resource',
+                       'publish' => true,
+                       'instances' => [],
+                       'notes' => [])
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prepared, documents|
+          doc = indexer.native_index_document(
+            prepared[:uri], prepared[:record_type], prepared[:values]
+          )
+          doc['notes_published'] = ['prepared by Rust']
+          doc['notes'] = ['private Rust text']
+          doc['fullrecord_published'] = ['prepared by Rust']
+          doc['fullrecord'] = ['private Rust text']
+          doc['_archivalist_rust_fields'] = ['common_metadata', 'fullrecord']
+          documents[prepared[:uri]] = doc
+        end
+      end
+
+      indexer.prepare_docs([resource])
+      doc = indexer.records.first
+      expect(doc['notes_published']).to eq(['prepared by Rust'])
+      expect(doc['notes']).to eq(['private Rust text'])
+      expect(doc['fullrecord_published']).to eq(['prepared by Rust'])
+      expect(doc['fullrecord']).to eq(['private Rust text'])
+      expect(doc).not_to have_key('_archivalist_rust_fields')
+    end
+  end
 end

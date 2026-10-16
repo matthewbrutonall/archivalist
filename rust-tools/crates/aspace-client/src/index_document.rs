@@ -10,6 +10,8 @@ pub struct IndexDocumentInput {
     pub record_type: String,
     pub repository: Value,
     pub record: Value,
+    #[serde(default)]
+    pub enrich: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
@@ -73,6 +75,399 @@ fn repository_is_unpublished(record: &Map<String, Value>) -> bool {
         == Some(&Value::Bool(false))
 }
 
+const FULLRECORD_EXCLUDES: &[&str] = &[
+    "created_by",
+    "last_modified_by",
+    "system_mtime",
+    "user_mtime",
+    "json",
+    "types",
+    "create_time",
+    "date_type",
+    "jsonmodel_type",
+    "publish",
+    "extent_type",
+    "language",
+    "script",
+    "system_generated",
+    "suppressed",
+    "source",
+    "rules",
+    "name_order",
+    "repository",
+    "top_container",
+    "finding_aid_filing_title",
+];
+
+fn flatten_array<'a>(value: &'a Value, output: &mut Vec<&'a Value>) {
+    match value {
+        Value::Array(values) => {
+            for item in values {
+                flatten_array(item, output);
+            }
+        }
+        _ => output.push(value),
+    }
+}
+
+fn extract_string_values(value: &Value) -> (Vec<String>, Vec<String>) {
+    let mut published_queue = Vec::new();
+    flatten_array(value, &mut published_queue);
+    let mut unpublished_queue = Vec::new();
+    let mut published_strings = Vec::new();
+    let mut unpublished_strings = Vec::new();
+
+    extract_string_values_phase(
+        &mut published_queue,
+        &mut published_strings,
+        Some(&mut unpublished_queue),
+    );
+    extract_string_values_phase(&mut unpublished_queue, &mut unpublished_strings, None);
+
+    (published_strings, unpublished_strings)
+}
+
+fn extract_string_values_phase<'a>(
+    queue: &mut Vec<&'a Value>,
+    strings: &mut Vec<String>,
+    mut unpublished_queue: Option<&mut Vec<&'a Value>>,
+) {
+    while let Some(node) = queue.pop() {
+        let Some(object) = node.as_object() else {
+            continue;
+        };
+        if unpublished_queue.is_some()
+            && object.contains_key("publish")
+            && object.get("publish") != Some(&Value::Bool(true))
+        {
+            unpublished_queue
+                .as_deref_mut()
+                .expect("unpublished queue checked")
+                .push(node);
+            continue;
+        }
+
+        for (key, child) in object {
+            if FULLRECORD_EXCLUDES.contains(&key.as_str()) || key.ends_with("_enum_s") {
+                continue;
+            }
+            match child {
+                Value::String(value) => strings.push(value.clone()),
+                Value::Object(_) => queue.push(child),
+                Value::Array(_) => {
+                    let mut flattened = Vec::new();
+                    flatten_array(child, &mut flattened);
+                    for item in flattened {
+                        match item {
+                            Value::String(value) => strings.push(value.clone()),
+                            Value::Object(_) => queue.push(item),
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn required_string<'a>(
+    value: Option<&'a Value>,
+    path: &str,
+) -> Result<&'a str, IndexDocumentError> {
+    value
+        .and_then(Value::as_str)
+        .ok_or_else(|| error(format!("field '{path}' must be a string")))
+}
+
+fn add_subjects(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let Some(subjects) = record.get("subjects") else {
+        return Ok(());
+    };
+    let subjects = subjects
+        .as_array()
+        .ok_or_else(|| error("field 'subjects' must be an array"))?;
+    let mut titles = Vec::new();
+    let mut uris = Vec::new();
+    for subject in subjects {
+        let subject = subject
+            .as_object()
+            .ok_or_else(|| error("subjects entries must be objects"))?;
+        if let Some(title) = subject
+            .get("_resolved")
+            .and_then(Value::as_object)
+            .and_then(|resolved| resolved.get("title"))
+            .and_then(Value::as_str)
+        {
+            titles.push(Value::String(title.to_string()));
+        }
+        uris.push(subject.get("ref").cloned().unwrap_or(Value::Null));
+    }
+    document.insert("subjects".to_string(), Value::Array(titles));
+    document.insert("subject_uris".to_string(), Value::Array(uris));
+    Ok(())
+}
+
+fn add_agents(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let Some(agents) = record.get("linked_agents") else {
+        return Ok(());
+    };
+    let agents = agents
+        .as_array()
+        .ok_or_else(|| error("field 'linked_agents' must be an array"))?;
+    let mut titles = Vec::new();
+    let mut uris = Vec::new();
+    let mut published_titles = Vec::new();
+    let mut published_uris = Vec::new();
+    let mut creators = Vec::new();
+    for agent in agents {
+        let agent = agent
+            .as_object()
+            .ok_or_else(|| error("linked_agents entries must be objects"))?;
+        let resolved = agent
+            .get("_resolved")
+            .and_then(Value::as_object)
+            .ok_or_else(|| error("linked_agents entries must contain _resolved"))?;
+        let title = required_string(
+            resolved
+                .get("display_name")
+                .and_then(Value::as_object)
+                .and_then(|display| display.get("sort_name")),
+            "linked_agents._resolved.display_name.sort_name",
+        )?;
+        let uri = agent.get("ref").cloned().unwrap_or(Value::Null);
+        titles.push(Value::String(title.to_string()));
+        uris.push(uri.clone());
+        if resolved.get("publish") == Some(&Value::Bool(true)) {
+            published_titles.push(Value::String(title.to_string()));
+            published_uris.push(uri);
+        }
+        if agent.get("role").and_then(Value::as_str) == Some("creator") {
+            creators.push(Value::String(title.to_string()));
+        }
+    }
+    document.insert("agents".to_string(), Value::Array(titles));
+    document.insert("agent_uris".to_string(), Value::Array(uris));
+    document.insert(
+        "published_agents".to_string(),
+        Value::Array(published_titles),
+    );
+    document.insert(
+        "published_agent_uris".to_string(),
+        Value::Array(published_uris),
+    );
+    if !creators.is_empty() {
+        document.insert("creators".to_string(), Value::Array(creators));
+    }
+    Ok(())
+}
+
+fn leading_year(value: Option<&Value>) -> Option<(u32, usize)> {
+    let value = value?.as_str()?;
+    let digits: String = value
+        .chars()
+        .take(4)
+        .take_while(char::is_ascii_digit)
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        Some((digits.parse().ok()?, digits.len()))
+    }
+}
+
+fn add_dates(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let Some(dates) = record.get("dates") else {
+        return Ok(());
+    };
+    let dates = dates
+        .as_array()
+        .ok_or_else(|| error("field 'dates' must be an array"))?;
+    let mut years = Vec::new();
+    for date in dates {
+        let date = date
+            .as_object()
+            .ok_or_else(|| error("dates entries must be objects"))?;
+        if let Some((begin, begin_width)) = leading_year(date.get("begin")) {
+            let (end, _) = leading_year(date.get("end")).unwrap_or((begin, begin_width));
+            if end >= begin && end - begin <= 10_000 {
+                let width = begin_width;
+                years.extend((begin..=end).map(|year| format!("{year:0width$}")));
+            }
+        }
+    }
+    if !years.is_empty() {
+        years.sort();
+        years.dedup();
+        let first = format!("{:0>4}", years.first().expect("years is not empty"));
+        let last = format!("{:0>4}", years.last().expect("years is not empty"));
+        document.insert(
+            "years".to_string(),
+            Value::Array(years.into_iter().map(Value::String).collect()),
+        );
+        document.insert(
+            "year_sort".to_string(),
+            Value::String(format!("{first}{last}")),
+        );
+    }
+
+    let mut display_dates: Vec<&Value> = dates
+        .iter()
+        .filter(|date| date.get("date_type").and_then(Value::as_str) == Some("inclusive"))
+        .collect();
+    if display_dates.is_empty() {
+        display_dates.extend(dates.iter());
+    }
+    let mut output = Vec::new();
+    for date in display_dates {
+        let date = date.as_object().expect("dates entries validated above");
+        if let Some(expression) = date.get("expression").and_then(Value::as_str) {
+            output.push(Value::String(expression.to_string()));
+        } else if date.get("date_type").and_then(Value::as_str) == Some("single") {
+            output.push(date.get("begin").cloned().unwrap_or(Value::Null));
+        } else if date.get("date_type").is_some_and(|value| !value.is_null()) {
+            let begin = date.get("begin").and_then(Value::as_str).unwrap_or("");
+            let end = date.get("end").and_then(Value::as_str).unwrap_or("");
+            output.push(Value::String(format!("{begin} - {end}")));
+        }
+    }
+    document.insert("dates".to_string(), Value::Array(output));
+    Ok(())
+}
+
+fn add_summary(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let Some(notes) = record.get("notes").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    if let Some(abstract_note) = notes
+        .iter()
+        .find(|note| note.get("type").and_then(Value::as_str) == Some("abstract"))
+    {
+        let content = abstract_note
+            .get("content")
+            .and_then(Value::as_array)
+            .ok_or_else(|| error("abstract note content must be an array"))?;
+        let strings = content
+            .iter()
+            .map(|value| required_string(Some(value), "notes.content").map(str::to_string))
+            .collect::<Result<Vec<_>, _>>()?;
+        document.insert("summary".to_string(), Value::String(strings.join("\n")));
+    } else if let Some(scope_note) = notes
+        .iter()
+        .find(|note| note.get("type").and_then(Value::as_str) == Some("scopecontent"))
+    {
+        if let Some(subnotes) = scope_note.get("subnotes").and_then(Value::as_array) {
+            let strings = subnotes
+                .iter()
+                .map(|note| {
+                    required_string(note.get("content"), "notes.subnotes.content")
+                        .map(str::to_string)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            document.insert("summary".to_string(), Value::String(strings.join("\n")));
+        }
+    }
+    Ok(())
+}
+
+fn add_enriched_fields(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+    full_record: &Value,
+) -> Result<(), IndexDocumentError> {
+    add_subjects(document, record)?;
+    add_agents(document, record)?;
+    for field in [
+        "created_by",
+        "last_modified_by",
+        "user_mtime",
+        "system_mtime",
+        "create_time",
+    ] {
+        if let Some(value) = record.get(field) {
+            document.insert(field.to_string(), value.clone());
+        }
+    }
+    if let Some(notes) = record.get("notes") {
+        if notes.is_string() {
+            document.insert("notes_published".to_string(), notes.clone());
+            document.insert("notes".to_string(), notes.clone());
+        } else {
+            let (published, unpublished) = extract_string_values(notes);
+            document.insert(
+                "notes_published".to_string(),
+                Value::Array(published.into_iter().map(Value::String).collect()),
+            );
+            document.insert(
+                "notes".to_string(),
+                Value::Array(unpublished.into_iter().map(Value::String).collect()),
+            );
+        }
+    }
+    add_dates(document, record)?;
+    if let Some(level) = record.get("level") {
+        let level = if level.as_str() == Some("otherlevel") {
+            record.get("other_level").cloned().unwrap_or(Value::Null)
+        } else {
+            level.clone()
+        };
+        document.insert("level".to_string(), level);
+    }
+    add_summary(document, record)?;
+    if let Some(extents) = record.get("extents") {
+        let extents = extents
+            .as_array()
+            .ok_or_else(|| error("field 'extents' must be an array"))?;
+        let whole: Vec<&Value> = extents
+            .iter()
+            .filter(|extent| extent.get("portion").and_then(Value::as_str) == Some("whole"))
+            .collect();
+        let display = if whole.is_empty() {
+            extents.iter().collect::<Vec<_>>()
+        } else {
+            whole
+        };
+        let values = display
+            .into_iter()
+            .map(|extent| {
+                let number = extent.get("number").and_then(Value::as_str).unwrap_or("");
+                let extent_type = extent
+                    .get("extent_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                Value::String(format!("{number} --- {extent_type}"))
+            })
+            .collect();
+        document.insert("extents".to_string(), Value::Array(values));
+    }
+    let (published, unpublished) = extract_string_values(full_record);
+    document.insert(
+        "fullrecord_published".to_string(),
+        Value::Array(published.into_iter().map(Value::String).collect()),
+    );
+    document.insert(
+        "fullrecord".to_string(),
+        Value::Array(unpublished.into_iter().map(Value::String).collect()),
+    );
+    document.insert(
+        "_archivalist_rust_fields".to_string(),
+        serde_json::json!(["common_metadata", "fullrecord"]),
+    );
+    Ok(())
+}
+
 pub fn build_index_document(input: IndexDocumentInput) -> Result<Value, IndexDocumentError> {
     if input.uri.trim().is_empty() {
         return Err(error("uri must not be empty"));
@@ -134,6 +529,10 @@ pub fn build_index_document(input: IndexDocumentInput) -> Result<Value, IndexDoc
     );
     document.insert("repository".to_string(), input.repository);
 
+    if input.enrich {
+        add_enriched_fields(&mut document, record, &input.record)?;
+    }
+
     Ok(Value::Object(document))
 }
 
@@ -172,6 +571,7 @@ mod tests {
             record_type: "resource".to_string(),
             repository: json!(2),
             record,
+            enrich: false,
         }
     }
 
@@ -194,6 +594,77 @@ mod tests {
         assert_eq!(document["repository"], 2);
         let embedded: Value = serde_json::from_str(document["json"].as_str().unwrap()).unwrap();
         assert_eq!(embedded["title"], "Sánchez papers");
+    }
+
+    #[test]
+    fn builds_staff_index_enrichment_fields() {
+        let mut enriched = input(json!({
+            "uri": "/repositories/2/resources/7",
+            "title": "Collection title",
+            "publish": true,
+            "created_by": "admin",
+            "level": "otherlevel",
+            "other_level": "subfonds",
+            "subjects": [{
+                "ref": "/subjects/1",
+                "_resolved": {"title": "Irish archives"}
+            }],
+            "linked_agents": [{
+                "ref": "/agents/people/1",
+                "role": "creator",
+                "_resolved": {
+                    "publish": true,
+                    "display_name": {"sort_name": "Sánchez, Luis"}
+                }
+            }],
+            "dates": [{
+                "date_type": "inclusive",
+                "begin": "1974",
+                "end": "1976",
+                "expression": "1974–1976"
+            }],
+            "extents": [
+                {"portion": "part", "number": "1", "extent_type": "boxes"},
+                {"portion": "whole", "number": "3", "extent_type": "linear_feet"}
+            ],
+            "notes": [
+                {"type": "abstract", "publish": true, "content": ["Public abstract"]},
+                {"type": "scopecontent", "publish": false, "content": ["Private note"]}
+            ],
+            "top_container": {"internal_note": "Must be excluded"}
+        }));
+        enriched.enrich = true;
+
+        let document = build_index_document(enriched).unwrap();
+        assert_eq!(document["subjects"], json!(["Irish archives"]));
+        assert_eq!(document["subject_uris"], json!(["/subjects/1"]));
+        assert_eq!(document["agents"], json!(["Sánchez, Luis"]));
+        assert_eq!(document["creators"], json!(["Sánchez, Luis"]));
+        assert_eq!(document["published_agents"], json!(["Sánchez, Luis"]));
+        assert_eq!(document["years"], json!(["1974", "1975", "1976"]));
+        assert_eq!(document["year_sort"], "19741976");
+        assert_eq!(document["dates"], json!(["1974–1976"]));
+        assert_eq!(document["level"], "subfonds");
+        assert_eq!(document["summary"], "Public abstract");
+        assert_eq!(document["extents"], json!(["3 --- linear_feet"]));
+        assert_eq!(
+            document["notes_published"],
+            json!(["abstract", "Public abstract"])
+        );
+        assert_eq!(document["notes"], json!(["scopecontent", "Private note"]));
+        assert_eq!(document["created_by"], "admin");
+        assert_eq!(
+            document["_archivalist_rust_fields"],
+            json!(["common_metadata", "fullrecord"])
+        );
+
+        let published = document["fullrecord_published"].as_array().unwrap();
+        let unpublished = document["fullrecord"].as_array().unwrap();
+        assert!(published.contains(&json!("Public abstract")));
+        assert!(!published.contains(&json!("Private note")));
+        assert!(unpublished.contains(&json!("Private note")));
+        assert!(!published.contains(&json!("Must be excluded")));
+        assert!(!published.contains(&json!("linear_feet")));
     }
 
     #[test]
@@ -228,6 +699,22 @@ mod tests {
             "publish": "yes"
         })))
         .is_err());
+    }
+
+    #[test]
+    fn enrichment_matches_string_notes_and_short_year_ranges() {
+        let mut enriched = input(json!({
+            "uri": "/repositories/2/resources/7",
+            "title": "Edge shapes",
+            "notes": "Profile note",
+            "dates": [{"date_type": "inclusive", "begin": "9", "end": "11"}]
+        }));
+        enriched.enrich = true;
+        let document = build_index_document(enriched).unwrap();
+        assert_eq!(document["notes_published"], "Profile note");
+        assert_eq!(document["notes"], "Profile note");
+        assert_eq!(document["years"], json!(["10", "11", "9"]));
+        assert_eq!(document["year_sort"], "00100009");
     }
 
     #[test]

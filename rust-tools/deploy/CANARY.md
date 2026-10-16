@@ -138,12 +138,28 @@ AppConfig[:rust_index_document_builder_enabled] = true
 AppConfig[:rust_index_document_builder_url] = "http://127.0.0.1:4570"
 AppConfig[:rust_index_document_builder_timeout_seconds] = 2
 AppConfig[:rust_index_document_builder_max_batch] = 1000
+AppConfig[:rust_index_document_enrichment_enabled] = false
 ```
 
 Reindex a disposable repository and compare its Solr document count and search
 results with the native baseline. Stop the sidecar during one batch and confirm the
 index completes through the native builder with a fallback warning. This flag is
 independent of the search and resource-tree flags.
+
+After the base builder passes, run the staff-index enrichment gate against a
+resource that is already present in the native Solr collection:
+
+```bash
+REPO_ID=2 RESOURCE_ID=18 ADMIN_PASSWORD='canary-password' \
+  scripts/canary_index_document_enrichment.sh
+```
+
+This compares subjects, agents, publication-aware notes, dates, years, level,
+summary, extents, and audit fields. It accounts for Solr's intentional copy-field
+merge of `notes_published` into `notes`. Only after this passes should
+`rust_index_document_enrichment_enabled` be set to `true`. The enrichment gate is
+staff-index only; PUI full-record extraction remains native after inheritance and
+privacy filtering.
 
 ## Rollback
 

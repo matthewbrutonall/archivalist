@@ -416,14 +416,17 @@ class IndexerCommon
     }
 
     add_document_prepare_hook {|doc, record|
-      add_subjects(doc, record)
-      add_agents(doc, record)
-      add_audit_info(doc, record)
-      add_notes(doc, record)
-      add_years(doc, record)
-      add_level(doc, record)
-      add_summary(doc, record)
-      add_extents(doc, record)
+      rust_fields = Array(doc['_archivalist_rust_fields'])
+      unless rust_fields.include?('common_metadata')
+        add_subjects(doc, record)
+        add_agents(doc, record)
+        add_audit_info(doc, record)
+        add_notes(doc, record)
+        add_years(doc, record)
+        add_level(doc, record)
+        add_summary(doc, record)
+        add_extents(doc, record)
+      end
       add_arks(doc, record)
     }
 
@@ -893,7 +896,8 @@ class IndexerCommon
     add_document_prepare_hook { |doc, record|
       if !self.instance_of?(PUIIndexer)
         # The PUI indexer makes its own call to build_fullrecord, so only call it here for realtime and periodic
-        build_fullrecord(doc, record)
+        rust_fields = Array(doc['_archivalist_rust_fields'])
+        build_fullrecord(doc, record) unless rust_fields.include?('fullrecord')
       end
     }
 
@@ -1018,6 +1022,11 @@ class IndexerCommon
         }
         doc['langcode'].uniq!
       end
+    }
+
+    # Internal handoff metadata must never reach Solr or plugin hooks.
+    add_document_prepare_hook {|doc, _record|
+      doc.delete('_archivalist_rust_fields')
     }
   end
 
@@ -1282,6 +1291,12 @@ class IndexerCommon
       AppConfig[:rust_index_document_builder_enabled]
   end
 
+  def rust_index_document_enrichment_enabled?
+    AppConfig.has_key?(:rust_index_document_enrichment_enabled) &&
+      AppConfig[:rust_index_document_enrichment_enabled] &&
+      self.class.name != 'PUIIndexer'
+  end
+
   def rust_index_documents(prepared_records)
     return nil unless rust_index_document_builder_enabled?
 
@@ -1299,6 +1314,7 @@ class IndexerCommon
         'record_type' => prepared[:record_type],
         'repository' => get_record_scope(prepared[:uri]),
         'record' => prepared[:values],
+        'enrich' => rust_index_document_enrichment_enabled?,
       }
     end
     builder = RustIndexDocumentBuilder.new(

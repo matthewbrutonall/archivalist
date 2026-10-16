@@ -102,7 +102,10 @@ Release archives can be built reproducibly with
 non-production rollout, parity gate, outage fallback test, and rollback procedure.
 The search, resource-tree, and index-document gates are automated by
 `scripts/canary_shadow_search.sh`, `scripts/canary_resource_tree.sh`, and
-`scripts/canary_index_document_builder.sh`.
+`scripts/canary_index_document_builder.sh`. Staff-index enrichment parity is
+checked separately by `scripts/canary_index_document_enrichment.sh`; PUI
+full-record preparation intentionally remains native because inheritance is applied
+later in its pipeline.
 
 ## Test and benchmark helpers
 
