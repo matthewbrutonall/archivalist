@@ -1,41 +1,130 @@
-ArchivesSpace 
---------------------
+# Archivalist
 
-[![Translation status](https://hosted.weblate.org/widgets/archivesspace-interfaces/-/svg-badge.svg)](https://hosted.weblate.org/engage/archivesspace-interfaces/)
+Archivalist is an independent, open-source archival management project derived
+from the [ArchivesSpace](https://archivesspace.org/) codebase.
 
+The project preserves the proven archival-management foundation of ArchivesSpace
+while progressively re-engineering performance-critical components in Rust. This
+migration is being carried out incrementally, with compatibility tests, feature
+flags, parity gates, and scoped fallback paths used to reduce migration risk.
 
-Built for archives by archivists, ArchivesSpace is the open source archives information management application for managing and providing web access to archives, manuscripts and digital objects.
+Archivalist's ambitions extend beyond technical modernisation. Its long-term goal
+is to provide a platform designed for AI-assisted archival work and first-class
+[IIIF](https://iiif.io/) interoperability.
 
-[![Build ArchivesSpace release package](https://github.com/archivesspace/archivesspace/actions/workflows/release.yml/badge.svg)](https://github.com/archivesspace/archivesspace/actions/workflows/release.yml)
+> [!WARNING]
+> Archivalist is under active development. It is not yet recommended for
+> production use or as a drop-in replacement for an existing ArchivesSpace
+> installation.
 
-* [archivesspace.org](http://archivesspace.org)
-* [User Documentation](https://archivesspace.atlassian.net/wiki/spaces/ADC/pages/917045261/ArchivesSpace+Help+Center) (member benefit)
-* [Technical Documentation](https://docs.archivesspace.org/)
-* [API](http://archivesspace.github.io/archivesspace/api)
-* [Wiki](http://wiki.archivesspace.org)
-* [Issue Tracker](http://development.archivesspace.org)
+## Why Archivalist?
 
-The latest technical documentation is managed in a separate GitHub repository [ArchivesSpace tech-docs](https://github.com/archivesspace/tech-docs) and is published at
-(https://docs.archivesspace.org/).
+Archives need systems that can manage established descriptive practice while
+also responding to rapidly growing digital collections, computational workflows,
+and new expectations for online access. Archivalist is being developed to:
 
-# License
+- improve performance and scalability by moving suitable workloads to
+  memory-safe Rust services;
+- modernise the architecture without attempting a risky all-at-once rewrite;
+- retain open formats, standards, and data portability;
+- support AI-assisted description, metadata enrichment, discovery, and workflow
+  automation while keeping professional archivists in control of decisions;
+- make the International Image Interoperability Framework (IIIF), including
+  manifests, image services, viewers, and annotations, a first-class part of
+  managing and presenting digital collections; and
+- provide a sustainable foundation for continued experimentation in archival
+  technology.
 
-ArchivesSpace is released under the [Educational Community License, version 2.0](https://opensource.org/license/ecl-2-0/). See the [COPYING](COPYING) file for more information.
+## Current architecture
 
-# Credits
+Archivalist currently has a hybrid architecture. The inherited application and
+API remain authoritative, while selected operations are moved behind a Rust
+sidecar only after they pass contract, parity, performance, and fallback tests.
+The Ruby indexer remains responsible for scheduling work and writing to the
+primary Solr collection.
 
-ArchivesSpace (https://archivesspace.org) is community-supported software whose ongoing development is led, managed, implemented and funded by a diverse community of users, developers, and administrators all working together to achieve the goal of helping archives and cultural heritage institutions better manage and provide access to their collections.
+This approach allows the project to improve the existing system in measurable
+stages. Migrated paths that currently support fallback return to their native
+implementation when the corresponding Rust service is disabled or unavailable.
 
-ArchivesSpace 1.0 (released in 2013) was developed by [Hudson Molonglo](http://www.hudsonmolonglo.com) in partnership with the New York University Libraries, UC San Diego Libraries, and University of Illinois Urbana-Champaign Library and with
-funding from the Andrew W. Mellon Foundation, organizational support from Lyrasis, and contributions from diverse persons in the archives community.
+## Engineering progress
 
-# Membership
+The current Rust workspace provides:
 
-ArchivesSpace is free to download and use, but has a membership model to promote sustainability and the continuing development of the application and to support those who use it. Learn more about [ArchivesSpace membership and its benefits](https://archivesspace.org/community/member-benefits) on our website. Reach out to the program team at ArchivesSpaceHome@lyrasis.org if you are interested in becoming an ArchivesSpace member.
+- typed access to the archival-management API;
+- validation and performance-profiling tools;
+- an experimental, separate shadow-index and query layer;
+- feature-gated Rust implementations of selected search and resource-tree
+  operations;
+- preparation of common staff-index documents and deterministic, non-AI metadata
+  enrichment; and
+- repeatable canary, parity, benchmark, packaging, and rollback tooling.
 
-# Reporting an Issue
+These paths are feature-gated and disabled by default. See the
+[Rust tools documentation](rust-tools/README.md) for the implemented components,
+build instructions, and safety model.
 
-All users are welcome to submit bug reports and requests for new features for consideration by our member community. Instructions are available on our wiki:
+AI-assisted workflows and comprehensive IIIF integration are project goals and
+are not presented as completed features in the current development version.
 
-* [How to Report a Bug](https://archivesspace.atlassian.net/wiki/spaces/ADC/pages/19202056/How+to+Report+a+Bug)
-* [How to Request a New Feature](https://archivesspace.atlassian.net/wiki/spaces/ADC/pages/19202060/How+to+Request+a+New+Feature)
+## Roadmap
+
+Archivalist's development priorities are:
+
+1. Continue the evidence-led migration of performance-critical services to Rust.
+2. Preserve behavioural and data compatibility through automated parity testing.
+3. Develop AI-assisted archival description, enrichment, discovery, and workflow
+   tools with clear human review and provenance.
+4. Build comprehensive IIIF Presentation API, Image API, viewer, and annotation
+   support into the core application.
+5. Simplify installation, upgrades, monitoring, and recovery.
+6. Establish an independent, well-documented release process suitable for wider
+   testing and eventual production use.
+
+## Relationship to ArchivesSpace
+
+Archivalist began from the ArchivesSpace source code and continues to benefit from
+the work of the ArchivesSpace community. It is now an independent project with a
+separate name, repository, technical direction, and release roadmap. It is not an
+official ArchivesSpace release and is not affiliated with or endorsed by the
+ArchivesSpace program.
+
+Compatibility with inherited ArchivesSpace behaviour is treated as an engineering
+baseline during the migration, not as a permanent restriction on Archivalist's
+design.
+
+## Development
+
+The project is currently intended for developers and controlled test environments.
+The existing [Docker development guide](DOCKER_DEV.md) describes the inherited
+development stack. Rust-specific build and test instructions are in
+[rust-tools/README.md](rust-tools/README.md).
+
+Production installation and migration instructions will be published when the
+software reaches an appropriate release stage.
+
+## Contributing and issues
+
+Contributions, design discussion, test results, and bug reports are welcome.
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) and use this repository's
+[GitHub issue tracker](https://github.com/matthewbrutonall/archivalist/issues) for
+Archivalist-specific reports and proposals.
+
+## Licence
+
+Archivalist is distributed under the
+[Educational Community License, version 2.0](https://opensource.org/license/ecl-2-0/).
+See [COPYING](COPYING) for the full licence text.
+
+## Acknowledgements
+
+Archivalist is derived from ArchivesSpace, the community-supported open-source
+archives information management application. The project acknowledges the
+ArchivesSpace community and the many institutions, funders, developers,
+archivists, and other contributors whose work created and continues to sustain
+the original codebase.
+
+ArchivesSpace 1.0 was developed by Hudson Molonglo in partnership with New York
+University Libraries, UC San Diego Libraries, and the University of Illinois
+Urbana-Champaign Library, with funding from the Andrew W. Mellon Foundation and
+organisational support from Lyrasis.
