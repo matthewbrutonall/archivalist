@@ -86,14 +86,19 @@ Endpoints:
 
 - `GET /health`: process and configuration liveness.
 - `GET /ready`: bounded dependency check against the configured shadow collection.
+- `GET /metrics`: Prometheus-format uptime and request counters.
 - `GET /shadow/search`: keyword search with optional resource and date filters.
 - `GET /shadow/descendants`: descendant retrieval with optional tree assembly.
-- `POST /shadow/tree/waypoint`: resource-tree waypoint lookup.
-- `POST /shadow/tree/paths`: batched root-to-node path lookup.
+- `GET /shadow/resource-tree/waypoint`: resource-tree waypoint lookup.
+- `GET /shadow/resource-tree/node-from-root`: batched root-to-node path lookup.
 
 The example systemd unit in `deploy/` binds to loopback by default. Put authentication
 and transport security in front of the sidecar before exposing it beyond the local
 host.
+
+Release archives can be built reproducibly with
+`scripts/package_sidecar_release.sh`. See `deploy/CANARY.md` for the staged
+non-production rollout, parity gate, outage fallback test, and rollback procedure.
 
 ## Test and benchmark helpers
 

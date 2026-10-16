@@ -8,8 +8,9 @@
 # Checks:
 # 1. GET /health confirms process liveness and configured dependency target.
 # 2. GET /ready proves the configured shadow Solr collection is queryable.
-# 3. GET /shadow/search with caller-supplied test data returns valid tree JSON.
-# 4. Live collection queries (collection=archivesspace) are refused with HTTP 403 Forbidden.
+# 3. GET /metrics exposes process counters in Prometheus format.
+# 4. GET /shadow/search with caller-supplied test data returns valid tree JSON.
+# 5. Live collection queries (collection=archivesspace) are refused with HTTP 403 Forbidden.
 #
 # Shell-only, read-only, no jq requirement.
 # Stops sidecar cleanly on exit.
@@ -27,6 +28,7 @@ HOST="127.0.0.1"
 BASE_URL="http://${HOST}:${PORT}"
 HEALTH_URL="${BASE_URL}/health"
 READY_URL="${BASE_URL}/ready"
+METRICS_URL="${BASE_URL}/metrics"
 SEARCH_URL="${BASE_URL}/shadow/search?q=${QUERY}&resource_uri=${RESOURCE_URI}&rows=5&tree=true&include_ancestors=true"
 FORBIDDEN_URL="${BASE_URL}/shadow/search?collection=archivesspace"
 
@@ -121,8 +123,18 @@ if ! echo "${READY_RESPONSE}" | grep -q '"num_found":'; then
 fi
 echo "PASSED"
 
-# 3. Shadow search check
-echo -n "3. Checking GET /shadow/search (configured query with tree & ancestors)... "
+# 3. Metrics check
+echo -n "3. Checking GET /metrics... "
+METRICS_RESPONSE=$(curl -s -f "${METRICS_URL}")
+if ! echo "${METRICS_RESPONSE}" | grep -q '^archivalist_sidecar_requests_total '; then
+    echo "FAILED: request counter not found in metrics response"
+    echo "Response: ${METRICS_RESPONSE}"
+    exit 1
+fi
+echo "PASSED"
+
+# 4. Shadow search check
+echo -n "4. Checking GET /shadow/search (configured query with tree & ancestors)... "
 SEARCH_RESPONSE=$(curl -s -f "${SEARCH_URL}")
 
 if ! echo "${SEARCH_RESPONSE}" | grep -q '"num_found":'; then
@@ -144,8 +156,8 @@ if ! echo "${SEARCH_RESPONSE}" | grep -q '"tree":\['; then
 fi
 echo "PASSED"
 
-# 4. Live collection refusal check
-echo -n "4. Checking live collection refusal returns 403... "
+# 5. Live collection refusal check
+echo -n "5. Checking live collection refusal returns 403... "
 HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${FORBIDDEN_URL}")
 if [ "${HTTP_CODE}" != "403" ]; then
     echo "FAILED: Expected HTTP 403, got ${HTTP_CODE}"

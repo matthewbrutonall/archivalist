@@ -21,10 +21,10 @@
 #      sudo systemctl enable --now aspace-shadow-sidecar.service
 
 [Unit]
-Description=ArchivesSpace Shadow Solr Query Sidecar
+Description=Archivalist Rust Shadow Solr Query Sidecar
 Wants=network-online.target
 After=network-online.target
-Documentation=https://github.com/archivesspace/archivesspace
+Documentation=https://github.com/matthewbrutonall/archivalist
 
 [Service]
 Type=simple
@@ -36,16 +36,8 @@ Group=archivesspace
 # Adapt WorkingDirectory to your deployment directory
 WorkingDirectory=/opt/archivesspace-rust-tools
 
-# Release binary invocation with required arguments:
-# - bind host: 127.0.0.1 (local interface only)
-# - port: 4570
-# - solr-url: http://localhost:8985/solr
-# - collection: archivesspace_shadow
-ExecStart=/usr/local/bin/aspace-shadow-sidecar \
-    --host 127.0.0.1 \
-    --port 4570 \
-    --solr-url http://localhost:8985/solr \
-    --collection archivesspace_shadow
+EnvironmentFile=/etc/archivalist/aspace-shadow-sidecar.env
+ExecStart=/usr/local/bin/aspace-shadow-sidecar
 
 # Fail startup if the process is live but the configured shadow Solr collection
 # cannot be queried. Adapt the curl path if it differs on the target host.
@@ -63,6 +55,15 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

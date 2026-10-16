@@ -2,8 +2,9 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -23,19 +24,27 @@ pub const DEFAULT_SOLR_URL: &str = "http://localhost:8985/solr";
 )]
 struct SidecarArgs {
     /// Port to listen on.
-    #[arg(long, default_value_t = DEFAULT_SIDECAR_PORT)]
+    #[arg(
+        long,
+        env = "ARCHIVALIST_SIDECAR_PORT",
+        default_value_t = DEFAULT_SIDECAR_PORT
+    )]
     port: u16,
 
     /// Bind host.
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, env = "ARCHIVALIST_SIDECAR_HOST", default_value = "127.0.0.1")]
     host: String,
 
     /// Default Solr base URL.
-    #[arg(long, default_value = DEFAULT_SOLR_URL)]
+    #[arg(long, env = "ARCHIVALIST_SOLR_URL", default_value = DEFAULT_SOLR_URL)]
     solr_url: String,
 
     /// Default collection name.
-    #[arg(long, default_value = DEFAULT_SHADOW_COLLECTION)]
+    #[arg(
+        long,
+        env = "ARCHIVALIST_SHADOW_COLLECTION",
+        default_value = DEFAULT_SHADOW_COLLECTION
+    )]
     collection: String,
 }
 
@@ -189,6 +198,7 @@ pub async fn check_readiness(
 pub enum SidecarRoute<'a> {
     Health,
     Ready,
+    Metrics,
     Descendants(&'a str),
     Search(&'a str),
     ResourceTreeWaypoint(&'a str),
@@ -209,6 +219,7 @@ pub fn route_request<'a>(method: &str, full_path: &'a str) -> Result<SidecarRout
     match path {
         "/health" => Ok(SidecarRoute::Health),
         "/ready" => Ok(SidecarRoute::Ready),
+        "/metrics" => Ok(SidecarRoute::Metrics),
         "/shadow/descendants" => Ok(SidecarRoute::Descendants(query_str)),
         "/shadow/search" => Ok(SidecarRoute::Search(query_str)),
         "/shadow/resource-tree/waypoint" => Ok(SidecarRoute::ResourceTreeWaypoint(query_str)),
@@ -560,6 +571,64 @@ struct AppState {
     collection: String,
     client: aspace_client::ShadowSolrClient,
     readiness_client: reqwest::Client,
+    metrics: Arc<SidecarMetrics>,
+}
+
+struct SidecarMetrics {
+    started_at: Instant,
+    requests_total: AtomicU64,
+    requests_active: AtomicU64,
+}
+
+impl SidecarMetrics {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            requests_total: AtomicU64::new(0),
+            requests_active: AtomicU64::new(0),
+        }
+    }
+
+    fn render(&self) -> String {
+        format!(
+            concat!(
+                "# HELP archivalist_sidecar_build_info Static build information.\n",
+                "# TYPE archivalist_sidecar_build_info gauge\n",
+                "archivalist_sidecar_build_info{{version=\"{}\"}} 1\n",
+                "# HELP archivalist_sidecar_uptime_seconds Seconds since the sidecar started.\n",
+                "# TYPE archivalist_sidecar_uptime_seconds gauge\n",
+                "archivalist_sidecar_uptime_seconds {:.3}\n",
+                "# HELP archivalist_sidecar_requests_total HTTP requests accepted by the sidecar.\n",
+                "# TYPE archivalist_sidecar_requests_total counter\n",
+                "archivalist_sidecar_requests_total {}\n",
+                "# HELP archivalist_sidecar_requests_active HTTP requests currently being handled.\n",
+                "# TYPE archivalist_sidecar_requests_active gauge\n",
+                "archivalist_sidecar_requests_active {}\n"
+            ),
+            env!("CARGO_PKG_VERSION"),
+            self.started_at.elapsed().as_secs_f64(),
+            self.requests_total.load(Ordering::Relaxed),
+            self.requests_active.load(Ordering::Relaxed)
+        )
+    }
+}
+
+struct ActiveRequestGuard {
+    metrics: Arc<SidecarMetrics>,
+}
+
+impl ActiveRequestGuard {
+    fn begin(metrics: Arc<SidecarMetrics>) -> Self {
+        metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+        metrics.requests_active.fetch_add(1, Ordering::Relaxed);
+        Self { metrics }
+    }
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.metrics.requests_active.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 async fn handle_connection(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {
@@ -568,6 +637,7 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<AppState>) -> Resul
     if bytes_read == 0 {
         return Ok(());
     }
+    let _request_guard = ActiveRequestGuard::begin(Arc::clone(&state.metrics));
 
     let request_str = String::from_utf8_lossy(&buffer[..bytes_read]);
     let mut lines = request_str.lines();
@@ -630,6 +700,16 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<AppState>) -> Resul
                     stream.write_all(response.as_bytes()).await?;
                 }
             }
+            return Ok(());
+        }
+        SidecarRoute::Metrics => {
+            let response_body = state.metrics.render();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).await?;
             return Ok(());
         }
         SidecarRoute::NotFound(path) => {
@@ -1101,6 +1181,7 @@ async fn main() -> Result<()> {
         collection: args.collection,
         client: warm_client,
         readiness_client,
+        metrics: Arc::new(SidecarMetrics::new()),
     });
 
     println!(
@@ -1551,6 +1632,7 @@ mod tests {
             Ok(SidecarRoute::Health)
         );
         assert_eq!(route_request("GET", "/ready"), Ok(SidecarRoute::Ready));
+        assert_eq!(route_request("GET", "/metrics"), Ok(SidecarRoute::Metrics));
         assert_eq!(
             route_request("GET", "/shadow/descendants?rows=5"),
             Ok(SidecarRoute::Descendants("rows=5"))
@@ -1594,6 +1676,19 @@ mod tests {
         assert_eq!(resp.served_by, "aspace-shadow-sidecar");
         assert_eq!(resp.solr_url, "http://localhost:8985/solr");
         assert_eq!(resp.collection, "archivesspace_shadow");
+    }
+
+    #[test]
+    fn test_metrics_render_prometheus_contract() {
+        let metrics = SidecarMetrics::new();
+        metrics.requests_total.store(7, Ordering::Relaxed);
+        metrics.requests_active.store(2, Ordering::Relaxed);
+
+        let rendered = metrics.render();
+        assert!(rendered.contains("archivalist_sidecar_build_info{version=\"0.1.0\"} 1"));
+        assert!(rendered.contains("archivalist_sidecar_requests_total 7"));
+        assert!(rendered.contains("archivalist_sidecar_requests_active 2"));
+        assert!(rendered.contains("archivalist_sidecar_uptime_seconds "));
     }
 
     #[tokio::test]
