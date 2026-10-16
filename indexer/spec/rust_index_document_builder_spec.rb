@@ -72,7 +72,11 @@ describe RustIndexDocumentBuilder do
       'publish' => true,
       'system_generated' => 'false',
       'repository' => 2,
-      '_archivalist_rust_fields' => ['common_metadata', 'fullrecord'],
+      '_archivalist_rust_fields' => [
+        'common_metadata',
+        'fullrecord',
+        'resource_archival_object_metadata',
+      ],
     }
     allow(builder).to receive(:perform_request).and_return(
       response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
@@ -80,5 +84,41 @@ describe RustIndexDocumentBuilder do
     )
 
     expect { builder.build([input]) }.to raise_error(/enrichment fields missing.*fullrecord_published/)
+  end
+
+  it 'does not require resource-specific enrichment fields from accessions' do
+    accession = {
+      'uri' => '/repositories/2/accessions/4',
+      'record_type' => 'accession',
+      'repository' => 2,
+      'enrich' => true,
+      'record' => {
+        'uri' => '/repositories/2/accessions/4',
+        'title' => 'New records',
+        'publish' => true,
+        'id_0' => '2026',
+      },
+    }
+    document = {
+      'id' => accession['uri'],
+      'uri' => accession['uri'],
+      'title' => 'New records',
+      'primary_type' => 'accession',
+      'types' => ['accession'],
+      'json' => ASUtils.to_json(accession['record']),
+      'suppressed' => false,
+      'publish' => true,
+      'system_generated' => 'false',
+      'repository' => 2,
+      'fullrecord_published' => [],
+      'fullrecord' => [],
+      '_archivalist_rust_fields' => ['common_metadata', 'fullrecord'],
+    }
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [document])
+    )
+
+    expect(builder.build([accession])).to eq(accession['uri'] => document)
   end
 end

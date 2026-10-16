@@ -91,7 +91,7 @@ Endpoints:
 - `GET /shadow/descendants`: descendant retrieval with optional tree assembly.
 - `GET /shadow/resource-tree/waypoint`: resource-tree waypoint lookup.
 - `GET /shadow/resource-tree/node-from-root`: batched root-to-node path lookup.
-- `POST /index/documents`: bounded preparation of common Solr document fields.
+- `POST /index/documents`: bounded preparation of common Solr document fields and, when enrichment is requested, the high-volume resource and archival-object staff-index mappings.
 
 The example systemd unit in `deploy/` binds to loopback by default. Put authentication
 and transport security in front of the sidecar before exposing it beyond the local

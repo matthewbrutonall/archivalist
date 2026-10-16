@@ -24,6 +24,7 @@ record="$(
         --data-urlencode 'resolve[]=subjects' \
         --data-urlencode 'resolve[]=linked_agents' \
         --data-urlencode 'resolve[]=repository' \
+        --data-urlencode 'resolve[]=classifications' \
         "${BACKEND_URL%/}/repositories/${REPO_ID}/resources/${RESOURCE_ID}"
 )"
 
@@ -59,12 +60,21 @@ for iteration in $(seq 1 "${ITERATIONS}"); do
           "subjects", "subject_uris", "agents", "agent_uris",
           "published_agents", "published_agent_uris", "creators",
           "notes_published", "dates", "years", "level", "summary", "extents",
-          "created_by", "last_modified_by", "user_mtime", "system_mtime", "create_time"
+          "created_by", "last_modified_by", "user_mtime", "system_mtime", "create_time",
+          "finding_aid_title", "finding_aid_filing_title", "identifier", "four_part_id",
+          "resource_type", "restrictions", "ead_id", "finding_aid_status",
+          "related_accession_uris", "slug", "is_slug_auto", "processing_priority",
+          "processors", "external_id", "classification_paths", "classification_uris",
+          "digital_object_uris", "top_container_uri_u_sstr", "child_container_u_sstr",
+          "grand_child_container_u_sstr", "ancestors", "rights_statement_agent_uris",
+          "langcode"
         ] as $fields |
         ($fields | all(($rust[.] | ary) == ($native[.] | ary))) and
         (((($rust.notes_published // []) + ($rust.notes // [])) | sort) ==
           (($native.notes // []) | sort)) and
-        ($rust._archivalist_rust_fields == ["common_metadata", "fullrecord"])
+        ($rust._archivalist_rust_fields == [
+          "common_metadata", "fullrecord", "resource_archival_object_metadata"
+        ])
       ' >/dev/null; then
         printf 'index-document enrichment parity failed at iteration %s\n' "${iteration}" >&2
         exit 1

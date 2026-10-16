@@ -193,7 +193,16 @@ describe "periodic indexer" do
           doc['notes'] = ['private Rust text']
           doc['fullrecord_published'] = ['prepared by Rust']
           doc['fullrecord'] = ['private Rust text']
-          doc['_archivalist_rust_fields'] = ['common_metadata', 'fullrecord']
+          doc['finding_aid_title'] = 'Rust finding aid title'
+          doc['identifier'] = 'RUST-77'
+          doc['external_id'] = ['rust-external-id']
+          doc['ancestors'] = ['/repositories/2/resources/1']
+          doc['langcode'] = ['gle']
+          doc['_archivalist_rust_fields'] = [
+            'common_metadata',
+            'fullrecord',
+            'resource_archival_object_metadata',
+          ]
           documents[prepared[:uri]] = doc
         end
       end
@@ -204,6 +213,11 @@ describe "periodic indexer" do
       expect(doc['notes']).to eq(['private Rust text'])
       expect(doc['fullrecord_published']).to eq(['prepared by Rust'])
       expect(doc['fullrecord']).to eq(['private Rust text'])
+      expect(doc['finding_aid_title']).to eq('Rust finding aid title')
+      expect(doc['identifier']).to eq('RUST-77')
+      expect(doc['external_id']).to eq(['rust-external-id'])
+      expect(doc['ancestors']).to eq(['/repositories/2/resources/1'])
+      expect(doc['langcode']).to eq(['gle'])
       expect(doc).not_to have_key('_archivalist_rust_fields')
     end
   end

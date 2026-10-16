@@ -382,8 +382,358 @@ fn add_summary(
     Ok(())
 }
 
+fn wrapped_values(value: Option<&Value>) -> Vec<&Value> {
+    match value {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(values)) => values.iter().collect(),
+        Some(value) => vec![value],
+    }
+}
+
+fn ruby_string(value: Option<&Value>) -> String {
+    match value {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Bool(value)) => value.to_string(),
+        Some(Value::Number(value)) => value.to_string(),
+        Some(value) => value.to_string(),
+    }
+}
+
+fn push_unique(values: &mut Vec<Value>, value: Value) {
+    if !values.contains(&value) {
+        values.push(value);
+    }
+}
+
+fn joined_identifier(record: &Map<String, Value>, separator: &str) -> String {
+    (0..4)
+        .filter_map(|index| record.get(&format!("id_{index}")))
+        .filter(|value| !value.is_null())
+        .map(|value| ruby_string(Some(value)))
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
+fn add_external_ids(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let mut values = Vec::new();
+    for external_id in wrapped_values(record.get("external_ids")) {
+        let external_id = external_id
+            .as_object()
+            .ok_or_else(|| error("external_ids entries must be objects"))?;
+        values.push(
+            external_id
+                .get("external_id")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+    }
+    document.insert("external_id".to_string(), Value::Array(values));
+    Ok(())
+}
+
+fn add_classifications(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let Some(classifications) = record.get("classifications") else {
+        return Ok(());
+    };
+    let classifications = classifications
+        .as_array()
+        .ok_or_else(|| error("field 'classifications' must be an array"))?;
+    if classifications.is_empty() {
+        return Ok(());
+    }
+
+    let mut paths = Vec::new();
+    let mut uris = Vec::new();
+    for classification in classifications {
+        let classification = classification
+            .as_object()
+            .ok_or_else(|| error("classifications entries must be objects"))?;
+        let path = classification
+            .get("_resolved")
+            .and_then(Value::as_object)
+            .and_then(|resolved| resolved.get("path_from_root"))
+            .ok_or_else(|| error("classifications entries must resolve path_from_root"))?;
+        paths.push(Value::String(serde_json::to_string(path).map_err(
+            |err| error(format!("failed to serialize classification path: {err}")),
+        )?));
+        uris.push(classification.get("ref").cloned().unwrap_or(Value::Null));
+    }
+    document.insert("classification_paths".to_string(), Value::Array(paths));
+    document.insert("classification_uris".to_string(), Value::Array(uris));
+    Ok(())
+}
+
+fn add_instance_fields(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let instances = wrapped_values(record.get("instances"));
+    let mut digital_objects = Vec::new();
+    let mut top_containers = Vec::new();
+    let mut child_containers = Vec::new();
+    let mut grandchild_containers = Vec::new();
+
+    for instance in instances {
+        let instance = instance
+            .as_object()
+            .ok_or_else(|| error("instances entries must be objects"))?;
+        if let Some(digital_object) = instance.get("digital_object").and_then(Value::as_object) {
+            if let Some(reference) = digital_object.get("ref") {
+                match reference {
+                    Value::Array(values) => {
+                        for value in values {
+                            push_unique(&mut digital_objects, value.clone());
+                        }
+                    }
+                    value => push_unique(&mut digital_objects, value.clone()),
+                }
+            }
+        }
+
+        let Some(sub_container) = instance.get("sub_container").and_then(Value::as_object) else {
+            continue;
+        };
+        let Some(top_container) = sub_container
+            .get("top_container")
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        top_containers.push(top_container.get("ref").cloned().unwrap_or(Value::Null));
+        if sub_container
+            .get("type_2")
+            .is_some_and(|value| !value.is_null())
+        {
+            child_containers.push(Value::String(format!(
+                "{} {} {}",
+                ruby_string(sub_container.get("type_2")),
+                ruby_string(sub_container.get("indicator_2")),
+                ruby_string(sub_container.get("barcode_2"))
+            )));
+        }
+        if sub_container
+            .get("type_3")
+            .is_some_and(|value| !value.is_null())
+        {
+            grandchild_containers.push(Value::String(format!(
+                "{} {}",
+                ruby_string(sub_container.get("type_3")),
+                ruby_string(sub_container.get("indicator_3"))
+            )));
+        }
+    }
+
+    if !digital_objects.is_empty() {
+        document.insert(
+            "digital_object_uris".to_string(),
+            Value::Array(digital_objects),
+        );
+    }
+    if !top_containers.is_empty() {
+        document.insert(
+            "top_container_uri_u_sstr".to_string(),
+            Value::Array(top_containers),
+        );
+    }
+    if !child_containers.is_empty() {
+        document.insert(
+            "child_container_u_sstr".to_string(),
+            Value::Array(child_containers),
+        );
+    }
+    if !grandchild_containers.is_empty() {
+        document.insert(
+            "grand_child_container_u_sstr".to_string(),
+            Value::Array(grandchild_containers),
+        );
+    }
+    Ok(())
+}
+
+fn add_ancestors(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let ancestors = wrapped_values(record.get("ancestors"))
+        .into_iter()
+        .map(|ancestor| {
+            ancestor
+                .as_object()
+                .and_then(|ancestor| ancestor.get("ref"))
+                .cloned()
+                .ok_or_else(|| error("ancestors entries must contain ref"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    document.insert("ancestors".to_string(), Value::Array(ancestors));
+    Ok(())
+}
+
+fn add_rights_statement_agents(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let mut uris = Vec::new();
+    for statement in wrapped_values(record.get("rights_statements")) {
+        let statement = statement
+            .as_object()
+            .ok_or_else(|| error("rights_statements entries must be objects"))?;
+        for agent in wrapped_values(statement.get("linked_agents")) {
+            let agent = agent
+                .as_object()
+                .ok_or_else(|| error("rights statement linked_agents entries must be objects"))?;
+            uris.push(agent.get("ref").cloned().unwrap_or(Value::Null));
+        }
+    }
+    if !uris.is_empty() {
+        document.insert(
+            "rights_statement_agent_uris".to_string(),
+            Value::Array(uris),
+        );
+    }
+    Ok(())
+}
+
+fn add_languages(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let mut languages = Vec::new();
+    if let Some(materials) = record.get("lang_materials").and_then(Value::as_array) {
+        for material in materials {
+            let material = material
+                .as_object()
+                .ok_or_else(|| error("lang_materials entries must be objects"))?;
+            if let Some(language_and_script) = material
+                .get("language_and_script")
+                .and_then(Value::as_object)
+            {
+                push_unique(
+                    &mut languages,
+                    language_and_script
+                        .get("language")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                );
+            }
+        }
+    }
+    document.insert("langcode".to_string(), Value::Array(languages));
+    Ok(())
+}
+
+fn add_resource_and_archival_object_fields(
+    document: &mut Map<String, Value>,
+    record_type: &str,
+    record: &Map<String, Value>,
+) -> Result<bool, IndexDocumentError> {
+    if !matches!(record_type, "resource" | "archival_object") {
+        return Ok(false);
+    }
+
+    if record_type == "archival_object" {
+        if let Some(resource) = record.get("resource").and_then(Value::as_object) {
+            document.insert(
+                "resource".to_string(),
+                resource.get("ref").cloned().unwrap_or(Value::Null),
+            );
+        }
+        for (document_field, record_field) in [
+            ("title", "display_string"),
+            ("identifier", "component_id"),
+            ("component_id", "component_id"),
+            ("ref_id", "ref_id"),
+            ("slug", "slug"),
+            ("is_slug_auto", "is_slug_auto"),
+        ] {
+            document.insert(
+                document_field.to_string(),
+                record.get(record_field).cloned().unwrap_or(Value::Null),
+            );
+        }
+    } else {
+        for field in [
+            "finding_aid_title",
+            "finding_aid_filing_title",
+            "resource_type",
+            "level",
+            "restrictions",
+            "ead_id",
+            "finding_aid_status",
+            "slug",
+            "is_slug_auto",
+        ] {
+            document.insert(
+                field.to_string(),
+                record.get(field).cloned().unwrap_or(Value::Null),
+            );
+        }
+        document.insert(
+            "identifier".to_string(),
+            Value::String(joined_identifier(record, "-")),
+        );
+
+        let related_accessions = record
+            .get("related_accessions")
+            .map(|value| {
+                value
+                    .as_array()
+                    .ok_or_else(|| error("field 'related_accessions' must be an array"))
+            })
+            .transpose()?
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut related_uris = Vec::new();
+        for accession in related_accessions {
+            if let Some(reference) = accession.get("ref") {
+                if !reference.is_null() {
+                    push_unique(&mut related_uris, reference.clone());
+                }
+            }
+        }
+        document.insert(
+            "related_accession_uris".to_string(),
+            Value::Array(related_uris),
+        );
+
+        if let Some(collection_management) = record
+            .get("collection_management")
+            .and_then(Value::as_object)
+        {
+            for field in ["processing_priority", "processors"] {
+                document.insert(
+                    field.to_string(),
+                    collection_management
+                        .get(field)
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                );
+            }
+        }
+        add_classifications(document, record)?;
+    }
+
+    add_external_ids(document, record)?;
+    add_instance_fields(document, record)?;
+    let four_part_id = joined_identifier(record, " ");
+    if !four_part_id.is_empty() {
+        document.insert("four_part_id".to_string(), Value::String(four_part_id));
+    }
+    add_ancestors(document, record)?;
+    add_rights_statement_agents(document, record)?;
+    add_languages(document, record)?;
+    Ok(true)
+}
+
 fn add_enriched_fields(
     document: &mut Map<String, Value>,
+    record_type: &str,
     record: &Map<String, Value>,
     full_record: &Value,
 ) -> Result<(), IndexDocumentError> {
@@ -461,11 +811,19 @@ fn add_enriched_fields(
         "fullrecord".to_string(),
         Value::Array(unpublished.into_iter().map(Value::String).collect()),
     );
+    let mut rust_fields = vec![json_string("common_metadata"), json_string("fullrecord")];
+    if add_resource_and_archival_object_fields(document, record_type, record)? {
+        rust_fields.push(json_string("resource_archival_object_metadata"));
+    }
     document.insert(
         "_archivalist_rust_fields".to_string(),
-        serde_json::json!(["common_metadata", "fullrecord"]),
+        Value::Array(rust_fields),
     );
     Ok(())
+}
+
+fn json_string(value: &str) -> Value {
+    Value::String(value.to_string())
 }
 
 pub fn build_index_document(input: IndexDocumentInput) -> Result<Value, IndexDocumentError> {
@@ -512,7 +870,7 @@ pub fn build_index_document(input: IndexDocumentInput) -> Result<Value, IndexDoc
     );
     document.insert(
         "types".to_string(),
-        Value::Array(vec![Value::String(input.record_type)]),
+        Value::Array(vec![Value::String(input.record_type.clone())]),
     );
     document.insert(
         "json".to_string(),
@@ -530,7 +888,7 @@ pub fn build_index_document(input: IndexDocumentInput) -> Result<Value, IndexDoc
     document.insert("repository".to_string(), input.repository);
 
     if input.enrich {
-        add_enriched_fields(&mut document, record, &input.record)?;
+        add_enriched_fields(&mut document, &input.record_type, record, &input.record)?;
     }
 
     Ok(Value::Object(document))
@@ -644,7 +1002,7 @@ mod tests {
         assert_eq!(document["years"], json!(["1974", "1975", "1976"]));
         assert_eq!(document["year_sort"], "19741976");
         assert_eq!(document["dates"], json!(["1974–1976"]));
-        assert_eq!(document["level"], "subfonds");
+        assert_eq!(document["level"], "otherlevel");
         assert_eq!(document["summary"], "Public abstract");
         assert_eq!(document["extents"], json!(["3 --- linear_feet"]));
         assert_eq!(
@@ -655,7 +1013,11 @@ mod tests {
         assert_eq!(document["created_by"], "admin");
         assert_eq!(
             document["_archivalist_rust_fields"],
-            json!(["common_metadata", "fullrecord"])
+            json!([
+                "common_metadata",
+                "fullrecord",
+                "resource_archival_object_metadata"
+            ])
         );
 
         let published = document["fullrecord_published"].as_array().unwrap();
@@ -665,6 +1027,133 @@ mod tests {
         assert!(unpublished.contains(&json!("Private note")));
         assert!(!published.contains(&json!("Must be excluded")));
         assert!(!published.contains(&json!("linear_feet")));
+    }
+
+    #[test]
+    fn builds_resource_specific_staff_index_fields() {
+        let mut enriched = input(json!({
+            "uri": "/repositories/2/resources/7",
+            "title": "Collection title",
+            "publish": true,
+            "finding_aid_title": "Collection guide",
+            "finding_aid_filing_title": "Guide, Collection",
+            "id_0": "MS",
+            "id_1": "7",
+            "resource_type": "papers",
+            "level": "collection",
+            "restrictions": true,
+            "ead_id": "ms-7",
+            "finding_aid_status": "completed",
+            "related_accessions": [
+                {"ref": "/repositories/2/accessions/1"},
+                {"ref": "/repositories/2/accessions/1"}
+            ],
+            "slug": "collection-title",
+            "is_slug_auto": false,
+            "collection_management": {
+                "processing_priority": "high",
+                "processors": "A. Archivist"
+            },
+            "external_ids": [{"external_id": "legacy-7"}],
+            "classifications": [{
+                "ref": "/classifications/1",
+                "_resolved": {"path_from_root": [{"identifier": "COL"}]}
+            }],
+            "instances": [
+                {"digital_object": {"ref": "/repositories/2/digital_objects/3"}},
+                {"sub_container": {
+                    "top_container": {"ref": "/repositories/2/top_containers/4"},
+                    "type_2": "folder",
+                    "indicator_2": "2",
+                    "barcode_2": "B2",
+                    "type_3": "item",
+                    "indicator_3": "5"
+                }}
+            ],
+            "ancestors": [{"ref": "/repositories/2/resources/1"}],
+            "rights_statements": [{
+                "linked_agents": [{"ref": "/agents/people/9"}]
+            }],
+            "lang_materials": [
+                {"language_and_script": {"language": "eng"}},
+                {"language_and_script": {"language": "eng"}}
+            ]
+        }));
+        enriched.enrich = true;
+
+        let document = build_index_document(enriched).unwrap();
+        assert_eq!(document["finding_aid_title"], "Collection guide");
+        assert_eq!(document["identifier"], "MS-7");
+        assert_eq!(document["four_part_id"], "MS 7");
+        assert_eq!(
+            document["related_accession_uris"],
+            json!(["/repositories/2/accessions/1"])
+        );
+        assert_eq!(document["external_id"], json!(["legacy-7"]));
+        assert_eq!(
+            document["classification_uris"],
+            json!(["/classifications/1"])
+        );
+        assert_eq!(
+            document["digital_object_uris"],
+            json!(["/repositories/2/digital_objects/3"])
+        );
+        assert_eq!(
+            document["top_container_uri_u_sstr"],
+            json!(["/repositories/2/top_containers/4"])
+        );
+        assert_eq!(document["child_container_u_sstr"], json!(["folder 2 B2"]));
+        assert_eq!(document["grand_child_container_u_sstr"], json!(["item 5"]));
+        assert_eq!(
+            document["ancestors"],
+            json!(["/repositories/2/resources/1"])
+        );
+        assert_eq!(
+            document["rights_statement_agent_uris"],
+            json!(["/agents/people/9"])
+        );
+        assert_eq!(document["langcode"], json!(["eng"]));
+        assert_eq!(document["processing_priority"], "high");
+    }
+
+    #[test]
+    fn builds_archival_object_specific_staff_index_fields() {
+        let mut enriched = IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/8".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/8",
+                "title": "Original title",
+                "display_string": "Series I: Correspondence",
+                "publish": true,
+                "resource": {"ref": "/repositories/2/resources/7"},
+                "component_id": "I",
+                "ref_id": "ref8",
+                "slug": "series-i-correspondence",
+                "is_slug_auto": true,
+                "external_ids": [],
+                "ancestors": [{"ref": "/repositories/2/resources/7"}],
+                "lang_materials": []
+            }),
+            enrich: true,
+        };
+        enriched.enrich = true;
+
+        let document = build_index_document(enriched).unwrap();
+        assert_eq!(document["title"], "Series I: Correspondence");
+        assert_eq!(document["resource"], "/repositories/2/resources/7");
+        assert_eq!(document["identifier"], "I");
+        assert_eq!(document["component_id"], "I");
+        assert_eq!(document["ref_id"], "ref8");
+        assert_eq!(document["slug"], "series-i-correspondence");
+        assert_eq!(document["is_slug_auto"], true);
+        assert_eq!(document["external_id"], json!([]));
+        assert_eq!(
+            document["ancestors"],
+            json!(["/repositories/2/resources/7"])
+        );
+        assert_eq!(document["langcode"], json!([]));
     }
 
     #[test]
