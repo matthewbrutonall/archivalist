@@ -32,10 +32,17 @@ class ShadowResourceTreePath
       http.request(Net::HTTP::Get.new(sidecar_uri.request_uri))
     end
 
-    return nil unless response && response.code.to_s.match?(/\A2\d\d\z/)
+    unless response && response.code.to_s.match?(/\A2\d\d\z/)
+      status = response ? "HTTP #{response.code}" : 'no response'
+      Log.warn("Shadow resource tree path sidecar returned #{status}, falling back to LargeTree")
+      return nil
+    end
 
     paths = ASUtils.json_parse(response.body)
-    return nil unless valid_response?(paths, repo_id, resource_uri, node_ids)
+    unless valid_response?(paths, repo_id, resource_uri, node_ids)
+      Log.warn('Shadow resource tree path sidecar returned an invalid response, falling back to LargeTree')
+      return nil
+    end
 
     Log.debug("Shadow resource tree path fast path served #{resource_uri} for #{node_ids.length} nodes")
     paths

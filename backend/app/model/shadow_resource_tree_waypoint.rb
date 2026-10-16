@@ -72,10 +72,17 @@ class ShadowResourceTreeWaypoint
       http.request(request)
     end
 
-    return nil unless response && response.code.to_s.match?(/\A2\d\d\z/)
+    unless response && response.code.to_s.match?(/\A2\d\d\z/)
+      status = response ? "HTTP #{response.code}" : 'no response'
+      Log.warn("Shadow resource tree waypoint sidecar returned #{status}, falling back to LargeTree")
+      return nil
+    end
 
     nodes = ASUtils.json_parse(response.body)
-    return nil unless valid_response?(nodes, repo_id, offset, parent_node)
+    unless valid_response?(nodes, repo_id, offset, parent_node)
+      Log.warn('Shadow resource tree waypoint sidecar returned an invalid response, falling back to LargeTree')
+      return nil
+    end
 
     Log.debug("Shadow resource tree waypoint fast path served #{resource_uri} offset #{offset}")
     nodes

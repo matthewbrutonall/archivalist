@@ -314,10 +314,17 @@ class Search
       http.request(req)
     end
 
-    return nil unless res && res.code.to_s =~ /\A2\d\d\z/
+    unless res && res.code.to_s =~ /\A2\d\d\z/
+      status = res ? "HTTP #{res.code}" : 'no response'
+      Log.warn("Shadow search sidecar returned #{status}, falling back to Solr search")
+      return nil
+    end
 
     data = ASUtils.json_parse(res.body)
-    return nil unless data.is_a?(Hash) && data['num_found'] && data['docs'].is_a?(Array)
+    unless data.is_a?(Hash) && data['num_found'] && data['docs'].is_a?(Array)
+      Log.warn('Shadow search sidecar returned an invalid response, falling back to Solr search')
+      return nil
+    end
 
     transform_sidecar_search_response(data, page, page_size, start)
   rescue StandardError => e
