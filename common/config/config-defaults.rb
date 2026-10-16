@@ -976,6 +976,9 @@ AppConfig[:pui_shadow_search_sidecar_enabled] = false
 
 # Rust shadow resource tree waypoint integration
 AppConfig[:shadow_resource_tree_sidecar_enabled] = false
+# Independent gates under the master switch; enable only after separate canaries.
+AppConfig[:shadow_resource_tree_waypoint_sidecar_enabled] = false
+AppConfig[:shadow_resource_tree_path_sidecar_enabled] = false
 AppConfig[:shadow_resource_tree_sidecar_url] = "http://127.0.0.1:4570"
 AppConfig[:shadow_resource_tree_sidecar_timeout_seconds] = 1
 AppConfig[:shadow_resource_tree_root_min_children] = 200

@@ -30,6 +30,8 @@ describe ShadowResourceTreeWaypoint do
     allow(AppConfig).to receive(:has_key?).and_call_original
     allow(AppConfig).to receive(:has_key?).with(:shadow_resource_tree_sidecar_enabled).and_return(true)
     allow(AppConfig).to receive(:[]).with(:shadow_resource_tree_sidecar_enabled).and_return(true)
+    allow(AppConfig).to receive(:has_key?).with(:shadow_resource_tree_waypoint_sidecar_enabled).and_return(true)
+    allow(AppConfig).to receive(:[]).with(:shadow_resource_tree_waypoint_sidecar_enabled).and_return(true)
     allow(AppConfig).to receive(:[]).with(:shadow_resource_tree_sidecar_url).and_return('http://127.0.0.1:4570')
     allow(AppConfig).to receive(:[]).with(:shadow_resource_tree_sidecar_timeout_seconds).and_return(1)
     allow(AppConfig).to receive(:has_key?).with(:shadow_resource_tree_root_min_children).and_return(true)
@@ -99,6 +101,17 @@ describe ShadowResourceTreeWaypoint do
     allow(AppConfig).to receive(:[]).with(:shadow_resource_tree_sidecar_enabled).and_raise('missing setting')
 
     expect(ASHTTP).not_to receive(:start_uri)
+    expect(described_class.fetch(repo_id: repo_id,
+                                 resource_id: resource_id,
+                                 offset: 0,
+                                 parent_node: nil,
+                                 published_only: false)).to be_nil
+  end
+
+  it 'remains off when the waypoint-specific flag is disabled' do
+    allow(AppConfig).to receive(:[]).with(:shadow_resource_tree_waypoint_sidecar_enabled).and_return(false)
+    expect(ASHTTP).not_to receive(:start_uri)
+
     expect(described_class.fetch(repo_id: repo_id,
                                  resource_id: resource_id,
                                  offset: 0,

@@ -99,6 +99,8 @@ host.
 Release archives can be built reproducibly with
 `scripts/package_sidecar_release.sh`. See `deploy/CANARY.md` for the staged
 non-production rollout, parity gate, outage fallback test, and rollback procedure.
+The search and resource-tree gates are automated by `scripts/canary_shadow_search.sh`
+and `scripts/canary_resource_tree.sh`.
 
 ## Test and benchmark helpers
 

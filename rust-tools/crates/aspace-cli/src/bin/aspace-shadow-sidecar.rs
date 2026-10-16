@@ -236,30 +236,38 @@ struct ErrorResponse {
 }
 
 pub fn url_decode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.as_bytes().iter();
-    while let Some(&b) = chars.next() {
-        if b == b'%' {
-            if let (Some(&h1), Some(&h2)) = (chars.next(), chars.next()) {
-                if let Ok(hex_str) = std::str::from_utf8(&[h1, h2]) {
-                    if let Ok(byte) = u8::from_str_radix(hex_str, 16) {
-                        result.push(byte as char);
-                        continue;
-                    }
-                }
-                result.push('%');
-                result.push(h1 as char);
-                result.push(h2 as char);
-            } else {
-                result.push('%');
-            }
-        } else if b == b'+' {
-            result.push(' ');
-        } else {
-            result.push(b as char);
+    fn hex_value(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
         }
     }
-    result
+
+    let input = s.as_bytes();
+    let mut result = Vec::with_capacity(input.len());
+    let mut index = 0;
+
+    while index < input.len() {
+        match input[index] {
+            b'%' if index + 2 < input.len() => {
+                if let (Some(high), Some(low)) =
+                    (hex_value(input[index + 1]), hex_value(input[index + 2]))
+                {
+                    result.push((high << 4) | low);
+                    index += 3;
+                    continue;
+                }
+                result.push(b'%');
+            }
+            b'+' => result.push(b' '),
+            byte => result.push(byte),
+        }
+        index += 1;
+    }
+
+    String::from_utf8_lossy(&result).into_owned()
 }
 
 pub fn parse_query_string(query_str: &str) -> HashMap<String, String> {
@@ -1219,6 +1227,10 @@ mod tests {
         );
         assert_eq!(url_decode("hello+world"), "hello world");
         assert_eq!(url_decode("%2A1974%2A"), "*1974*");
+        assert_eq!(url_decode("S%C3%A1nchez"), "Sánchez");
+        assert_eq!(url_decode("Sa%CC%81nchez"), "Sánchez");
+        assert_eq!(url_decode("incomplete%2"), "incomplete%2");
+        assert_eq!(url_decode("invalid%é"), "invalid%é");
     }
 
     #[test]

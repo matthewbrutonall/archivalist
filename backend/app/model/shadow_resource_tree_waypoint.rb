@@ -163,7 +163,10 @@ class ShadowResourceTreeWaypoint
   end
 
   def self.sidecar_enabled?
-    AppConfig.has_key?(:shadow_resource_tree_sidecar_enabled) && AppConfig[:shadow_resource_tree_sidecar_enabled]
+    AppConfig.has_key?(:shadow_resource_tree_sidecar_enabled) &&
+      AppConfig[:shadow_resource_tree_sidecar_enabled] &&
+      AppConfig.has_key?(:shadow_resource_tree_waypoint_sidecar_enabled) &&
+      AppConfig[:shadow_resource_tree_waypoint_sidecar_enabled]
   end
 
   private_class_method :positive_integer?, :sidecar_enabled?

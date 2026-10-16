@@ -97,7 +97,10 @@ class ShadowResourceTreePath
   end
 
   def self.sidecar_enabled?
-    AppConfig.has_key?(:shadow_resource_tree_sidecar_enabled) && AppConfig[:shadow_resource_tree_sidecar_enabled]
+    AppConfig.has_key?(:shadow_resource_tree_sidecar_enabled) &&
+      AppConfig[:shadow_resource_tree_sidecar_enabled] &&
+      AppConfig.has_key?(:shadow_resource_tree_path_sidecar_enabled) &&
+      AppConfig[:shadow_resource_tree_path_sidecar_enabled]
   end
 
   private_class_method :minimum_nodes, :positive_integer?, :sidecar_enabled?

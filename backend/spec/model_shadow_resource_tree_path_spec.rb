@@ -33,6 +33,8 @@ describe ShadowResourceTreePath do
     allow(AppConfig).to receive(:has_key?).and_call_original
     allow(AppConfig).to receive(:has_key?).with(:shadow_resource_tree_sidecar_enabled).and_return(true)
     allow(AppConfig).to receive(:[]).with(:shadow_resource_tree_sidecar_enabled).and_return(true)
+    allow(AppConfig).to receive(:has_key?).with(:shadow_resource_tree_path_sidecar_enabled).and_return(true)
+    allow(AppConfig).to receive(:[]).with(:shadow_resource_tree_path_sidecar_enabled).and_return(true)
     allow(AppConfig).to receive(:[]).with(:shadow_resource_tree_sidecar_url).and_return('http://127.0.0.1:4570')
     allow(AppConfig).to receive(:[]).with(:shadow_resource_tree_sidecar_timeout_seconds).and_return(1)
     allow(AppConfig).to receive(:has_key?).with(:shadow_resource_tree_path_min_nodes).and_return(true)
@@ -49,6 +51,17 @@ describe ShadowResourceTreePath do
                                  root_title: 'Resource title',
                                  node_ids: node_ids,
                                  published_only: true)).to be_nil
+  end
+
+  it 'remains off when the path-specific flag is disabled' do
+    allow(AppConfig).to receive(:[]).with(:shadow_resource_tree_path_sidecar_enabled).and_return(false)
+    expect(ASHTTP).not_to receive(:start_uri)
+
+    expect(described_class.fetch(repo_id: repo_id,
+                                 resource_id: resource_id,
+                                 root_title: 'Resource title',
+                                 node_ids: node_ids,
+                                 published_only: false)).to be_nil
   end
 
   it 'rejects undersized, oversized, duplicate, and invalid node batches' do

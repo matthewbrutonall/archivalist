@@ -71,6 +71,55 @@ waypoints, and 64–128-node root paths separately. Retain the shipped threshold
 200 root children, 100 node children, and 64 path nodes. Exercise the same outage
 fallback before accepting each path.
 
+Use one backend with all sidecar flags disabled as the baseline and a second,
+otherwise identical backend with only the resource-tree flag enabled:
+
+```ruby
+AppConfig[:shadow_search_sidecar_enabled] = false
+AppConfig[:pui_shadow_search_sidecar_enabled] = false
+AppConfig[:shadow_resource_tree_sidecar_enabled] = true
+AppConfig[:shadow_resource_tree_waypoint_sidecar_enabled] = true
+AppConfig[:shadow_resource_tree_path_sidecar_enabled] = true
+AppConfig[:shadow_resource_tree_sidecar_url] = "http://127.0.0.1:4570"
+AppConfig[:shadow_resource_tree_sidecar_timeout_seconds] = 1
+```
+
+Select a nested node with at least 100 immediate children and 64–128 unique node
+IDs belonging to the same resource. Run all three gates with:
+
+```bash
+BASELINE_BACKEND_URL=http://127.0.0.1:4567 \
+CANARY_BACKEND_URL=http://127.0.0.1:4569 \
+REPO_ID=2 RESOURCE_ID=18 \
+NODE_URI=/repositories/2/archival_objects/1712 \
+NODE_IDS=1,2,3,...,64 ADMIN_PASSWORD='canary-password' \
+  scripts/canary_resource_tree.sh
+```
+
+The script compares the complete canonical JSON response, records native and Rust
+latencies, and verifies from the sidecar request counter that every canary request
+used Rust. It performs three warm-up rounds by default and alternates native/Rust
+request order to reduce cache and ordering bias. For the outage gate, stop the sidecar and rerun with
+`EXPECT_FAST_PATH=false`; every response must still match the baseline, and the
+backend log must contain a fallback warning for each tree path.
+
+Treat the two specific flags as independent acceptance gates. Leave either flag
+`false` if its canary is slower or fails parity. The master
+`shadow_resource_tree_sidecar_enabled` flag remains the single emergency kill
+switch for both accelerators. Use `GATES=root_paths` or a comma-separated subset
+to repeat only the paths being accepted or tested for outage fallback.
+
+When only batched root paths pass the gate, use:
+
+```ruby
+AppConfig[:shadow_resource_tree_sidecar_enabled] = true
+AppConfig[:shadow_resource_tree_waypoint_sidecar_enabled] = false
+AppConfig[:shadow_resource_tree_path_sidecar_enabled] = true
+```
+
+This keeps root and nested waypoint responses on LargeTree while accelerating only
+eligible 64–128-node `node_from_root` batches.
+
 ## Rollback
 
 Set all four sidecar enable flags to `false` and restart Archivalist. The sidecar
