@@ -4,7 +4,7 @@ use std::fmt;
 
 pub const MAX_INDEX_DOCUMENT_BATCH: usize = 1_000;
 
-#[derive(Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Clone)]
 pub struct IndexDocumentInput {
     pub uri: String,
     pub record_type: String,
@@ -12,6 +12,24 @@ pub struct IndexDocumentInput {
     pub record: Value,
     #[serde(default)]
     pub enrich: bool,
+    #[serde(default)]
+    pub dynamic_enum_fields: Vec<String>,
+    #[serde(default)]
+    pub arks_enabled: bool,
+}
+
+impl Default for IndexDocumentInput {
+    fn default() -> Self {
+        Self {
+            uri: String::new(),
+            record_type: String::new(),
+            repository: Value::Null,
+            record: Value::Null,
+            enrich: false,
+            dynamic_enum_fields: Vec::new(),
+            arks_enabled: false,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, PartialEq)]
@@ -2379,11 +2397,164 @@ fn add_record_type_markers(
     Ok(())
 }
 
+fn add_to_set_map(sets: &mut Vec<(String, Vec<Value>)>, key: &str, val: &Value) {
+    if let Some((_, set)) = sets.iter_mut().find(|(k, _)| k == key) {
+        if !set.contains(val) {
+            set.push(val.clone());
+        }
+    } else {
+        sets.push((key.to_string(), vec![val.clone()]));
+    }
+}
+
+fn search_nested_enums(
+    elt: &Value,
+    enum_fields: &[String],
+    enum_sets: &mut Vec<(String, Vec<Value>)>,
+) {
+    match elt {
+        Value::Object(map) => {
+            for key in enum_fields {
+                if let Some(field_value) = map.get(key) {
+                    let doc_key = format!("{key}_enum_s");
+                    add_to_set_map(enum_sets, &doc_key, field_value);
+                }
+            }
+            for (next_key, value) in map {
+                if next_key != "_resolved" {
+                    search_nested_enums(value, enum_fields, enum_sets);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                search_nested_enums(item, enum_fields, enum_sets);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn search_nested_items_type(elt: &Value, enum_sets: &mut Vec<(String, Vec<Value>)>) {
+    match elt {
+        Value::Object(map) => {
+            if let Some(Value::Object(items_map)) = map.get("items") {
+                if let Some(type_val) = items_map.get("type") {
+                    add_to_set_map(enum_sets, "type_enum_s", type_val);
+                }
+            }
+            for (next_key, value) in map {
+                if next_key != "_resolved" {
+                    search_nested_items_type(value, enum_sets);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                search_nested_items_type(item, enum_sets);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn flatten_value(val: &Value, out: &mut Vec<Value>) {
+    match val {
+        Value::Array(items) => {
+            for item in items {
+                flatten_value(item, out);
+            }
+        }
+        other => {
+            out.push(other.clone());
+        }
+    }
+}
+
+fn add_dynamic_enums(
+    document: &mut Map<String, Value>,
+    full_record: &Value,
+    dynamic_enum_fields: &[String],
+) {
+    let mut enum_sets: Vec<(String, Vec<Value>)> = Vec::new();
+    if !dynamic_enum_fields.is_empty() {
+        search_nested_enums(full_record, dynamic_enum_fields, &mut enum_sets);
+    }
+    search_nested_items_type(full_record, &mut enum_sets);
+
+    for (key, set) in enum_sets {
+        let mut flattened = Vec::new();
+        for item in &set {
+            flatten_value(item, &mut flattened);
+        }
+        document.insert(key, Value::Array(flattened));
+    }
+}
+
+fn trim_ark_value(s: &str) -> String {
+    let (first_line, rest) = match s.split_once('\n') {
+        Some((line, tail)) => (line, Some(tail)),
+        None => (s, None),
+    };
+    if let Some(idx) = first_line.rfind("ark:") {
+        match rest {
+            Some(tail) => format!("ark:{}\n{}", &first_line[idx + 4..], tail),
+            None => format!("ark:{}", &first_line[idx + 4..]),
+        }
+    } else {
+        s.to_string()
+    }
+}
+
+fn add_arks(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let ark_val = match record.get("ark_name") {
+        None | Some(Value::Null) => return Ok(()),
+        Some(val) => val,
+    };
+    let arks = ark_val
+        .as_object()
+        .ok_or_else(|| error("field 'ark_name' must be an object when present"))?;
+
+    let previous_val = arks
+        .get("previous")
+        .ok_or_else(|| error("field 'ark_name.previous' is required"))?;
+    let previous_arr = previous_val
+        .as_array()
+        .ok_or_else(|| error("field 'ark_name.previous' must be an array"))?;
+
+    let mut ark_list = Vec::new();
+
+    if let Some(current_val) = arks.get("current") {
+        match current_val {
+            Value::Null => {}
+            Value::String(current_str) => {
+                ark_list.push(Value::String(trim_ark_value(current_str)));
+            }
+            _ => return Err(error("field 'ark_name.current' must be a string or null")),
+        }
+    }
+
+    for prev_val in previous_arr {
+        let prev_str = prev_val
+            .as_str()
+            .ok_or_else(|| error("elements of 'ark_name.previous' must be strings"))?;
+        ark_list.push(Value::String(trim_ark_value(prev_str)));
+    }
+
+    document.insert("ark_name".to_string(), Value::Array(ark_list));
+    Ok(())
+}
+
 fn add_enriched_fields(
     document: &mut Map<String, Value>,
     record_type: &str,
     record: &Map<String, Value>,
     full_record: &Value,
+    dynamic_enum_fields: &[String],
+    arks_enabled: bool,
 ) -> Result<(), IndexDocumentError> {
     add_subjects(document, record)?;
     add_agents(document, record)?;
@@ -2461,6 +2632,11 @@ fn add_enriched_fields(
     );
     let mut rust_fields = vec![json_string("common_metadata"), json_string("fullrecord")];
     add_record_type_markers(document, record_type, record, &mut rust_fields)?;
+    add_dynamic_enums(document, full_record, dynamic_enum_fields);
+    if arks_enabled {
+        add_arks(document, record)?;
+    }
+    rust_fields.push(json_string("dynamic_enum_and_ark_metadata"));
     document.insert(
         "_archivalist_rust_fields".to_string(),
         Value::Array(rust_fields),
@@ -2540,8 +2716,16 @@ pub fn build_index_document(input: IndexDocumentInput) -> Result<Value, IndexDoc
     document.insert("repository".to_string(), input.repository);
 
     if input.enrich {
-        add_enriched_fields(&mut document, &input.record_type, record, &input.record)?;
+        add_enriched_fields(
+            &mut document,
+            &input.record_type,
+            record,
+            &input.record,
+            &input.dynamic_enum_fields,
+            input.arks_enabled,
+        )?;
     }
+
     if let Some(child) = collection_management {
         document.insert(
             COLLECTION_MANAGEMENT_DOCUMENTS_KEY.to_string(),
@@ -2588,6 +2772,7 @@ mod tests {
             repository: json!(2),
             record,
             enrich: false,
+            ..Default::default()
         }
     }
 
@@ -2674,7 +2859,8 @@ mod tests {
             json!([
                 "common_metadata",
                 "fullrecord",
-                "resource_archival_object_metadata"
+                "resource_archival_object_metadata",
+                "dynamic_enum_and_ark_metadata"
             ])
         );
 
@@ -2795,6 +2981,7 @@ mod tests {
                 "lang_materials": []
             }),
             enrich: true,
+            ..Default::default()
         };
         enriched.enrich = true;
 
@@ -2857,6 +3044,7 @@ mod tests {
                 "lang_materials": [{"language_and_script": {"language": "gle"}}]
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
 
@@ -2884,7 +3072,8 @@ mod tests {
             json!([
                 "common_metadata",
                 "fullrecord",
-                "accession_digital_object_metadata"
+                "accession_digital_object_metadata",
+                "dynamic_enum_and_ark_metadata"
             ])
         );
     }
@@ -2916,6 +3105,7 @@ mod tests {
                 "lang_materials": []
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
 
@@ -2936,7 +3126,8 @@ mod tests {
             json!([
                 "common_metadata",
                 "fullrecord",
-                "accession_digital_object_metadata"
+                "accession_digital_object_metadata",
+                "dynamic_enum_and_ark_metadata"
             ])
         );
     }
@@ -2961,6 +3152,7 @@ mod tests {
                 "external_ids": [{"external_id": "subject-12"}]
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
 
@@ -2974,7 +3166,12 @@ mod tests {
         assert_eq!(document["external_id"], json!(["subject-12"]));
         assert_eq!(
             document["_archivalist_rust_fields"],
-            json!(["common_metadata", "fullrecord", "agent_subject_metadata"])
+            json!([
+                "common_metadata",
+                "fullrecord",
+                "agent_subject_metadata",
+                "dynamic_enum_and_ark_metadata"
+            ])
         );
     }
 
@@ -3025,6 +3222,7 @@ mod tests {
                 "external_ids": []
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
 
@@ -3048,7 +3246,12 @@ mod tests {
         );
         assert_eq!(
             document["_archivalist_rust_fields"],
-            json!(["common_metadata", "fullrecord", "agent_subject_metadata"])
+            json!([
+                "common_metadata",
+                "fullrecord",
+                "agent_subject_metadata",
+                "dynamic_enum_and_ark_metadata"
+            ])
         );
     }
 
@@ -3071,6 +3274,7 @@ mod tests {
                 "ancestors": [{"ref": "/repositories/2/digital_objects/1"}]
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
 
@@ -3087,7 +3291,8 @@ mod tests {
             json!([
                 "common_metadata",
                 "fullrecord",
-                "component_classification_metadata"
+                "component_classification_metadata",
+                "dynamic_enum_and_ark_metadata"
             ])
         );
     }
@@ -3120,6 +3325,7 @@ mod tests {
                 "ancestors": [{"ref": "/repositories/2/classifications/1"}]
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
 
@@ -3143,7 +3349,8 @@ mod tests {
             json!([
                 "common_metadata",
                 "fullrecord",
-                "component_classification_metadata"
+                "component_classification_metadata",
+                "dynamic_enum_and_ark_metadata"
             ])
         );
     }
@@ -3167,6 +3374,7 @@ mod tests {
                 "lang_materials": [{"language_and_script": {"language": "eng"}}]
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
 
@@ -3189,7 +3397,8 @@ mod tests {
             json!([
                 "common_metadata",
                 "fullrecord",
-                "repository_event_location_metadata"
+                "repository_event_location_metadata",
+                "dynamic_enum_and_ark_metadata"
             ])
         );
     }
@@ -3281,6 +3490,7 @@ mod tests {
                 "ancestors": []
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
 
@@ -3325,7 +3535,8 @@ mod tests {
             json!([
                 "common_metadata",
                 "fullrecord",
-                "repository_event_location_metadata"
+                "repository_event_location_metadata",
+                "dynamic_enum_and_ark_metadata"
             ])
         );
     }
@@ -3357,6 +3568,7 @@ mod tests {
                 "ancestors": []
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
 
@@ -3387,7 +3599,8 @@ mod tests {
             json!([
                 "common_metadata",
                 "fullrecord",
-                "repository_event_location_metadata"
+                "repository_event_location_metadata",
+                "dynamic_enum_and_ark_metadata"
             ])
         );
 
@@ -3406,6 +3619,7 @@ mod tests {
                 "owner_repo": {"ref": "/repositories/2"}
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
 
@@ -3450,6 +3664,7 @@ mod tests {
                 "lang_materials": [{"language_and_script": {"language": "eng"}}]
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
 
@@ -3490,7 +3705,8 @@ mod tests {
             json!([
                 "common_metadata",
                 "fullrecord",
-                "profile_assessment_metadata"
+                "profile_assessment_metadata",
+                "dynamic_enum_and_ark_metadata"
             ])
         );
 
@@ -3510,6 +3726,7 @@ mod tests {
                 "ancestors": []
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
 
@@ -3539,7 +3756,8 @@ mod tests {
             json!([
                 "common_metadata",
                 "fullrecord",
-                "profile_assessment_metadata"
+                "profile_assessment_metadata",
+                "dynamic_enum_and_ark_metadata"
             ])
         );
     }
@@ -3641,6 +3859,7 @@ mod tests {
                 "ancestors": []
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
 
@@ -3731,7 +3950,8 @@ mod tests {
             json!([
                 "common_metadata",
                 "fullrecord",
-                "profile_assessment_metadata"
+                "profile_assessment_metadata",
+                "dynamic_enum_and_ark_metadata"
             ])
         );
 
@@ -3764,6 +3984,7 @@ mod tests {
                 "conservation_issues": []
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
 
@@ -3957,6 +4178,7 @@ mod tests {
                 "lang_materials": [{"language_and_script": {"language": "eng"}}]
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
 
@@ -4117,7 +4339,12 @@ mod tests {
         assert_eq!(full_top_container["publish"], false);
         assert_eq!(
             full_top_container["_archivalist_rust_fields"],
-            json!(["common_metadata", "fullrecord", "top_container_metadata"])
+            json!([
+                "common_metadata",
+                "fullrecord",
+                "top_container_metadata",
+                "dynamic_enum_and_ark_metadata"
+            ])
         );
 
         let minimal_top_container = build_index_document(IndexDocumentInput {
@@ -4131,6 +4358,7 @@ mod tests {
                 "container_locations": []
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
 
@@ -4202,7 +4430,12 @@ mod tests {
         );
         assert_eq!(
             minimal_top_container["_archivalist_rust_fields"],
-            json!(["common_metadata", "fullrecord", "top_container_metadata"])
+            json!([
+                "common_metadata",
+                "fullrecord",
+                "top_container_metadata",
+                "dynamic_enum_and_ark_metadata"
+            ])
         );
     }
 
@@ -4244,6 +4477,7 @@ mod tests {
                 ]
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
 
@@ -4291,6 +4525,7 @@ mod tests {
                 "exported_to_ils": Value::Null
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(exported_null["exported_u_sbool"], true);
@@ -4342,6 +4577,7 @@ mod tests {
                 "lang_materials": [{"language_and_script": {"language": "eng"}}]
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
 
@@ -4373,7 +4609,12 @@ mod tests {
         assert!(report_job.get("job_data").is_none());
         assert_eq!(
             report_job["_archivalist_rust_fields"],
-            json!(["common_metadata", "fullrecord", "job_metadata"])
+            json!([
+                "common_metadata",
+                "fullrecord",
+                "job_metadata",
+                "dynamic_enum_and_ark_metadata"
+            ])
         );
 
         let minimal_import_job = build_index_document(IndexDocumentInput {
@@ -4391,6 +4632,7 @@ mod tests {
                 "owner": "archivist"
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
 
@@ -4409,7 +4651,12 @@ mod tests {
         assert_eq!(minimal_import_job["langcode"], json!([]));
         assert_eq!(
             minimal_import_job["_archivalist_rust_fields"],
-            json!(["common_metadata", "fullrecord", "job_metadata"])
+            json!([
+                "common_metadata",
+                "fullrecord",
+                "job_metadata",
+                "dynamic_enum_and_ark_metadata"
+            ])
         );
 
         let falsy_report_type_job = build_index_document(IndexDocumentInput {
@@ -4427,6 +4674,7 @@ mod tests {
                 "owner": "admin"
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(
@@ -4451,6 +4699,7 @@ mod tests {
                 "owner": "admin"
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(empty_report_type_job["report_type"], "");
@@ -4469,6 +4718,7 @@ mod tests {
                 "owner": "admin"
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(
@@ -4491,6 +4741,7 @@ mod tests {
                 "owner": "admin"
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(
@@ -4519,6 +4770,7 @@ mod tests {
                 "owner": "admin"
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(
@@ -4544,6 +4796,7 @@ mod tests {
                 "owner": "admin"
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(
@@ -4566,11 +4819,16 @@ mod tests {
                 "title": "Custom 5"
             }),
             enrich: true,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(
             custom_record["_archivalist_rust_fields"],
-            json!(["common_metadata", "fullrecord"])
+            json!([
+                "common_metadata",
+                "fullrecord",
+                "dynamic_enum_and_ark_metadata"
+            ])
         );
         assert!(
             !custom_record["_archivalist_rust_fields"]
@@ -4593,6 +4851,7 @@ mod tests {
                 "owner": "admin"
             }),
             enrich: false,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(unenriched_job["title"], "Envelope job title");
@@ -4612,6 +4871,7 @@ mod tests {
                 "long_display_string": "Long Box 55"
             }),
             enrich: false,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(unenriched_top_container["title"], "Envelope title");
@@ -4632,6 +4892,7 @@ mod tests {
                 "display_string": "Display title"
             }),
             enrich: false,
+            ..Default::default()
         })
         .unwrap();
         assert_eq!(unenriched_assessment["title"], "Envelope title");
@@ -4688,6 +4949,7 @@ mod tests {
                     "display_string": "Bad Assessment"
                 }),
                 enrich: true,
+                ..Default::default()
             })
             .is_err());
         }
@@ -4701,6 +4963,7 @@ mod tests {
                 "formats": "not-an-array"
             }),
             enrich: true,
+            ..Default::default()
         })
         .is_err());
         assert!(build_index_document(IndexDocumentInput {
@@ -4711,6 +4974,7 @@ mod tests {
                 "uri": "/repositories/2/top_containers/55"
             }),
             enrich: true,
+            ..Default::default()
         })
         .is_err());
         assert!(build_index_document(IndexDocumentInput {
@@ -4723,6 +4987,7 @@ mod tests {
                 "container_locations": [{"status": "current", "ref": "/locations/1"}]
             }),
             enrich: true,
+            ..Default::default()
         })
         .is_err());
         assert!(build_index_document(IndexDocumentInput {
@@ -4733,6 +4998,7 @@ mod tests {
                 "uri": "/repositories/2/jobs/5"
             }),
             enrich: true,
+            ..Default::default()
         })
         .is_err());
         assert!(build_index_document(IndexDocumentInput {
@@ -4744,6 +5010,7 @@ mod tests {
                 "job": ["invalid-array-job"]
             }),
             enrich: true,
+            ..Default::default()
         })
         .is_err());
     }
@@ -4845,6 +5112,7 @@ mod tests {
                 "collection_management": minimal_cm
             }),
             enrich: true,
+            ..Default::default()
         };
         let acc_doc = build_index_document(minimal_accession).unwrap();
         let acc_children = acc_doc[COLLECTION_MANAGEMENT_DOCUMENTS_KEY]
@@ -4878,6 +5146,7 @@ mod tests {
                 "collection_management": do_cm
             }),
             enrich: true,
+            ..Default::default()
         };
         let do_doc = build_index_document(digital_object).unwrap();
         let do_child = &do_doc[COLLECTION_MANAGEMENT_DOCUMENTS_KEY]
@@ -4925,6 +5194,7 @@ mod tests {
                 "collection_management": { "uri": "/repositories/2/collection_management/21" }
             }),
             enrich: true,
+            ..Default::default()
         };
         let unsupported_doc = build_index_document(unsupported_type).unwrap();
         assert!(!unsupported_doc
@@ -4997,5 +5267,546 @@ mod tests {
             .map(|_| input(json!({"uri": "/repositories/2/resources/7"})))
             .collect();
         assert!(build_index_document_batch(IndexDocumentBatchRequest { records }).is_err());
+    }
+
+    #[test]
+    fn dynamic_enums_nested_hashes_and_arrays() {
+        let input_doc = IndexDocumentInput {
+            uri: "/repositories/2/resources/10".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/10",
+                "title": "Nested Enums Resource",
+                "publish": true,
+                "rights_statements": [
+                    {
+                        "rights_type": "copyright",
+                        "acts": [
+                            { "status": "active" },
+                            { "status": "expired" }
+                        ]
+                    }
+                ],
+                "instances": [
+                    {
+                        "instance_type": "text",
+                        "sub_container": {
+                            "type_2": "folder"
+                        }
+                    }
+                ]
+            }),
+            enrich: true,
+            dynamic_enum_fields: vec![
+                "rights_type".to_string(),
+                "status".to_string(),
+                "instance_type".to_string(),
+                "type_2".to_string(),
+                "nonexistent".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input_doc).unwrap();
+        assert_eq!(doc["rights_type_enum_s"], json!(["copyright"]));
+        assert_eq!(doc["status_enum_s"], json!(["active", "expired"]));
+        assert_eq!(doc["instance_type_enum_s"], json!(["text"]));
+        assert_eq!(doc["type_2_enum_s"], json!(["folder"]));
+        assert!(doc.get("nonexistent_enum_s").is_none());
+        assert!(doc["_archivalist_rust_fields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("dynamic_enum_and_ark_metadata")));
+    }
+
+    #[test]
+    fn dynamic_enums_excludes_resolved_subtrees() {
+        let input_doc = IndexDocumentInput {
+            uri: "/repositories/2/resources/11".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/11",
+                "title": "Resolved Exclusion Resource",
+                "publish": true,
+                "rights_type": "in_copyright",
+                "_resolved": {
+                    "rights_type": "should_be_ignored_copyright",
+                    "status": "should_be_ignored_status",
+                    "items": { "type": "should_be_ignored_type" }
+                },
+                "subrecord": {
+                    "_resolved": {
+                        "status": "nested_ignored_status"
+                    }
+                }
+            }),
+            enrich: true,
+            dynamic_enum_fields: vec![
+                "rights_type".to_string(),
+                "status".to_string(),
+                "type".to_string(),
+            ],
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input_doc).unwrap();
+        assert_eq!(doc["rights_type_enum_s"], json!(["in_copyright"]));
+        assert!(doc.get("status_enum_s").is_none());
+        assert!(doc.get("type_enum_s").is_none());
+    }
+
+    #[test]
+    fn dynamic_enums_preserves_stable_order_and_deduplicates() {
+        let input_doc = IndexDocumentInput {
+            uri: "/repositories/2/resources/12".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/12",
+                "title": "Order and Dedupe",
+                "publish": true,
+                "notes": [
+                    { "status": "draft" },
+                    { "status": "reviewed" },
+                    { "status": "draft" },
+                    { "status": "approved" }
+                ],
+                "array_field": ["val1", "val2"],
+                "sub": {
+                    "array_field": "val1"
+                }
+            }),
+            enrich: true,
+            dynamic_enum_fields: vec!["status".to_string(), "array_field".to_string()],
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input_doc).unwrap();
+        assert_eq!(
+            doc["status_enum_s"],
+            json!(["draft", "reviewed", "approved"])
+        );
+        // array ["val1", "val2"] added, then scalar "val1" added (not equal to array), then flattened
+        assert_eq!(doc["array_field_enum_s"], json!(["val1", "val2", "val1"]));
+    }
+
+    #[test]
+    fn dynamic_enums_handles_multiple_keys_in_same_and_different_objects() {
+        let input_doc = IndexDocumentInput {
+            uri: "/repositories/2/resources/13".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/13",
+                "title": "Multiple Keys Resource",
+                "publish": true,
+                "level": "collection",
+                "resource_type": "records",
+                "sub": {
+                    "level": "series",
+                    "resource_type": "papers"
+                }
+            }),
+            enrich: true,
+            dynamic_enum_fields: vec!["level".to_string(), "resource_type".to_string()],
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input_doc).unwrap();
+        assert_eq!(doc["level_enum_s"], json!(["collection", "series"]));
+        assert_eq!(doc["resource_type_enum_s"], json!(["records", "papers"]));
+    }
+
+    #[test]
+    fn dynamic_enums_projects_items_type_into_type_enum_s() {
+        // When "type" is not in dynamic_enum_fields, only items containing a Hash with "type"
+        // are projected into type_enum_s (native Pass 2 behavior).
+        let input_doc = IndexDocumentInput {
+            uri: "/repositories/2/resources/14".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/14",
+                "title": "Items Type Resource",
+                "publish": true,
+                "type": "outer_type",
+                "notes": [
+                    {
+                        "items": { "type": "inner_hash_type" }
+                    },
+                    {
+                        "items": [
+                            { "type": "array_item_type_not_a_hash_under_items" }
+                        ]
+                    }
+                ]
+            }),
+            enrich: true,
+            dynamic_enum_fields: vec![],
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input_doc).unwrap();
+        assert_eq!(doc["type_enum_s"], json!(["inner_hash_type"]));
+    }
+
+    #[test]
+    fn dynamic_enums_omits_absent_fields_and_preserves_empty_arrays() {
+        let input_doc = IndexDocumentInput {
+            uri: "/repositories/2/resources/15".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/15",
+                "title": "Absent and Empty",
+                "publish": true,
+                "empty_field": []
+            }),
+            enrich: true,
+            dynamic_enum_fields: vec!["empty_field".to_string(), "missing_field".to_string()],
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input_doc).unwrap();
+        assert_eq!(doc["empty_field_enum_s"], json!([]));
+        assert!(doc.get("missing_field_enum_s").is_none());
+    }
+
+    #[test]
+    fn projects_arks_with_current_and_previous_ordering_and_trim_semantics() {
+        let input_doc = IndexDocumentInput {
+            uri: "/repositories/2/resources/16".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/16",
+                "title": "ARK Resource",
+                "publish": true,
+                "ark_name": {
+                    "current": "https://n2t.net/ark:/12345/current_val",
+                    "previous": [
+                        "ark:/12345/prev_one",
+                        "https://archive.org/ark:/12345/prev_two"
+                    ]
+                }
+            }),
+            enrich: true,
+            arks_enabled: true,
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input_doc).unwrap();
+        assert_eq!(
+            doc["ark_name"],
+            json!([
+                "ark:/12345/current_val",
+                "ark:/12345/prev_one",
+                "ark:/12345/prev_two"
+            ])
+        );
+
+        // Null current: only previous values
+        let null_curr_input = IndexDocumentInput {
+            uri: "/repositories/2/resources/17".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/17",
+                "title": "Null Current ARK Resource",
+                "publish": true,
+                "ark_name": {
+                    "current": null,
+                    "previous": ["ark:/12345/prev_only"]
+                }
+            }),
+            enrich: true,
+            arks_enabled: true,
+            ..Default::default()
+        };
+        let null_curr_doc = build_index_document(null_curr_input).unwrap();
+        assert_eq!(null_curr_doc["ark_name"], json!(["ark:/12345/prev_only"]));
+    }
+
+    #[test]
+    fn projects_arks_with_multiple_ark_substrings() {
+        let input_doc = IndexDocumentInput {
+            uri: "/repositories/2/resources/18".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/18",
+                "title": "Multiple ARK Substrings Resource",
+                "publish": true,
+                "ark_name": {
+                    "current": "http://example.org/ark:/proxy/ark:/final_val",
+                    "previous": []
+                }
+            }),
+            enrich: true,
+            arks_enabled: true,
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input_doc).unwrap();
+        assert_eq!(doc["ark_name"], json!(["ark:/final_val"]));
+    }
+
+    #[test]
+    fn projects_dynamic_enums_and_arks_with_unicode() {
+        let input_doc = IndexDocumentInput {
+            uri: "/repositories/2/resources/19".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/19",
+                "title": "Unicode Resource",
+                "publish": true,
+                "genre": "korespondencja_rękopiśmienna",
+                "ark_name": {
+                    "current": "https://example.org/ark:/12345/bók-123_żółw",
+                    "previous": []
+                }
+            }),
+            enrich: true,
+            dynamic_enum_fields: vec!["genre".to_string()],
+            arks_enabled: true,
+        };
+
+        let doc = build_index_document(input_doc).unwrap();
+        assert_eq!(doc["genre_enum_s"], json!(["korespondencja_rękopiśmienna"]));
+        assert_eq!(doc["ark_name"], json!(["ark:/12345/bók-123_żółw"]));
+    }
+
+    #[test]
+    fn omits_arks_when_disabled_or_absent() {
+        // ARKs disabled: ark_name omitted even when present in record
+        let disabled_input = IndexDocumentInput {
+            uri: "/repositories/2/resources/20".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/20",
+                "title": "Disabled ARKs Resource",
+                "publish": true,
+                "ark_name": {
+                    "current": "ark:/12345/should_be_omitted",
+                    "previous": []
+                }
+            }),
+            enrich: true,
+            arks_enabled: false,
+            ..Default::default()
+        };
+        let disabled_doc = build_index_document(disabled_input).unwrap();
+        assert!(disabled_doc.get("ark_name").is_none());
+
+        // ARKs enabled but record has no ark_name
+        let absent_input = IndexDocumentInput {
+            uri: "/repositories/2/resources/21".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/21",
+                "title": "No ARK Resource",
+                "publish": true
+            }),
+            enrich: true,
+            arks_enabled: true,
+            ..Default::default()
+        };
+        let absent_doc = build_index_document(absent_input).unwrap();
+        assert!(absent_doc.get("ark_name").is_none());
+    }
+
+    #[test]
+    fn rejects_malformed_ark_inputs() {
+        // Non-object ark_name
+        let bad_ark_obj = IndexDocumentInput {
+            uri: "/repositories/2/resources/22".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/22",
+                "title": "Bad ARK",
+                "publish": true,
+                "ark_name": "not an object"
+            }),
+            enrich: true,
+            arks_enabled: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(bad_ark_obj).is_err());
+
+        // Missing previous array
+        let missing_prev = IndexDocumentInput {
+            uri: "/repositories/2/resources/23".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/23",
+                "title": "Missing Previous ARK",
+                "publish": true,
+                "ark_name": { "current": "ark:/123" }
+            }),
+            enrich: true,
+            arks_enabled: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(missing_prev).is_err());
+
+        // Non-array previous
+        let non_array_prev = IndexDocumentInput {
+            uri: "/repositories/2/resources/24".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/24",
+                "title": "Non-array Previous ARK",
+                "publish": true,
+                "ark_name": { "previous": "not an array" }
+            }),
+            enrich: true,
+            arks_enabled: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(non_array_prev).is_err());
+
+        // Non-string in previous
+        let non_string_prev = IndexDocumentInput {
+            uri: "/repositories/2/resources/25".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/25",
+                "title": "Non-string in Previous",
+                "publish": true,
+                "ark_name": { "previous": [123] }
+            }),
+            enrich: true,
+            arks_enabled: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(non_string_prev).is_err());
+
+        // Non-string current
+        let non_string_curr = IndexDocumentInput {
+            uri: "/repositories/2/resources/26".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/26",
+                "title": "Non-string Current",
+                "publish": true,
+                "ark_name": { "current": 123, "previous": [] }
+            }),
+            enrich: true,
+            arks_enabled: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(non_string_curr).is_err());
+    }
+
+    #[test]
+    fn unenriched_requests_do_not_project_enums_or_arks_or_marker() {
+        let unenriched = IndexDocumentInput {
+            uri: "/repositories/2/resources/27".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/27",
+                "title": "Unenriched",
+                "publish": true,
+                "rights_type": "copyright",
+                "ark_name": { "current": "ark:/123", "previous": [] }
+            }),
+            enrich: false,
+            dynamic_enum_fields: vec!["rights_type".to_string()],
+            arks_enabled: true,
+        };
+
+        let doc = build_index_document(unenriched).unwrap();
+        assert!(doc.get("rights_type_enum_s").is_none());
+        assert!(doc.get("ark_name").is_none());
+        assert!(doc.get("_archivalist_rust_fields").is_none());
+    }
+
+    #[test]
+    fn test_trim_ark_value_ruby_newline_semantics() {
+        // No newline: trims to last ark:
+        assert_eq!(trim_ark_value("ark:/12345/foo"), "ark:/12345/foo");
+        assert_eq!(
+            trim_ark_value("http://example.org/ark:/12345/foo"),
+            "ark:/12345/foo"
+        );
+        assert_eq!(
+            trim_ark_value("prefix ark:/first ark:/second"),
+            "ark:/second"
+        );
+        assert_eq!(trim_ark_value("no ark here"), "no ark here");
+        assert_eq!(trim_ark_value(""), "");
+
+        // Newline cases: regex /\A.*ark:/ cannot cross \n
+        // prefix\nark:/later is unchanged because ark: is not on the first line
+        assert_eq!(trim_ark_value("prefix\nark:/later"), "prefix\nark:/later");
+        // pre ark:/first\nark:/second trims first line to last ark: on first line and preserves rest
+        assert_eq!(
+            trim_ark_value("pre ark:/first\nark:/second"),
+            "ark:/first\nark:/second"
+        );
+        // multiple arks on first line with newline suffix
+        assert_eq!(
+            trim_ark_value("pre ark:/one ark:/two\nark:/three\nark:/four"),
+            "ark:/two\nark:/three\nark:/four"
+        );
+        // \r\n: \r is on first line
+        assert_eq!(
+            trim_ark_value("pre ark:/first\r\nark:/second"),
+            "ark:/first\r\nark:/second"
+        );
+        assert_eq!(
+            trim_ark_value("prefix\r\nark:/later"),
+            "prefix\r\nark:/later"
+        );
+        // \nark:/foo: first line is empty, so unchanged
+        assert_eq!(trim_ark_value("\nark:/foo"), "\nark:/foo");
+        // ark:/foo\n: first line trimmed, \n preserved
+        assert_eq!(trim_ark_value("ark:/foo\n"), "ark:/foo\n");
+    }
+
+    #[test]
+    fn projects_arks_with_newline_cases_matching_ruby_semantics() {
+        let input = IndexDocumentInput {
+            uri: "/repositories/2/resources/28".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/28",
+                "title": "Newline ARKs",
+                "publish": true,
+                "ark_name": {
+                    "current": "prefix\nark:/later",
+                    "previous": [
+                        "pre ark:/first\nark:/second",
+                        "pre ark:/one ark:/two\nark:/three"
+                    ]
+                }
+            }),
+            enrich: true,
+            arks_enabled: true,
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input).unwrap();
+        let arks = doc.get("ark_name").and_then(Value::as_array).unwrap();
+        assert_eq!(
+            arks,
+            &vec![
+                json!("prefix\nark:/later"),
+                json!("ark:/first\nark:/second"),
+                json!("ark:/two\nark:/three"),
+            ]
+        );
     }
 }

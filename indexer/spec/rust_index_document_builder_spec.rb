@@ -76,6 +76,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'resource_archival_object_metadata',
+        'dynamic_enum_and_ark_metadata',
       ],
     }
     allow(builder).to receive(:perform_request).and_return(
@@ -140,6 +141,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'accession_digital_object_metadata',
+        'dynamic_enum_and_ark_metadata',
       ],
     }
     allow(builder).to receive(:perform_request).and_return(
@@ -198,6 +200,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'agent_subject_metadata',
+        'dynamic_enum_and_ark_metadata',
       ],
     }
     allow(builder).to receive(:perform_request).and_return(
@@ -250,6 +253,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'component_classification_metadata',
+        'dynamic_enum_and_ark_metadata',
       ],
     }
     allow(builder).to receive(:perform_request).and_return(
@@ -309,6 +313,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'component_classification_metadata',
+        'dynamic_enum_and_ark_metadata',
       ],
     }
     allow(builder).to receive(:perform_request).and_return(
@@ -360,6 +365,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'repository_event_location_metadata',
+        'dynamic_enum_and_ark_metadata',
       ],
     }
 
@@ -405,6 +411,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'repository_event_location_metadata',
+        'dynamic_enum_and_ark_metadata',
       ],
     }
 
@@ -473,6 +480,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'repository_event_location_metadata',
+        'dynamic_enum_and_ark_metadata',
       ],
     }
 
@@ -517,6 +525,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'repository_event_location_metadata',
+        'dynamic_enum_and_ark_metadata',
       ],
     }
 
@@ -576,6 +585,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'profile_assessment_metadata',
+        'dynamic_enum_and_ark_metadata',
       ],
     }
 
@@ -621,6 +631,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'profile_assessment_metadata',
+        'dynamic_enum_and_ark_metadata',
       ],
     }
 
@@ -714,6 +725,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'profile_assessment_metadata',
+        'dynamic_enum_and_ark_metadata',
       ],
     }
 
@@ -774,6 +786,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'profile_assessment_metadata',
+        'dynamic_enum_and_ark_metadata',
       ],
     }
 
@@ -930,6 +943,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'top_container_metadata',
+        'dynamic_enum_and_ark_metadata',
       ],
     }
 
@@ -1009,6 +1023,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'top_container_metadata',
+        'dynamic_enum_and_ark_metadata',
       ],
     }
 
@@ -1087,6 +1102,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'job_metadata',
+        'dynamic_enum_and_ark_metadata',
       ],
     }
 
@@ -1135,6 +1151,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'job_metadata',
+        'dynamic_enum_and_ark_metadata',
       ],
     }
 
@@ -1277,6 +1294,7 @@ describe RustIndexDocumentBuilder do
         'fullrecord',
         'resource_archival_object_metadata',
         'job_metadata',
+        'dynamic_enum_and_ark_metadata',
       ],
     }
 
@@ -1373,6 +1391,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'resource_archival_object_metadata',
+        'dynamic_enum_and_ark_metadata',
       ],
       '_archivalist_collection_management_documents' => [child_doc],
     }
@@ -1467,6 +1486,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'accession_digital_object_metadata',
+        'dynamic_enum_and_ark_metadata',
       ],
       '_archivalist_collection_management_documents' => [minimal_child],
     }
@@ -1552,6 +1572,7 @@ describe RustIndexDocumentBuilder do
           'common_metadata',
           'fullrecord',
           'resource_archival_object_metadata',
+          'dynamic_enum_and_ark_metadata',
         ],
         '_archivalist_collection_management_documents' => child ? [child] : [],
       }
@@ -1723,6 +1744,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'resource_archival_object_metadata',
+        'dynamic_enum_and_ark_metadata',
       ],
       # Notice: _archivalist_collection_management_documents is absent because Rust withheld it
     }
@@ -1860,6 +1882,7 @@ describe RustIndexDocumentBuilder do
           'common_metadata',
           'fullrecord',
           'resource_archival_object_metadata',
+          'dynamic_enum_and_ark_metadata',
         ],
         '_archivalist_collection_management_documents' => [child],
       }
@@ -2007,6 +2030,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'resource_archival_object_metadata',
+        'dynamic_enum_and_ark_metadata',
       ],
       '_archivalist_collection_management_documents' => [valid_child],
     }
@@ -2033,5 +2057,232 @@ describe RustIndexDocumentBuilder do
                       'documents' => [reordered_doc])
     )
     expect { builder.build([valid_input]) }.to raise_error(/child json serialization mismatch/)
+  end
+
+  describe "dynamic_enum_and_ark_metadata projection validation" do
+    let(:base_resource_input) do
+      {
+        'uri' => '/repositories/2/resources/99',
+        'record_type' => 'resource',
+        'repository' => 2,
+        'enrich' => true,
+        'dynamic_enum_fields' => ['status', 'genre'],
+        'arks_enabled' => true,
+        'record' => {
+          'uri' => '/repositories/2/resources/99',
+          'title' => 'Validation Resource',
+          'publish' => true,
+          'status' => 'draft',
+          'genre' => 'korespondencja_rękopiśmienna',
+          'notes' => [
+            { 'status' => 'reviewed', 'items' => { 'type' => 'ordered_list' } },
+            { 'status' => 'draft' }, # duplicate
+            { '_resolved' => { 'status' => 'should_be_excluded' } },
+          ],
+          'ark_name' => {
+            'current' => 'https://example.org/ark:/12345/curr_żółw',
+            'previous' => ['http://proxy/ark:/12345/ark:/prev_final'],
+          },
+        },
+      }
+    end
+
+    def valid_doc_for(input)
+      {
+        'id' => input['uri'],
+        'uri' => input['uri'],
+        'title' => input['record']['title'],
+        'primary_type' => 'resource',
+        'types' => ['resource'],
+        'json' => ASUtils.to_json(input['record']),
+        'suppressed' => false,
+        'publish' => true,
+        'system_generated' => 'false',
+        'repository' => 2,
+        'fullrecord_published' => [],
+        'fullrecord' => [],
+        'finding_aid_title' => nil,
+        'finding_aid_filing_title' => nil,
+        'identifier' => 'VAL-99',
+        'resource_type' => nil,
+        'level' => 'collection',
+        'restrictions' => false,
+        'ead_id' => nil,
+        'finding_aid_status' => nil,
+        'related_accession_uris' => [],
+        'slug' => nil,
+        'is_slug_auto' => false,
+        'external_id' => [],
+        'ancestors' => [],
+        'langcode' => [],
+        'four_part_id' => 'VAL-99',
+        'status_enum_s' => ['draft', 'reviewed'],
+        'genre_enum_s' => ['korespondencja_rękopiśmienna'],
+        'type_enum_s' => ['ordered_list'],
+        'ark_name' => ['ark:/12345/curr_żółw', 'ark:/prev_final'],
+        '_archivalist_rust_fields' => [
+          'common_metadata',
+          'fullrecord',
+          'resource_archival_object_metadata',
+          'dynamic_enum_and_ark_metadata',
+        ],
+      }
+    end
+
+    it 'accepts exact dynamic enum and ARK projection matching native semantics' do
+      doc = valid_doc_for(base_resource_input)
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      result = builder.build([base_resource_input])
+      expect(result[base_resource_input['uri']]).to eq(doc)
+    end
+
+    it 'rejects unexpected dynamic enum keys' do
+      doc = valid_doc_for(base_resource_input)
+      doc['unexpected_field_enum_s'] = ['intruder']
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([base_resource_input]) }.to raise_error(/unexpected dynamic enum keys projected/)
+    end
+
+    it 'rejects missing dynamic enum keys' do
+      doc = valid_doc_for(base_resource_input)
+      doc.delete('genre_enum_s')
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([base_resource_input]) }.to raise_error(/missing dynamic enum keys/)
+    end
+
+    it 'rejects non-array dynamic enum values' do
+      doc = valid_doc_for(base_resource_input)
+      doc['status_enum_s'] = 'draft' # not an array
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([base_resource_input]) }.to raise_error(/dynamic enum field status_enum_s must be an array/)
+    end
+
+    it 'rejects mismatched dynamic enum values or ordering' do
+      doc = valid_doc_for(base_resource_input)
+      doc['status_enum_s'] = ['reviewed', 'draft'] # inverted order
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([base_resource_input]) }.to raise_error(/dynamic enum values mismatch/)
+    end
+
+    it 'rejects ark_name when ARKs are disabled in input' do
+      disabled_input = base_resource_input.merge('arks_enabled' => false)
+      doc = valid_doc_for(base_resource_input) # doc still has ark_name
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([disabled_input]) }.to raise_error(/unexpected ark_name projected when ARKs are disabled/)
+    end
+
+    it 'rejects ark_name when absent in record but present in response' do
+      no_ark_record = base_resource_input['record'].dup
+      no_ark_record.delete('ark_name')
+      no_ark_input = base_resource_input.merge('record' => no_ark_record)
+      doc = valid_doc_for(base_resource_input) # doc still has ark_name
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([no_ark_input]) }.to raise_error(/unexpected ark_name projected when absent in record/)
+    end
+
+    it 'rejects non-array ark_name or mismatched ARK values' do
+      doc = valid_doc_for(base_resource_input)
+      doc['ark_name'] = 'ark:/12345/curr_żółw' # non-array
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([base_resource_input]) }.to raise_error(/response ark_name must be an array/)
+
+      doc['ark_name'] = ['ark:/wrong_val']
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([base_resource_input]) }.to raise_error(/response ark_name mismatch/)
+    end
+
+    it 'rejects integer vs float dynamic enum value type mismatches' do
+      int_input = base_resource_input.merge(
+        'record' => base_resource_input['record'].merge('status' => 1)
+      )
+      doc = valid_doc_for(int_input)
+      doc['status_enum_s'] = [1.0] # float instead of integer
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([int_input]) }.to raise_error(/dynamic enum values mismatch.*type mismatch/)
+    end
+
+    it 'rejects boolean vs integer dynamic enum value type mismatches' do
+      bool_input = base_resource_input.merge(
+        'record' => base_resource_input['record'].merge('status' => true)
+      )
+      doc = valid_doc_for(bool_input)
+      doc['status_enum_s'] = [1] # integer instead of boolean
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([bool_input]) }.to raise_error(/dynamic enum values mismatch.*type mismatch/)
+    end
+
+    it 'validates ARK values with newline cases matching native Ruby /\A.*ark:/ semantics' do
+      newline_ark_input = base_resource_input.merge(
+        'record' => base_resource_input['record'].merge(
+          'ark_name' => {
+            'current' => "prefix\nark:/later",
+            'previous' => ["pre ark:/first\nark:/second", "pre ark:/one ark:/two\nark:/three"],
+          }
+        )
+      )
+      doc = valid_doc_for(newline_ark_input)
+      doc['ark_name'] = [
+        "prefix\nark:/later",
+        "ark:/first\nark:/second",
+        "ark:/two\nark:/three",
+      ]
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      result = builder.build([newline_ark_input])
+      expect(result[newline_ark_input['uri']]['ark_name']).to eq(doc['ark_name'])
+    end
+
+    it 'rejects ARK projection if Rust incorrectly trims across newlines' do
+      newline_ark_input = base_resource_input.merge(
+        'record' => base_resource_input['record'].merge(
+          'ark_name' => {
+            'current' => "prefix\nark:/later",
+            'previous' => [],
+          }
+        )
+      )
+      doc = valid_doc_for(newline_ark_input)
+      doc['ark_name'] = ["ark:/later"]
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([newline_ark_input]) }.to raise_error(/response ark_name mismatch/)
+    end
   end
 end

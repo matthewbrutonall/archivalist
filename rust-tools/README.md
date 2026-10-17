@@ -96,8 +96,9 @@ Endpoints:
   objects, accessions, digital objects and components, subjects, classifications,
   repositories, events, locations, container profiles, location profiles,
   assessments, top containers, jobs (deterministic staff metadata), synthetic
-  collection-management child documents for valid parent records, and all
-  agent authority types.
+  collection-management child documents for valid parent records, all
+  agent authority types, staff-index dynamic-enum projection (`<field>_enum_s`
+  and `type_enum_s`), and ARK field preparation (`ark_name`).
 
 The example systemd unit in `deploy/` binds to loopback by default. Put authentication
 and transport security in front of the sidecar before exposing it beyond the local
@@ -115,9 +116,12 @@ parity comparator, `scripts/compare_staff_index_parity.py`. PUI full-record
 preparation, publication decisions, internal-note privacy filtering, and
 job-specific dynamic I18n translation, local timestamps, and output-file
 discovery intentionally remain native because inheritance, localization, and
-external I/O are handled by Ruby. Collection-management child documents are generated
-exclusively for staff enrichment; PUI indexing remains native, and Ruby retains sole
-ownership of Solr writes and stale-child deletions.
+external I/O are handled by Ruby. Dynamic-enum schema derivation and ARK enablement
+configuration remain in Ruby; Rust handles deterministic recursive traversal, `_resolved`
+exclusion, ordering, deduplication, and trim semantics under strict Ruby validation and
+complete native fallback. Collection-management child documents are generated exclusively
+for staff enrichment; PUI indexing remains native, and Ruby retains sole ownership of Solr
+writes and stale-child deletions.
 
 ## Test and benchmark helpers
 

@@ -1,6 +1,7 @@
 require 'net/http'
 require 'uri'
 require 'json'
+require 'set'
 require_relative 'indexer_common_config'
 
 class RustIndexDocumentBuilder
@@ -118,9 +119,11 @@ class RustIndexDocumentBuilder
         elsif record_type == 'job'
           expected_fields << 'job_metadata'
         end
+        expected_fields << 'dynamic_enum_and_ark_metadata'
         unless document['_archivalist_rust_fields'] == expected_fields
           raise "response enrichment marker mismatch for #{uri}"
         end
+        validate_dynamic_enum_and_ark_projection!(document, input)
         required = ['fullrecord_published', 'fullrecord']
         required.concat(['subjects', 'subject_uris']) if record.has_key?('subjects')
         if record.has_key?('linked_agents')
@@ -530,6 +533,106 @@ class RustIndexDocumentBuilder
     return false if record.dig('repository', '_resolved', 'publish') == false
     return false if record['has_unpublished_ancestor']
     record.has_key?('publish') && record['publish']
+  end
+
+  def validate_dynamic_enum_and_ark_projection!(document, input)
+    uri = input['uri']
+    record = input['record']
+    dynamic_enum_fields = Array(input['dynamic_enum_fields'])
+    arks_enabled = !!input['arks_enabled']
+
+    # 1. Dynamic Enums validation
+    expected_enums = compute_expected_dynamic_enums(record, dynamic_enum_fields)
+    doc_enum_keys = document.keys.select { |k| k.is_a?(String) && k.end_with?('_enum_s') }
+
+    unexpected_keys = doc_enum_keys - expected_enums.keys
+    unless unexpected_keys.empty?
+      raise "unexpected dynamic enum keys projected for #{uri}: #{unexpected_keys.sort.join(', ')}"
+    end
+
+    missing_keys = expected_enums.keys - doc_enum_keys
+    unless missing_keys.empty?
+      raise "missing dynamic enum keys for #{uri}: #{missing_keys.sort.join(', ')}"
+    end
+
+    expected_enums.each do |key, expected_vals|
+      actual_vals = document[key]
+      unless actual_vals.is_a?(Array)
+        raise "dynamic enum field #{key} must be an array for #{uri}"
+      end
+      begin
+        validate_json_equal!(expected_vals, actual_vals, "dynamic enum #{key} for #{uri}")
+      rescue => e
+        raise "dynamic enum values mismatch for #{uri} on #{key}: #{e.message}"
+      end
+    end
+
+    # 2. ARK validation
+    if !arks_enabled
+      if document.has_key?('ark_name')
+        raise "unexpected ark_name projected when ARKs are disabled for #{uri}"
+      end
+    else
+      raw_arks = record.is_a?(Hash) ? record['ark_name'] : nil
+      if raw_arks.nil?
+        if document.has_key?('ark_name')
+          raise "unexpected ark_name projected when absent in record for #{uri}"
+        end
+      else
+        unless raw_arks.is_a?(Hash)
+          raise "record ark_name must be a hash for #{uri}"
+        end
+        current = raw_arks['current']
+        previous = raw_arks['previous']
+        unless previous.is_a?(Array)
+          raise "record ark_name.previous must be an array for #{uri}"
+        end
+        if current && !current.is_a?(String)
+          raise "record ark_name.current must be a string for #{uri}"
+        end
+        if previous.any? { |p| !p.is_a?(String) }
+          raise "record ark_name.previous elements must be strings for #{uri}"
+        end
+        expected_arks = ([current] + previous).compact.map { |s| s.gsub(/\A.*ark:/, 'ark:') }
+        actual_arks = document['ark_name']
+        unless actual_arks.is_a?(Array)
+          raise "response ark_name must be an array for #{uri}"
+        end
+        begin
+          validate_json_equal!(expected_arks, actual_arks, "response ark_name for #{uri}")
+        rescue => e
+          raise "response ark_name mismatch for #{uri}: #{e.message}"
+        end
+      end
+    end
+  end
+
+  def compute_expected_dynamic_enums(record_hash, fields)
+    return {} unless record_hash.is_a?(Hash)
+
+    expected = {}
+    found_keys = Set.new
+
+    ASUtils.search_nested(record_hash, fields, ['_resolved']) do |field, field_value|
+      key = "#{field}_enum_s"
+      expected[key] ||= Set.new
+      expected[key] << field_value
+      found_keys << key
+    end
+
+    ASUtils.search_nested(record_hash, ['items'], ['_resolved']) do |_field, field_value|
+      if field_value.is_a?(Hash) && field_value.key?('type')
+        expected['type_enum_s'] ||= Set.new
+        expected['type_enum_s'] << field_value.fetch('type')
+        found_keys << 'type_enum_s'
+      end
+    end
+
+    result = {}
+    found_keys.each do |key|
+      result[key] = expected[key].to_a.flatten
+    end
+    result
   end
 
   def perform_request(request)

@@ -1555,4 +1555,203 @@ describe "periodic indexer" do
       expect(child.keys.none? {|k| k.start_with?('_archivalist_')}).to be(true)
     end
   end
+
+  describe "dynamic enum and ARK acceleration and fallback" do
+    before(:each) do
+      AppConfig[:rust_index_document_builder_enabled] = true
+      AppConfig[:rust_index_document_enrichment_enabled] = true
+      AppConfig[:arks_enabled] = true
+    end
+
+    after(:each) do
+      AppConfig[:rust_index_document_builder_enabled] = false
+      AppConfig[:rust_index_document_enrichment_enabled] = false
+      AppConfig[:arks_enabled] = false
+    end
+
+    let(:resource_with_enums_and_arks) do
+      {
+        'uri' => '/repositories/2/resources/55',
+        'record' => {
+          'uri' => '/repositories/2/resources/55',
+          'title' => 'Enum and ARK Resource',
+          'display_string' => 'Enum and ARK Resource',
+          'publish' => true,
+          'status' => 'draft',
+          'notes' => [
+            { 'status' => 'reviewed', 'items' => { 'type' => 'container_summary' } },
+            { 'status' => 'draft' },
+            { '_resolved' => { 'status' => 'excluded_resolved' } },
+          ],
+          'ark_name' => {
+            'current' => 'https://example.org/ark:/12345/curr55',
+            'previous' => ['http://proxy/ark:/12345/ark:/prev55'],
+          },
+        },
+      }
+    end
+
+    it "skips native enum traversal and add_arks when valid Rust projection and marker are present" do
+      allow(indexer).to receive(:enum_fields).and_return(['status'])
+
+      prepare_hook_calls = 0
+      indexer.add_document_prepare_hook do |_doc, _rec|
+        prepare_hook_calls += 1
+      end
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prepared, docs|
+          doc = indexer.native_index_document(prepared[:uri], prepared[:record_type], prepared[:values])
+          doc['status_enum_s'] = ['draft', 'reviewed']
+          doc['type_enum_s'] = ['container_summary']
+          doc['ark_name'] = ['ark:/12345/curr55', 'ark:/prev55']
+          doc['_archivalist_rust_fields'] = [
+            'common_metadata',
+            'fullrecord',
+            'resource_archival_object_metadata',
+            'dynamic_enum_and_ark_metadata',
+          ]
+          docs[prepared[:uri]] = doc
+        end
+      end
+
+      indexer.index_records([resource_with_enums_and_arks])
+
+      doc = indexer.records.find {|d| d['id'] == '/repositories/2/resources/55'}
+      expect(doc['status_enum_s']).to eq(['draft', 'reviewed'])
+      expect(doc['type_enum_s']).to eq(['container_summary'])
+      expect(doc['ark_name']).to eq(['ark:/12345/curr55', 'ark:/prev55'])
+      expect(doc).not_to have_key('_archivalist_rust_fields')
+      expect(prepare_hook_calls).to be > 0
+    end
+
+    it "falls back to complete native enum and ARK preparation when projection is invalid or corrupted" do
+      allow(indexer).to receive(:enum_fields).and_return(['status'])
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prepared, docs|
+          doc = indexer.native_index_document(prepared[:uri], prepared[:record_type], prepared[:values])
+          # Corrupted: bogus enum values and bogus ark_name
+          doc['status_enum_s'] = ['corrupted_val']
+          doc['ark_name'] = ['ark:/bogus']
+          doc['_archivalist_rust_fields'] = [
+            'common_metadata',
+            'fullrecord',
+            'resource_archival_object_metadata',
+            'dynamic_enum_and_ark_metadata',
+          ]
+          docs[prepared[:uri]] = doc
+        end
+      end
+
+      indexer.index_records([resource_with_enums_and_arks])
+
+      doc = indexer.records.find {|d| d['id'] == '/repositories/2/resources/55'}
+      # Mismatch caused complete native preparation for both slices
+      expect(doc['status_enum_s']).to eq(['draft', 'reviewed'])
+      expect(doc['type_enum_s']).to eq(['container_summary'])
+      expect(doc['ark_name']).to eq(['ark:/12345/curr55', 'ark:/prev55'])
+      expect(doc).not_to have_key('_archivalist_rust_fields')
+    end
+
+    it "omits ark_name when ARKs are disabled in AppConfig" do
+      AppConfig[:arks_enabled] = false
+      allow(indexer).to receive(:enum_fields).and_return(['status'])
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prepared, docs|
+          doc = indexer.native_index_document(prepared[:uri], prepared[:record_type], prepared[:values])
+          doc['status_enum_s'] = ['draft', 'reviewed']
+          doc['type_enum_s'] = ['container_summary']
+          doc['_archivalist_rust_fields'] = [
+            'common_metadata',
+            'fullrecord',
+            'resource_archival_object_metadata',
+            'dynamic_enum_and_ark_metadata',
+          ]
+          docs[prepared[:uri]] = doc
+        end
+      end
+
+      indexer.index_records([resource_with_enums_and_arks])
+
+      doc = indexer.records.find {|d| d['id'] == '/repositories/2/resources/55'}
+      expect(doc['status_enum_s']).to eq(['draft', 'reviewed'])
+      expect(doc['type_enum_s']).to eq(['container_summary'])
+      expect(doc).not_to have_key('ark_name')
+      expect(doc).not_to have_key('_archivalist_rust_fields')
+    end
+
+    it "falls back to native dynamic enum preparation when integer vs float type mismatch occurs" do
+      allow(indexer).to receive(:enum_fields).and_return(['status'])
+
+      typed_resource = {
+        'uri' => '/repositories/2/resources/55',
+        'record' => {
+          'uri' => '/repositories/2/resources/55',
+          'title' => 'Typed Enum Resource',
+          'publish' => true,
+          'status' => 1,
+        },
+      }
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prepared, docs|
+          doc = indexer.native_index_document(prepared[:uri], prepared[:record_type], prepared[:values])
+          doc['status_enum_s'] = [1.0] # float instead of integer
+          doc['_archivalist_rust_fields'] = [
+            'common_metadata',
+            'fullrecord',
+            'resource_archival_object_metadata',
+            'dynamic_enum_and_ark_metadata',
+          ]
+          docs[prepared[:uri]] = doc
+        end
+      end
+
+      indexer.index_records([typed_resource])
+
+      doc = indexer.records.find {|d| d['id'] == '/repositories/2/resources/55'}
+      # Fell back to native, which extracted exact integer 1
+      expect(doc['status_enum_s']).to eq([1])
+      expect(doc['status_enum_s'].first).to be_a(Integer)
+      expect(doc).not_to have_key('_archivalist_rust_fields')
+    end
+
+    it "falls back to native dynamic enum preparation when boolean vs integer type mismatch occurs" do
+      allow(indexer).to receive(:enum_fields).and_return(['status'])
+
+      typed_resource = {
+        'uri' => '/repositories/2/resources/55',
+        'record' => {
+          'uri' => '/repositories/2/resources/55',
+          'title' => 'Typed Enum Resource',
+          'publish' => true,
+          'status' => true,
+        },
+      }
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prepared, docs|
+          doc = indexer.native_index_document(prepared[:uri], prepared[:record_type], prepared[:values])
+          doc['status_enum_s'] = [1] # integer instead of boolean true
+          doc['_archivalist_rust_fields'] = [
+            'common_metadata',
+            'fullrecord',
+            'resource_archival_object_metadata',
+            'dynamic_enum_and_ark_metadata',
+          ]
+          docs[prepared[:uri]] = doc
+        end
+      end
+
+      indexer.index_records([typed_resource])
+
+      doc = indexer.records.find {|d| d['id'] == '/repositories/2/resources/55'}
+      # Fell back to native, which extracted exact boolean true
+      expect(doc['status_enum_s']).to eq([true])
+      expect(doc['status_enum_s'].first).to be(true)
+      expect(doc).not_to have_key('_archivalist_rust_fields')
+    end
+  end
 end

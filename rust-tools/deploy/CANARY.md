@@ -154,12 +154,24 @@ REPO_ID=2 RESOURCE_ID=18 ADMIN_PASSWORD='canary-password' \
   scripts/canary_index_document_enrichment.sh
 ```
 
+The script derives dynamic-enum base names from native Solr document keys ending
+`_enum_s` and passes them in the sidecar payload. `ARKS_ENABLED` defaults safely
+to `false` (requiring `ark_name` to be omitted by both Rust and native documents).
+To compare `ark_name` presence and value against an instance with ARKs enabled in
+`AppConfig` and indexed in Solr, pass `ARKS_ENABLED=true`:
+
+```bash
+REPO_ID=2 RESOURCE_ID=18 ARKS_ENABLED=true ADMIN_PASSWORD='canary-password' \
+  scripts/canary_index_document_enrichment.sh
+```
+
 This compares subjects, agents, publication-aware notes, dates, years, level,
-summary, extents, audit fields, and the resource-specific identifiers, finding-aid
-metadata, classifications, instances, containers, ancestors, linked rights agents,
-and language codes now prepared by Rust. The private handoff marker includes
-`resource_archival_object_metadata` for resources and archival objects and is
-joined by `accession_digital_object_metadata` for accessions and digital objects.
+summary, extents, audit fields, exact dynamic-enum sets and values (`*_enum_s`),
+`ark_name` presence and values according to `ARKS_ENABLED`, and the resource-specific
+identifiers, finding-aid metadata, classifications, instances, containers, ancestors,
+linked rights agents, and language codes now prepared by Rust. The private handoff
+marker includes `resource_archival_object_metadata` for resources and archival objects
+and is joined by `accession_digital_object_metadata` for accessions and digital objects.
 Subject and agent authority mappings use `agent_subject_metadata`, including
 authority identifiers, rules, repository usage, related agents, and nested
 subject/place terms. Digital-object components and classifications use
@@ -193,22 +205,29 @@ native Ruby child generation runs.
 Accession date localization, unresolved location owner-repository HTTP lookups,
 and job dynamic title translation via I18n, localized timestamps via
 `Time.parse(...).getlocal`, and output-file discovery via `JSONModel::HTTP`
-remain native. All markers (`_archivalist_rust_fields` and
-`_archivalist_collection_management_documents`) are removed before Solr and plugin
-hooks. A valid Rust child handoff suppresses only the built-in native child generator;
-all third-party `add_extra_documents_hook` registrations execute unchanged exactly
-once. Stale-child deletion via `records_with_children` is preserved. It accounts
+remain native. Dynamic enum projections (`<field>_enum_s` and `type_enum_s`) and ARK
+fields (`ark_name`) are accelerated by Rust when staff enrichment is enabled, using the
+handoff capability marker `dynamic_enum_and_ark_metadata`. Ruby derives dynamic-enum
+schema field names and checks `AppConfig[:arks_enabled]`, while Rust executes deterministic
+traversal, `_resolved` exclusion, flattening, deduplication, and trim semantics. Ruby strictly
+validates the returned projection before skipping native prepare hooks. If the response is
+unsupported, missing, malformed, or mismatched, complete native preparation runs for this
+slice. All markers (`_archivalist_rust_fields` and `_archivalist_collection_management_documents`)
+are removed before Solr and plugin hooks. A valid Rust child handoff suppresses only the
+built-in native child generator; all third-party `add_extra_documents_hook` registrations execute
+unchanged exactly once. Stale-child deletion via `records_with_children` is preserved. It accounts
 for Solr's intentional copy-field merge of `notes_published` into `notes`. Only
 after this passes should `rust_index_document_enrichment_enabled` be set to `true`.
 The enrichment gate is staff-index only; PUI full-record extraction, top-container
 publication decisions (`is_linked_to_published_record` / `pui_container`), and PUI
 removal of `internal_note` and container-profile notes remain native after
-inheritance and privacy filtering. Job and collection-management child enrichment is
-completely bypassed in PUI.
+inheritance and privacy filtering. Job, collection-management child, dynamic-enum, and ARK
+enrichment is completely bypassed in PUI.
 Before rollout, also require a complete native-versus-Rust reindex comparison so
 accessions, digital objects and components, subjects, agents, classifications,
 repositories, events, locations, container profiles, location profiles,
-assessments, top containers, jobs, and collection-management child documents are covered.
+assessments, top containers, jobs, collection-management child documents, dynamic enums,
+and ARKs are covered.
 
 ## 7. Full STAFF index parity gate
 

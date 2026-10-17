@@ -74,6 +74,8 @@ scripts/quarantine_spikes/
 rust-tools/benchmarks/
 rust-tools/dist/
 rust-tools/reports/
+__pycache__/
+*.py[cod]
 RUST_BENCHMARKS.md
 RUST_PLAYBOOK.md
 RUST_PROJECT_TRACKER.md

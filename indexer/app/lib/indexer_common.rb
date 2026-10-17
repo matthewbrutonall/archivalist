@@ -375,31 +375,137 @@ class IndexerCommon
     end
   end
 
+  def clean_dynamic_enum_fields!(doc)
+    doc.delete_if { |k, _| k.is_a?(String) && k.end_with?('_enum_s') }
+  end
+
+  def strict_json_equal?(expected, actual)
+    return false unless expected.class == actual.class
+
+    case expected
+    when Hash
+      return false unless expected.length == actual.length
+      expected_keys = expected.keys.map(&:to_s).sort
+      actual_keys = actual.keys.map(&:to_s).sort
+      return false unless expected_keys == actual_keys
+
+      expected.all? do |k, v|
+        act_v = actual.fetch(k) { actual.fetch(k.to_s, nil) }
+        strict_json_equal?(v, act_v)
+      end
+    when Array
+      return false unless expected.length == actual.length
+      expected.each_with_index.all? do |exp_val, idx|
+        strict_json_equal?(exp_val, actual[idx])
+      end
+    else
+      expected == actual
+    end
+  end
+
+  def valid_dynamic_enum_and_ark_projection?(doc, record)
+    return false unless doc.is_a?(Hash)
+    record_data = (record.is_a?(Hash) && record['record'].is_a?(Hash)) ? record['record'] : (record.is_a?(Hash) ? record : nil)
+    return false unless record_data.is_a?(Hash)
+
+    # 1. Validate dynamic enums
+    expected_enums = compute_expected_dynamic_enums(record_data, enum_fields)
+    doc_enum_keys = doc.keys.select { |k| k.is_a?(String) && k.end_with?('_enum_s') }
+
+    return false unless doc_enum_keys.sort == expected_enums.keys.sort
+
+    expected_enums.each do |key, expected_vals|
+      actual_vals = doc[key]
+      return false unless actual_vals.is_a?(Array)
+      return false unless strict_json_equal?(expected_vals, actual_vals)
+    end
+
+    # 2. Validate ARKs
+    arks_enabled = !!AppConfig[:arks_enabled]
+    if !arks_enabled
+      return false if doc.has_key?('ark_name')
+    else
+      raw_arks = record_data['ark_name']
+      if raw_arks.nil?
+        return false if doc.has_key?('ark_name')
+      else
+        return false unless raw_arks.is_a?(Hash)
+        current = raw_arks['current']
+        previous = raw_arks['previous']
+        return false unless previous.is_a?(Array)
+        return false if current && !current.is_a?(String)
+        return false if previous.any? { |p| !p.is_a?(String) }
+
+        expected_arks = ([current] + previous).compact.map { |s| trim_ark_value(s) }
+        actual_arks = doc['ark_name']
+        return false unless actual_arks.is_a?(Array)
+        return false unless strict_json_equal?(expected_arks, actual_arks)
+      end
+    end
+
+    true
+  end
+
+  def compute_expected_dynamic_enums(record_data, fields = enum_fields)
+    return {} unless record_data.is_a?(Hash)
+
+    expected = {}
+    found_keys = Set.new
+
+    ASUtils.search_nested(record_data, fields, ['_resolved']) do |field, field_value|
+      key = "#{field}_enum_s"
+      expected[key] ||= Set.new
+      expected[key] << field_value
+      found_keys << key
+    end
+
+    ASUtils.search_nested(record_data, ['items'], ['_resolved']) do |_field, field_value|
+      if field_value.is_a?(Hash) && field_value.key?('type')
+        expected['type_enum_s'] ||= Set.new
+        expected['type_enum_s'] << field_value.fetch('type')
+        found_keys << 'type_enum_s'
+      end
+    end
+
+    result = {}
+    found_keys.each do |key|
+      result[key] = expected[key].to_a.flatten
+    end
+    result
+  end
+
 
   def configure_doc_rules
     add_document_prepare_hook {|doc, record|
-      found_keys = Set.new
+      rust_fields = Array(doc['_archivalist_rust_fields'])
+      if rust_fields.include?('dynamic_enum_and_ark_metadata') && valid_dynamic_enum_and_ark_projection?(doc, record)
+        # Accelerated by Rust sidecar: skip native dynamic enum traversal
+      else
+        doc['_archivalist_rust_fields'].delete('dynamic_enum_and_ark_metadata') if doc['_archivalist_rust_fields'].is_a?(Array)
+        clean_dynamic_enum_fields!(doc)
+        found_keys = Set.new
 
-      ASUtils.search_nested(record["record"], enum_fields, ['_resolved']) do |field, field_value|
-        key = "#{field}_enum_s"
+        ASUtils.search_nested(record["record"], enum_fields, ['_resolved']) do |field, field_value|
+          key = "#{field}_enum_s"
 
-        doc[key] ||= Set.new
-        doc[key] << field_value
+          doc[key] ||= Set.new
+          doc[key] << field_value
 
-        found_keys << key
-      end
-
-      ASUtils.search_nested(record["record"], ['items'], ['_resolved']) do |field, field_value|
-        if field_value.is_a?(Hash) && field_value.key?('type')
-          doc['type_enum_s'] ||= Set.new
-          doc['type_enum_s'] << field_value.fetch('type')
-          found_keys << 'type_enum_s'
+          found_keys << key
         end
-      end
 
-      # Turn our sets back into regular arrays so they serialize out to JSON correctly
-      found_keys.each do |key|
-        doc[key] = doc[key].to_a.flatten
+        ASUtils.search_nested(record["record"], ['items'], ['_resolved']) do |field, field_value|
+          if field_value.is_a?(Hash) && field_value.key?('type')
+            doc['type_enum_s'] ||= Set.new
+            doc['type_enum_s'] << field_value.fetch('type')
+            found_keys << 'type_enum_s'
+          end
+        end
+
+        # Turn our sets back into regular arrays so they serialize out to JSON correctly
+        found_keys.each do |key|
+          doc[key] = doc[key].to_a.flatten
+        end
       end
     }
 
@@ -428,7 +534,12 @@ class IndexerCommon
         add_summary(doc, record)
         add_extents(doc, record)
       end
-      add_arks(doc, record)
+      if rust_fields.include?('dynamic_enum_and_ark_metadata') && valid_dynamic_enum_and_ark_projection?(doc, record)
+        # Accelerated by Rust sidecar: skip native add_arks
+      else
+        doc.delete('ark_name')
+        add_arks(doc, record)
+      end
     }
 
     add_document_prepare_hook {|doc, record|
@@ -1410,13 +1521,18 @@ class IndexerCommon
     inputs = prepared_records.map do |prepared|
       prepared[:values] = sanitize_json(prepared[:values])
       prepared[:sanitized] = true
-      {
+      input = {
         'uri' => prepared[:uri],
         'record_type' => prepared[:record_type],
         'repository' => get_record_scope(prepared[:uri]),
         'record' => prepared[:values],
         'enrich' => rust_index_document_enrichment_enabled?,
       }
+      if rust_index_document_enrichment_enabled?
+        input['dynamic_enum_fields'] = enum_fields
+        input['arks_enabled'] = !!AppConfig[:arks_enabled]
+      end
+      input
     end
     builder = RustIndexDocumentBuilder.new(
       AppConfig[:rust_index_document_builder_url] || 'http://127.0.0.1:4570',
