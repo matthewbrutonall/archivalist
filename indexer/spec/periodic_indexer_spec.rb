@@ -220,5 +220,49 @@ describe "periodic indexer" do
       expect(doc['langcode']).to eq(['gle'])
       expect(doc).not_to have_key('_archivalist_rust_fields')
     end
+
+    it "retains Rust accession fields while keeping localized date handling native" do
+      accession = build(:json_accession,
+                        'uri' => '/repositories/2/accessions/78',
+                        'title' => 'Native accession title',
+                        'display_string' => 'Native accession display',
+                        'accession_date' => '2026-10-17',
+                        'id_0' => 'NATIVE',
+                        'instances' => [])
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prepared, documents|
+          doc = indexer.native_index_document(
+            prepared[:uri], prepared[:record_type], prepared[:values]
+          )
+          doc['notes_published'] = []
+          doc['notes'] = []
+          doc['fullrecord_published'] = []
+          doc['fullrecord'] = []
+          doc['title'] = 'Rust accession display'
+          doc['identifier'] = 'RUST-78'
+          doc['acquisition_type'] = 'gift'
+          doc['external_id'] = ['rust-accession-id']
+          doc['ancestors'] = []
+          doc['langcode'] = ['eng']
+          doc['_archivalist_rust_fields'] = [
+            'common_metadata',
+            'fullrecord',
+            'accession_digital_object_metadata',
+          ]
+          documents[prepared[:uri]] = doc
+        end
+      end
+
+      indexer.prepare_docs([accession])
+      doc = indexer.records.first
+      expect(doc['title']).to eq('Rust accession display')
+      expect(doc['identifier']).to eq('RUST-78')
+      expect(doc['acquisition_type']).to eq('gift')
+      expect(doc['external_id']).to eq(['rust-accession-id'])
+      expect(doc['accession_date']).to eq('2026-10-17')
+      expect(doc['accession_date_year']).to eq(2026)
+      expect(doc).not_to have_key('_archivalist_rust_fields')
+    end
   end
 end

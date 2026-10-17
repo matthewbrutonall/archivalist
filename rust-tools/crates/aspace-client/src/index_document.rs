@@ -628,99 +628,183 @@ fn add_languages(
     Ok(())
 }
 
-fn add_resource_and_archival_object_fields(
+fn related_uris(
+    record: &Map<String, Value>,
+    field: &str,
+    compact: bool,
+    unique: bool,
+) -> Result<Vec<Value>, IndexDocumentError> {
+    let values = match record.get(field) {
+        None => &[][..],
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| error(format!("field '{field}' must be an array")))?,
+    };
+    let mut uris = Vec::new();
+    for value in values {
+        let reference = value.get("ref").cloned().unwrap_or(Value::Null);
+        if compact && reference.is_null() {
+            continue;
+        }
+        if unique {
+            push_unique(&mut uris, reference);
+        } else {
+            uris.push(reference);
+        }
+    }
+    Ok(uris)
+}
+
+fn add_collection_management_fields(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) {
+    if let Some(collection_management) = record
+        .get("collection_management")
+        .and_then(Value::as_object)
+    {
+        for field in ["processing_priority", "processors"] {
+            document.insert(
+                field.to_string(),
+                collection_management
+                    .get(field)
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+        }
+    }
+}
+
+fn add_type_specific_fields(
     document: &mut Map<String, Value>,
     record_type: &str,
     record: &Map<String, Value>,
-) -> Result<bool, IndexDocumentError> {
-    if !matches!(record_type, "resource" | "archival_object") {
-        return Ok(false);
-    }
-
-    if record_type == "archival_object" {
-        if let Some(resource) = record.get("resource").and_then(Value::as_object) {
-            document.insert(
-                "resource".to_string(),
-                resource.get("ref").cloned().unwrap_or(Value::Null),
-            );
-        }
-        for (document_field, record_field) in [
-            ("title", "display_string"),
-            ("identifier", "component_id"),
-            ("component_id", "component_id"),
-            ("ref_id", "ref_id"),
-            ("slug", "slug"),
-            ("is_slug_auto", "is_slug_auto"),
-        ] {
-            document.insert(
-                document_field.to_string(),
-                record.get(record_field).cloned().unwrap_or(Value::Null),
-            );
-        }
-    } else {
-        for field in [
-            "finding_aid_title",
-            "finding_aid_filing_title",
-            "resource_type",
-            "level",
-            "restrictions",
-            "ead_id",
-            "finding_aid_status",
-            "slug",
-            "is_slug_auto",
-        ] {
-            document.insert(
-                field.to_string(),
-                record.get(field).cloned().unwrap_or(Value::Null),
-            );
-        }
-        document.insert(
-            "identifier".to_string(),
-            Value::String(joined_identifier(record, "-")),
-        );
-
-        let related_accessions = record
-            .get("related_accessions")
-            .map(|value| {
-                value
-                    .as_array()
-                    .ok_or_else(|| error("field 'related_accessions' must be an array"))
-            })
-            .transpose()?
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let mut related_uris = Vec::new();
-        for accession in related_accessions {
-            if let Some(reference) = accession.get("ref") {
-                if !reference.is_null() {
-                    push_unique(&mut related_uris, reference.clone());
-                }
-            }
-        }
-        document.insert(
-            "related_accession_uris".to_string(),
-            Value::Array(related_uris),
-        );
-
-        if let Some(collection_management) = record
-            .get("collection_management")
-            .and_then(Value::as_object)
-        {
-            for field in ["processing_priority", "processors"] {
+) -> Result<Vec<Value>, IndexDocumentError> {
+    let mut markers = Vec::new();
+    match record_type {
+        "archival_object" => {
+            if let Some(resource) = record.get("resource").and_then(Value::as_object) {
                 document.insert(
-                    field.to_string(),
-                    collection_management
-                        .get(field)
-                        .cloned()
-                        .unwrap_or(Value::Null),
+                    "resource".to_string(),
+                    resource.get("ref").cloned().unwrap_or(Value::Null),
                 );
             }
+            for (document_field, record_field) in [
+                ("title", "display_string"),
+                ("identifier", "component_id"),
+                ("component_id", "component_id"),
+                ("ref_id", "ref_id"),
+                ("slug", "slug"),
+                ("is_slug_auto", "is_slug_auto"),
+            ] {
+                document.insert(
+                    document_field.to_string(),
+                    record.get(record_field).cloned().unwrap_or(Value::Null),
+                );
+            }
+            markers.push(json_string("resource_archival_object_metadata"));
         }
-        add_classifications(document, record)?;
+        "resource" => {
+            for field in [
+                "finding_aid_title",
+                "finding_aid_filing_title",
+                "resource_type",
+                "level",
+                "restrictions",
+                "ead_id",
+                "finding_aid_status",
+                "slug",
+                "is_slug_auto",
+            ] {
+                document.insert(
+                    field.to_string(),
+                    record.get(field).cloned().unwrap_or(Value::Null),
+                );
+            }
+            document.insert(
+                "identifier".to_string(),
+                Value::String(joined_identifier(record, "-")),
+            );
+            document.insert(
+                "related_accession_uris".to_string(),
+                Value::Array(related_uris(record, "related_accessions", true, true)?),
+            );
+            add_collection_management_fields(document, record);
+            markers.push(json_string("resource_archival_object_metadata"));
+        }
+        "accession" => {
+            for field in [
+                "acquisition_type",
+                "resource_type",
+                "restrictions_apply",
+                "access_restrictions",
+                "use_restrictions",
+                "slug",
+                "is_slug_auto",
+            ] {
+                document.insert(
+                    field.to_string(),
+                    record.get(field).cloned().unwrap_or(Value::Null),
+                );
+            }
+            document.insert(
+                "title".to_string(),
+                record.get("display_string").cloned().unwrap_or(Value::Null),
+            );
+            document.insert(
+                "identifier".to_string(),
+                Value::String(joined_identifier(record, "-")),
+            );
+            document.insert(
+                "related_resource_uris".to_string(),
+                Value::Array(related_uris(record, "related_resources", true, true)?),
+            );
+            document.insert(
+                "related_accession_uris".to_string(),
+                Value::Array(related_uris(record, "related_accessions", true, true)?),
+            );
+            add_collection_management_fields(document, record);
+            markers.push(json_string("accession_digital_object_metadata"));
+        }
+        "digital_object" => {
+            for field in [
+                "digital_object_type",
+                "level",
+                "restrictions",
+                "slug",
+                "is_slug_auto",
+            ] {
+                document.insert(
+                    field.to_string(),
+                    record.get(field).cloned().unwrap_or(Value::Null),
+                );
+            }
+            let identifier = record
+                .get("digital_object_id")
+                .cloned()
+                .unwrap_or(Value::Null);
+            document.insert("digital_object_id".to_string(), identifier.clone());
+            document.insert("identifier".to_string(), identifier);
+            document.insert(
+                "collection_uri_u_sstr".to_string(),
+                Value::Array(related_uris(record, "collection", false, false)?),
+            );
+            document.insert(
+                "linked_instance_uris".to_string(),
+                Value::Array(related_uris(record, "linked_instances", true, true)?),
+            );
+            markers.push(json_string("accession_digital_object_metadata"));
+        }
+        _ => return Ok(markers),
     }
 
     add_external_ids(document, record)?;
-    add_instance_fields(document, record)?;
+    if matches!(record_type, "resource" | "accession" | "digital_object") {
+        add_classifications(document, record)?;
+    }
+    if matches!(record_type, "resource" | "archival_object" | "accession") {
+        add_instance_fields(document, record)?;
+    }
     let four_part_id = joined_identifier(record, " ");
     if !four_part_id.is_empty() {
         document.insert("four_part_id".to_string(), Value::String(four_part_id));
@@ -728,7 +812,21 @@ fn add_resource_and_archival_object_fields(
     add_ancestors(document, record)?;
     add_rights_statement_agents(document, record)?;
     add_languages(document, record)?;
-    Ok(true)
+    Ok(markers)
+}
+
+fn add_record_type_markers(
+    document: &mut Map<String, Value>,
+    record_type: &str,
+    record: &Map<String, Value>,
+    rust_fields: &mut Vec<Value>,
+) -> Result<(), IndexDocumentError> {
+    for marker in add_type_specific_fields(document, record_type, record)? {
+        if !rust_fields.contains(&marker) {
+            rust_fields.push(marker);
+        }
+    }
+    Ok(())
 }
 
 fn add_enriched_fields(
@@ -812,9 +910,7 @@ fn add_enriched_fields(
         Value::Array(unpublished.into_iter().map(Value::String).collect()),
     );
     let mut rust_fields = vec![json_string("common_metadata"), json_string("fullrecord")];
-    if add_resource_and_archival_object_fields(document, record_type, record)? {
-        rust_fields.push(json_string("resource_archival_object_metadata"));
-    }
+    add_record_type_markers(document, record_type, record, &mut rust_fields)?;
     document.insert(
         "_archivalist_rust_fields".to_string(),
         Value::Array(rust_fields),
@@ -1154,6 +1250,133 @@ mod tests {
             json!(["/repositories/2/resources/7"])
         );
         assert_eq!(document["langcode"], json!([]));
+    }
+
+    #[test]
+    fn builds_accession_specific_staff_index_fields() {
+        let document = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/accessions/4".to_string(),
+            record_type: "accession".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/accessions/4",
+                "title": "Original accession title",
+                "display_string": "2026-004: New records",
+                "publish": true,
+                "id_0": "2026",
+                "id_1": "004",
+                "acquisition_type": "gift",
+                "resource_type": "papers",
+                "restrictions_apply": true,
+                "access_restrictions": true,
+                "use_restrictions": false,
+                "related_resources": [
+                    {"ref": "/repositories/2/resources/7"},
+                    {"ref": "/repositories/2/resources/7"}
+                ],
+                "related_accessions": [{"ref": "/repositories/2/accessions/3"}],
+                "slug": "2026-004-new-records",
+                "is_slug_auto": true,
+                "collection_management": {
+                    "processing_priority": "medium",
+                    "processors": "Archive team"
+                },
+                "external_ids": [{"external_id": "legacy-a4"}],
+                "classifications": [{
+                    "ref": "/classifications/2",
+                    "_resolved": {"path_from_root": [{"identifier": "ACC"}]}
+                }],
+                "instances": [{
+                    "sub_container": {
+                        "top_container": {"ref": "/repositories/2/top_containers/6"}
+                    }
+                }],
+                "ancestors": [],
+                "lang_materials": [{"language_and_script": {"language": "gle"}}]
+            }),
+            enrich: true,
+        })
+        .unwrap();
+
+        assert_eq!(document["title"], "2026-004: New records");
+        assert_eq!(document["identifier"], "2026-004");
+        assert_eq!(document["four_part_id"], "2026 004");
+        assert_eq!(document["acquisition_type"], "gift");
+        assert_eq!(document["restrictions_apply"], true);
+        assert_eq!(
+            document["related_resource_uris"],
+            json!(["/repositories/2/resources/7"])
+        );
+        assert_eq!(
+            document["related_accession_uris"],
+            json!(["/repositories/2/accessions/3"])
+        );
+        assert_eq!(document["processing_priority"], "medium");
+        assert_eq!(
+            document["top_container_uri_u_sstr"],
+            json!(["/repositories/2/top_containers/6"])
+        );
+        assert_eq!(document["langcode"], json!(["gle"]));
+        assert_eq!(
+            document["_archivalist_rust_fields"],
+            json!([
+                "common_metadata",
+                "fullrecord",
+                "accession_digital_object_metadata"
+            ])
+        );
+    }
+
+    #[test]
+    fn builds_digital_object_specific_staff_index_fields() {
+        let document = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/digital_objects/5".to_string(),
+            record_type: "digital_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/digital_objects/5",
+                "title": "Scanned register",
+                "publish": true,
+                "digital_object_type": "still_image",
+                "digital_object_id": "DO-5",
+                "level": "image",
+                "restrictions": false,
+                "slug": "scanned-register",
+                "is_slug_auto": false,
+                "collection": [{"ref": "/repositories/2/resources/7"}],
+                "linked_instances": [
+                    {"ref": "/repositories/2/archival_objects/8"},
+                    {"ref": "/repositories/2/archival_objects/8"}
+                ],
+                "external_ids": [],
+                "classifications": [],
+                "ancestors": [],
+                "lang_materials": []
+            }),
+            enrich: true,
+        })
+        .unwrap();
+
+        assert_eq!(document["digital_object_type"], "still_image");
+        assert_eq!(document["digital_object_id"], "DO-5");
+        assert_eq!(document["identifier"], "DO-5");
+        assert_eq!(document["level"], "image");
+        assert_eq!(
+            document["collection_uri_u_sstr"],
+            json!(["/repositories/2/resources/7"])
+        );
+        assert_eq!(
+            document["linked_instance_uris"],
+            json!(["/repositories/2/archival_objects/8"])
+        );
+        assert_eq!(
+            document["_archivalist_rust_fields"],
+            json!([
+                "common_metadata",
+                "fullrecord",
+                "accession_digital_object_metadata"
+            ])
+        );
     }
 
     #[test]

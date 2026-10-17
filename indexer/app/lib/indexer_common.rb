@@ -433,6 +433,7 @@ class IndexerCommon
 
     add_document_prepare_hook {|doc, record|
       if doc['primary_type'] == 'accession'
+        rust_fields = Array(doc['_archivalist_rust_fields'])
         date = record['record']['accession_date']
         if date == '9999-12-31'
           unknown = I18n.t('accession.accession_date_unknown')
@@ -443,27 +444,29 @@ class IndexerCommon
           doc['accession_date'] = date
         end
         doc['accession_date_year'] = Date.parse(date).year
-        doc['identifier'] = (0...4).map {|i| record['record']["id_#{i}"]}.compact.join("-")
-        doc['title'] = record['record']['display_string']
+        unless rust_fields.include?('accession_digital_object_metadata')
+          doc['identifier'] = (0...4).map {|i| record['record']["id_#{i}"]}.compact.join("-")
+          doc['title'] = record['record']['display_string']
 
-        doc['acquisition_type'] = record['record']['acquisition_type']
-        doc['resource_type'] = record['record']['resource_type']
-        doc['restrictions_apply'] = record['record']['restrictions_apply']
-        doc['access_restrictions'] = record['record']['access_restrictions']
-        doc['use_restrictions'] = record['record']['use_restrictions']
-        doc['related_resource_uris'] = record['record']['related_resources'].
-                                          collect { |resource| resource["ref"] }.
-                                          compact.uniq
+          doc['acquisition_type'] = record['record']['acquisition_type']
+          doc['resource_type'] = record['record']['resource_type']
+          doc['restrictions_apply'] = record['record']['restrictions_apply']
+          doc['access_restrictions'] = record['record']['access_restrictions']
+          doc['use_restrictions'] = record['record']['use_restrictions']
+          doc['related_resource_uris'] = record['record']['related_resources'].
+                                            collect { |resource| resource["ref"] }.
+                                            compact.uniq
 
-        doc['related_accession_uris'] = record['record']['related_accessions'].
-                                           collect { |accession| accession["ref"] }.
-                                           compact.uniq
+          doc['related_accession_uris'] = record['record']['related_accessions'].
+                                             collect { |accession| accession["ref"] }.
+                                             compact.uniq
 
-        doc['slug'] = record['record']['slug']
-        doc['is_slug_auto'] = record['record']['is_slug_auto']
-        if cm = record['record']['collection_management']
-          doc['processing_priority'] = cm['processing_priority']
-          doc['processors'] = cm['processors']
+          doc['slug'] = record['record']['slug']
+          doc['is_slug_auto'] = record['record']['is_slug_auto']
+          if cm = record['record']['collection_management']
+            doc['processing_priority'] = cm['processing_priority']
+            doc['processors'] = cm['processors']
+          end
         end
       end
     }
@@ -547,7 +550,7 @@ class IndexerCommon
         end
       end
 
-      if doc['primary_type'] == 'digital_object'
+      if doc['primary_type'] == 'digital_object' && !rust_fields.include?('accession_digital_object_metadata')
         doc['digital_object_type'] = record['record']['digital_object_type']
 
         doc['digital_object_id'] = record['record']['digital_object_id']
@@ -674,7 +677,8 @@ class IndexerCommon
 
     add_document_prepare_hook {|doc, record|
       rust_fields = Array(doc['_archivalist_rust_fields'])
-      unless rust_fields.include?('resource_archival_object_metadata')
+      unless rust_fields.include?('resource_archival_object_metadata') ||
+             rust_fields.include?('accession_digital_object_metadata')
         doc['external_id'] = Array(record['record']['external_ids']).map do |eid|
           eid['external_id']
         end
@@ -750,6 +754,7 @@ class IndexerCommon
 
       if records_with_classifications.include?(doc['primary_type']) &&
          !rust_fields.include?('resource_archival_object_metadata') &&
+         !rust_fields.include?('accession_digital_object_metadata') &&
          record['record']['classifications'].length > 0
         doc['classification_paths'] = record['record']['classifications'].map { |c| ASUtils.to_json(c['_resolved']['path_from_root']) }
         doc['classification_uris'] = record['record']['classifications'].map { |c| c['ref'] }
@@ -760,6 +765,7 @@ class IndexerCommon
       rust_fields = Array(doc['_archivalist_rust_fields'])
       if ['resource', 'archival_object', 'accession'].include?(doc['primary_type']) &&
          !rust_fields.include?('resource_archival_object_metadata') &&
+         !rust_fields.include?('accession_digital_object_metadata') &&
          record['record']['instances'] && record['record']['instances'].length > 0
         doc['location_uris'] = record['record']['instances'].
                                   collect {|instance| instance["sub_container"]}.compact.
@@ -777,7 +783,8 @@ class IndexerCommon
     # Index four-part IDs separately
     add_document_prepare_hook {|doc, record|
       rust_fields = Array(doc['_archivalist_rust_fields'])
-      unless rust_fields.include?('resource_archival_object_metadata')
+      unless rust_fields.include?('resource_archival_object_metadata') ||
+             rust_fields.include?('accession_digital_object_metadata')
         four_part_id = (0..3).map {|n| record['record']["id_#{n}"]}.compact.join(" ")
 
         unless four_part_id.empty?
@@ -868,7 +875,8 @@ class IndexerCommon
     add_document_prepare_hook {|doc, record|
       rust_fields = Array(doc['_archivalist_rust_fields'])
       if ['resource', 'archival_object', 'accession'].include?(doc['primary_type']) &&
-         !rust_fields.include?('resource_archival_object_metadata')
+         !rust_fields.include?('resource_archival_object_metadata') &&
+         !rust_fields.include?('accession_digital_object_metadata')
         # we no longer want the contents of containers to be indexed at the container's location
         doc.delete('location_uris')
 
@@ -940,7 +948,8 @@ class IndexerCommon
 
     add_document_prepare_hook {|doc, record|
       rust_fields = Array(doc['_archivalist_rust_fields'])
-      unless rust_fields.include?('resource_archival_object_metadata')
+      unless rust_fields.include?('resource_archival_object_metadata') ||
+             rust_fields.include?('accession_digital_object_metadata')
         doc['ancestors'] = ASUtils.wrap(record['record']['ancestors']).map {|ancestor|
           ancestor.fetch('ref')
         }
@@ -949,7 +958,8 @@ class IndexerCommon
 
     add_document_prepare_hook {|doc, record|
       rust_fields = Array(doc['_archivalist_rust_fields'])
-      unless rust_fields.include?('resource_archival_object_metadata')
+      unless rust_fields.include?('resource_archival_object_metadata') ||
+             rust_fields.include?('accession_digital_object_metadata')
         ASUtils.wrap(record['record']['rights_statements']).each do |rights_statement|
           ASUtils.wrap(rights_statement['linked_agents']).each do |agent_link|
             doc['rights_statement_agent_uris'] ||= []
@@ -1036,7 +1046,8 @@ class IndexerCommon
 
     add_document_prepare_hook {|doc, record|
       rust_fields = Array(doc['_archivalist_rust_fields'])
-      unless rust_fields.include?('resource_archival_object_metadata')
+      unless rust_fields.include?('resource_archival_object_metadata') ||
+             rust_fields.include?('accession_digital_object_metadata')
         doc['langcode'] ||= []
         if record['record'].has_key?('lang_materials') and record['record']['lang_materials'].is_a?(Array)
           record['record']['lang_materials'].each { |langmaterial|
