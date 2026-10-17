@@ -58,6 +58,10 @@ class RustIndexDocumentBuilder
       expected_types = [record_type]
       expected_types << 'agent_with_user' if agent_types.include?(record_type) && record['is_user']
       expected_types << 'agent' if agent_types.include?(record_type)
+      if record_type == 'job' && input['enrich']
+        expected_types << record['job_type']
+        expected_types << (record['job'] && record['job']['report_type'])
+      end
       raise "response types mismatch for #{uri}" unless document['types'] == expected_types
       expected_repository = record_type == 'repository' && input['enrich'] ? uri : input['repository']
       raise "response repository mismatch for #{uri}" unless document['repository'] == expected_repository
@@ -85,6 +89,8 @@ class RustIndexDocumentBuilder
           expected_fields << 'profile_assessment_metadata'
         elsif record_type == 'top_container'
           expected_fields << 'top_container_metadata'
+        elsif record_type == 'job'
+          expected_fields << 'job_metadata'
         end
         unless document['_archivalist_rust_fields'] == expected_fields
           raise "response enrichment marker mismatch for #{uri}"
@@ -284,6 +290,12 @@ class RustIndexDocumentBuilder
                             ])
           end
           required << 'indicator_u_icusort' if record['indicator']
+        elsif record_type == 'job'
+          required.concat([
+                            'job_type', 'report_type', 'job_report_type',
+                            'status', 'owner', 'queue_position',
+                            'external_id', 'ancestors', 'langcode'
+                          ])
         end
         if record_type == 'subject' || agent_types.include?(record_type)
           if record.has_key?('used_within_repositories')

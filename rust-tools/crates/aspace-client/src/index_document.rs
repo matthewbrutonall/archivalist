@@ -1940,6 +1940,48 @@ fn add_top_container_fields(
     Ok(())
 }
 
+fn add_job_fields(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    // `common/schemas/job.rb` defines `job` as `"type" => "object"`, while
+    // `Job.sequel_to_jsonmodel` (`backend/app/model/job.rb`) falls back to setting
+    // `json.job = obj.job_type` (a string) on `JSONModel::ModelNotFound`.
+    let report_type = match record.get("job") {
+        Some(Value::Object(job)) => job.get("report_type").cloned().unwrap_or(Value::Null),
+        Some(Value::String(job)) => {
+            if job.contains("report_type") {
+                Value::String("report_type".to_string())
+            } else {
+                Value::Null
+            }
+        }
+        _ => return Err(error("field 'job' must be an object or string")),
+    };
+    let job_type = record.get("job_type").cloned().unwrap_or(Value::Null);
+    let types = document
+        .get_mut("types")
+        .and_then(Value::as_array_mut)
+        .expect("types is initialized as an array");
+    types.push(job_type.clone());
+    types.push(report_type.clone());
+    let job_report_type = if ruby_truthy(Some(&report_type)) {
+        report_type.clone()
+    } else {
+        job_type.clone()
+    };
+    document.insert("job_type".to_string(), job_type);
+    document.insert("report_type".to_string(), report_type);
+    document.insert("job_report_type".to_string(), job_report_type);
+    for field in ["status", "owner", "queue_position"] {
+        document.insert(
+            field.to_string(),
+            record.get(field).cloned().unwrap_or(Value::Null),
+        );
+    }
+    Ok(())
+}
+
 fn add_type_specific_fields(
     document: &mut Map<String, Value>,
     record_type: &str,
@@ -2103,6 +2145,10 @@ fn add_type_specific_fields(
         "top_container" => {
             add_top_container_fields(document, record)?;
             markers.push(json_string("top_container_metadata"));
+        }
+        "job" => {
+            add_job_fields(document, record)?;
+            markers.push(json_string("job_metadata"));
         }
         _ => return Ok(markers),
     }
@@ -4066,22 +4112,287 @@ mod tests {
     }
 
     #[test]
-    fn keeps_unmigrated_types_and_unenriched_requests_free_of_type_specific_markers() {
-        let job = build_index_document(IndexDocumentInput {
-            uri: "/repositories/2/jobs/5".to_string(),
+    fn builds_job_staff_index_fields_for_full_and_minimal_records() {
+        let report_job = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/jobs/14".to_string(),
             record_type: "job".to_string(),
             repository: json!(2),
             record: json!({
-                "uri": "/repositories/2/jobs/5",
-                "title": "Job 5"
+                "uri": "/repositories/2/jobs/14",
+                "job_type": "report_job",
+                "job": {
+                    "jsonmodel_type": "report_job",
+                    "report_type": "assessment_list_report",
+                    "format": "pdf"
+                },
+                "status": "queued",
+                "owner": "admin",
+                "queue_position": 2,
+                "time_submitted": "2026-10-17 12:00:00 UTC",
+                "created_by": "admin",
+                "external_ids": [{"external_id": "job-ext-14"}],
+                "ancestors": [{"ref": "/repositories/2/resources/7"}],
+                "lang_materials": [{"language_and_script": {"language": "eng"}}]
+            }),
+            enrich: true,
+        })
+        .unwrap();
+
+        assert_eq!(report_job["id"], "/repositories/2/jobs/14");
+        assert_eq!(report_job["uri"], "/repositories/2/jobs/14");
+        assert_eq!(report_job["primary_type"], "job");
+        assert_eq!(report_job["title"], Value::Null);
+        assert_eq!(
+            report_job["types"],
+            json!(["job", "report_job", "assessment_list_report"])
+        );
+        assert_eq!(report_job["job_type"], "report_job");
+        assert_eq!(report_job["report_type"], "assessment_list_report");
+        assert_eq!(report_job["job_report_type"], "assessment_list_report");
+        assert_eq!(report_job["status"], "queued");
+        assert_eq!(report_job["owner"], "admin");
+        assert_eq!(report_job["queue_position"], 2);
+        assert_eq!(report_job["created_by"], "admin");
+        assert_eq!(report_job["external_id"], json!(["job-ext-14"]));
+        assert_eq!(
+            report_job["ancestors"],
+            json!(["/repositories/2/resources/7"])
+        );
+        assert_eq!(report_job["langcode"], json!(["eng"]));
+        assert!(report_job.get("time_submitted").is_none());
+        assert!(report_job.get("time_started").is_none());
+        assert!(report_job.get("time_finished").is_none());
+        assert!(report_job.get("files").is_none());
+        assert!(report_job.get("job_data").is_none());
+        assert_eq!(
+            report_job["_archivalist_rust_fields"],
+            json!(["common_metadata", "fullrecord", "job_metadata"])
+        );
+
+        let minimal_import_job = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/jobs/15".to_string(),
+            record_type: "job".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/jobs/15",
+                "job_type": "import_job",
+                "job": {
+                    "jsonmodel_type": "import_job",
+                    "filenames": ["ead.xml"]
+                },
+                "status": "completed",
+                "owner": "archivist"
+            }),
+            enrich: true,
+        })
+        .unwrap();
+
+        assert_eq!(
+            minimal_import_job["types"],
+            json!(["job", "import_job", Value::Null])
+        );
+        assert_eq!(minimal_import_job["job_type"], "import_job");
+        assert_eq!(minimal_import_job["report_type"], Value::Null);
+        assert_eq!(minimal_import_job["job_report_type"], "import_job");
+        assert_eq!(minimal_import_job["status"], "completed");
+        assert_eq!(minimal_import_job["owner"], "archivist");
+        assert_eq!(minimal_import_job["queue_position"], Value::Null);
+        assert_eq!(minimal_import_job["external_id"], json!([]));
+        assert_eq!(minimal_import_job["ancestors"], json!([]));
+        assert_eq!(minimal_import_job["langcode"], json!([]));
+        assert_eq!(
+            minimal_import_job["_archivalist_rust_fields"],
+            json!(["common_metadata", "fullrecord", "job_metadata"])
+        );
+
+        let falsy_report_type_job = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/jobs/16".to_string(),
+            record_type: "job".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/jobs/16",
+                "job_type": "batch_delete_job",
+                "job": {
+                    "jsonmodel_type": "batch_delete_job",
+                    "report_type": false
+                },
+                "status": "failed",
+                "owner": "admin"
             }),
             enrich: true,
         })
         .unwrap();
         assert_eq!(
-            job["_archivalist_rust_fields"],
+            falsy_report_type_job["types"],
+            json!(["job", "batch_delete_job", false])
+        );
+        assert_eq!(falsy_report_type_job["report_type"], false);
+        assert_eq!(falsy_report_type_job["job_report_type"], "batch_delete_job");
+
+        let empty_report_type_job = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/jobs/17".to_string(),
+            record_type: "job".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/jobs/17",
+                "job_type": "report_job",
+                "job": {
+                    "jsonmodel_type": "report_job",
+                    "report_type": ""
+                },
+                "status": "running",
+                "owner": "admin"
+            }),
+            enrich: true,
+        })
+        .unwrap();
+        assert_eq!(empty_report_type_job["report_type"], "");
+        assert_eq!(empty_report_type_job["job_report_type"], "");
+
+        let legacy_string_job = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/jobs/18".to_string(),
+            record_type: "job".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/jobs/18",
+                "job_type": "removed_plugin_job",
+                "job": "removed_plugin_job",
+                "inactive_record": true,
+                "status": "completed",
+                "owner": "admin"
+            }),
+            enrich: true,
+        })
+        .unwrap();
+        assert_eq!(
+            legacy_string_job["types"],
+            json!(["job", "removed_plugin_job", Value::Null])
+        );
+        assert_eq!(legacy_string_job["job_type"], "removed_plugin_job");
+        assert_eq!(legacy_string_job["report_type"], Value::Null);
+        assert_eq!(legacy_string_job["job_report_type"], "removed_plugin_job");
+
+        let string_with_report_type_job = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/jobs/19".to_string(),
+            record_type: "job".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/jobs/19",
+                "job_type": "legacy_job",
+                "job": "legacy_report_type_job",
+                "status": "completed",
+                "owner": "admin"
+            }),
+            enrich: true,
+        })
+        .unwrap();
+        assert_eq!(
+            string_with_report_type_job["types"],
+            json!(["job", "legacy_job", "report_type"])
+        );
+        assert_eq!(string_with_report_type_job["job_type"], "legacy_job");
+        assert_eq!(string_with_report_type_job["report_type"], "report_type");
+        assert_eq!(
+            string_with_report_type_job["job_report_type"],
+            "report_type"
+        );
+
+        let explicit_null_report_type_job = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/jobs/20".to_string(),
+            record_type: "job".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/jobs/20",
+                "job_type": "export_job",
+                "job": {
+                    "jsonmodel_type": "export_job",
+                    "report_type": Value::Null
+                },
+                "status": "completed",
+                "owner": "admin"
+            }),
+            enrich: true,
+        })
+        .unwrap();
+        assert_eq!(
+            explicit_null_report_type_job["types"],
+            json!(["job", "export_job", Value::Null])
+        );
+        assert_eq!(explicit_null_report_type_job["report_type"], Value::Null);
+        assert_eq!(
+            explicit_null_report_type_job["job_report_type"],
+            "export_job"
+        );
+
+        let missing_job_type_job = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/jobs/21".to_string(),
+            record_type: "job".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/jobs/21",
+                "job": {
+                    "jsonmodel_type": "unknown_job"
+                },
+                "status": "queued",
+                "owner": "admin"
+            }),
+            enrich: true,
+        })
+        .unwrap();
+        assert_eq!(
+            missing_job_type_job["types"],
+            json!(["job", Value::Null, Value::Null])
+        );
+        assert_eq!(missing_job_type_job["job_type"], Value::Null);
+        assert_eq!(missing_job_type_job["report_type"], Value::Null);
+        assert_eq!(missing_job_type_job["job_report_type"], Value::Null);
+    }
+
+    #[test]
+    fn keeps_unmigrated_types_and_unenriched_requests_free_of_type_specific_markers() {
+        let custom_record = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/custom_records/5".to_string(),
+            record_type: "custom_record".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/custom_records/5",
+                "title": "Custom 5"
+            }),
+            enrich: true,
+        })
+        .unwrap();
+        assert_eq!(
+            custom_record["_archivalist_rust_fields"],
             json!(["common_metadata", "fullrecord"])
         );
+        assert!(
+            !custom_record["_archivalist_rust_fields"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("job_metadata")),
+            "custom record should not contain job_metadata marker"
+        );
+
+        let unenriched_job = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/jobs/5".to_string(),
+            record_type: "job".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/jobs/5",
+                "title": "Envelope job title",
+                "job_type": "import_job",
+                "job": {"jsonmodel_type": "import_job"},
+                "status": "queued",
+                "owner": "admin"
+            }),
+            enrich: false,
+        })
+        .unwrap();
+        assert_eq!(unenriched_job["title"], "Envelope job title");
+        assert_eq!(unenriched_job["types"], json!(["job"]));
+        assert!(unenriched_job.get("_archivalist_rust_fields").is_none());
+        assert!(unenriched_job.get("job_type").is_none());
+        assert!(unenriched_job.get("job_report_type").is_none());
 
         let unenriched_top_container = build_index_document(IndexDocumentInput {
             uri: "/repositories/2/top_containers/55".to_string(),
@@ -4203,6 +4514,27 @@ mod tests {
                 "uri": "/repositories/2/top_containers/55",
                 "display_string": "Box 55",
                 "container_locations": [{"status": "current", "ref": "/locations/1"}]
+            }),
+            enrich: true,
+        })
+        .is_err());
+        assert!(build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/jobs/5".to_string(),
+            record_type: "job".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/jobs/5"
+            }),
+            enrich: true,
+        })
+        .is_err());
+        assert!(build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/jobs/5".to_string(),
+            record_type: "job".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/jobs/5",
+                "job": ["invalid-array-job"]
             }),
             enrich: true,
         })

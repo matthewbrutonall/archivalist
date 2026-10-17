@@ -701,7 +701,8 @@ class IndexerCommon
              rust_fields.include?('component_classification_metadata') ||
              rust_fields.include?('repository_event_location_metadata') ||
              rust_fields.include?('profile_assessment_metadata') ||
-             rust_fields.include?('top_container_metadata')
+             rust_fields.include?('top_container_metadata') ||
+             rust_fields.include?('job_metadata')
         doc['external_id'] = Array(record['record']['external_ids']).map do |eid|
           eid['external_id']
         end
@@ -740,16 +741,19 @@ class IndexerCommon
 
     add_document_prepare_hook {|doc, record|
       if doc['primary_type'] == 'job'
+        rust_fields = Array(doc['_archivalist_rust_fields'])
         report_type = record['record']['job']['report_type']
         doc['title'] = (report_type ? I18n.t("reports.#{report_type}.title", :default => report_type) :
           I18n.t("job.types.#{record['record']['job_type']}"))
-        doc['types'] << record['record']['job_type']
-        doc['types'] << report_type
-        doc['job_type'] = record['record']['job_type']
-        doc['report_type'] = report_type
-        doc['job_report_type'] = report_type || doc['job_type']
-        doc['status'] = record['record']['status']
-        doc['owner'] = record['record']['owner']
+        unless rust_fields.include?('job_metadata')
+          doc['types'] << record['record']['job_type']
+          doc['types'] << report_type
+          doc['job_type'] = record['record']['job_type']
+          doc['report_type'] = report_type
+          doc['job_report_type'] = report_type || doc['job_type']
+          doc['status'] = record['record']['status']
+          doc['owner'] = record['record']['owner']
+        end
         doc['time_submitted'] = Time.parse(record['record']['time_submitted']).getlocal if record['record']['time_submitted']
         doc['time_started'] = Time.parse(record['record']['time_started']).getlocal if record['record']['time_started']
         doc['time_finished'] = Time.parse(record['record']['time_finished']).getlocal if record['record']['time_finished']
@@ -770,7 +774,7 @@ class IndexerCommon
             doc['job_data'] << "#{k} --- #{v}"
           end
         end
-        doc['queue_position'] = record['record']['queue_position']
+        doc['queue_position'] = record['record']['queue_position'] unless rust_fields.include?('job_metadata')
       end
     }
 
@@ -816,7 +820,8 @@ class IndexerCommon
              rust_fields.include?('component_classification_metadata') ||
              rust_fields.include?('repository_event_location_metadata') ||
              rust_fields.include?('profile_assessment_metadata') ||
-             rust_fields.include?('top_container_metadata')
+             rust_fields.include?('top_container_metadata') ||
+             rust_fields.include?('job_metadata')
         four_part_id = (0..3).map {|n| record['record']["id_#{n}"]}.compact.join(" ")
 
         unless four_part_id.empty?
@@ -993,7 +998,8 @@ class IndexerCommon
              rust_fields.include?('component_classification_metadata') ||
              rust_fields.include?('repository_event_location_metadata') ||
              rust_fields.include?('profile_assessment_metadata') ||
-             rust_fields.include?('top_container_metadata')
+             rust_fields.include?('top_container_metadata') ||
+             rust_fields.include?('job_metadata')
         doc['ancestors'] = ASUtils.wrap(record['record']['ancestors']).map {|ancestor|
           ancestor.fetch('ref')
         }
@@ -1008,7 +1014,8 @@ class IndexerCommon
              rust_fields.include?('component_classification_metadata') ||
              rust_fields.include?('repository_event_location_metadata') ||
              rust_fields.include?('profile_assessment_metadata') ||
-             rust_fields.include?('top_container_metadata')
+             rust_fields.include?('top_container_metadata') ||
+             rust_fields.include?('job_metadata')
         ASUtils.wrap(record['record']['rights_statements']).each do |rights_statement|
           ASUtils.wrap(rights_statement['linked_agents']).each do |agent_link|
             doc['rights_statement_agent_uris'] ||= []
@@ -1103,7 +1110,8 @@ class IndexerCommon
              rust_fields.include?('component_classification_metadata') ||
              rust_fields.include?('repository_event_location_metadata') ||
              rust_fields.include?('profile_assessment_metadata') ||
-             rust_fields.include?('top_container_metadata')
+             rust_fields.include?('top_container_metadata') ||
+             rust_fields.include?('job_metadata')
         doc['langcode'] ||= []
         if record['record'].has_key?('lang_materials') and record['record']['lang_materials'].is_a?(Array)
           record['record']['lang_materials'].each { |langmaterial|

@@ -1040,4 +1040,250 @@ describe RustIndexDocumentBuilder do
       )
     end
   end
+
+  it 'validates job enrichment fields, types ordering, and job_metadata marker' do
+    report_job = {
+      'uri' => '/repositories/2/jobs/31',
+      'record_type' => 'job',
+      'repository' => 2,
+      'enrich' => true,
+      'record' => {
+        'uri' => '/repositories/2/jobs/31',
+        'jsonmodel_type' => 'job',
+        'job_type' => 'report_job',
+        'status' => 'completed',
+        'owner' => 'admin',
+        'queue_position' => 0,
+        'job' => {
+          'jsonmodel_type' => 'report_job',
+          'report_type' => 'assessment_list_report',
+          'format' => 'pdf',
+        },
+      },
+    }
+    report_job_document = {
+      'id' => report_job['uri'],
+      'uri' => report_job['uri'],
+      'title' => nil,
+      'primary_type' => 'job',
+      'types' => ['job', 'report_job', 'assessment_list_report'],
+      'job_type' => 'report_job',
+      'report_type' => 'assessment_list_report',
+      'job_report_type' => 'assessment_list_report',
+      'status' => 'completed',
+      'owner' => 'admin',
+      'queue_position' => 0,
+      'json' => ASUtils.to_json(report_job['record']),
+      'suppressed' => false,
+      'publish' => false,
+      'system_generated' => 'false',
+      'repository' => 2,
+      'fullrecord_published' => [],
+      'fullrecord' => [],
+      'external_id' => [],
+      'ancestors' => [],
+      'langcode' => [],
+      '_archivalist_rust_fields' => [
+        'common_metadata',
+        'fullrecord',
+        'job_metadata',
+      ],
+    }
+
+    import_job = {
+      'uri' => '/repositories/2/jobs/32',
+      'record_type' => 'job',
+      'repository' => 2,
+      'enrich' => true,
+      'record' => {
+        'uri' => '/repositories/2/jobs/32',
+        'jsonmodel_type' => 'job',
+        'job_type' => 'import_job',
+        'status' => 'queued',
+        'owner' => 'archivist',
+        'queue_position' => 3,
+        'job' => {
+          'jsonmodel_type' => 'import_job',
+          'import_type' => 'ead_xml',
+          'filenames' => ['collection.xml'],
+        },
+      },
+    }
+    import_job_document = {
+      'id' => import_job['uri'],
+      'uri' => import_job['uri'],
+      'title' => nil,
+      'primary_type' => 'job',
+      'types' => ['job', 'import_job', nil],
+      'job_type' => 'import_job',
+      'report_type' => nil,
+      'job_report_type' => 'import_job',
+      'status' => 'queued',
+      'owner' => 'archivist',
+      'queue_position' => 3,
+      'json' => ASUtils.to_json(import_job['record']),
+      'suppressed' => false,
+      'publish' => false,
+      'system_generated' => 'false',
+      'repository' => 2,
+      'fullrecord_published' => [],
+      'fullrecord' => [],
+      'external_id' => [],
+      'ancestors' => [],
+      'langcode' => [],
+      '_archivalist_rust_fields' => [
+        'common_metadata',
+        'fullrecord',
+        'job_metadata',
+      ],
+    }
+
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [report_job_document, import_job_document])
+    )
+
+    expect(builder.build([report_job, import_job])).to eq(
+      report_job['uri'] => report_job_document,
+      import_job['uri'] => import_job_document
+    )
+
+    bad_types_doc = import_job_document.merge('types' => ['job', 'import_job'])
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [bad_types_doc])
+    )
+    expect { builder.build([import_job]) }.to raise_error(/response types mismatch/)
+
+    bad_marker_doc = report_job_document.merge(
+      '_archivalist_rust_fields' => ['common_metadata', 'fullrecord']
+    )
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [bad_marker_doc])
+    )
+    expect { builder.build([report_job]) }.to raise_error(/response enrichment marker mismatch/)
+
+    [
+      'job_type',
+      'report_type',
+      'job_report_type',
+      'status',
+      'owner',
+      'queue_position',
+      'external_id',
+      'ancestors',
+      'langcode',
+    ].each do |required_field|
+      missing_doc = report_job_document.reject {|k, _| k == required_field}
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [missing_doc])
+      )
+      expect { builder.build([report_job]) }.to raise_error(
+        /enrichment fields missing.*#{Regexp.escape(required_field)}/
+      )
+    end
+  end
+
+  it 'accepts unenriched job documents without job_metadata marker and rejects unexpected markers' do
+    unenriched_job = {
+      'uri' => '/repositories/2/jobs/33',
+      'record_type' => 'job',
+      'repository' => 2,
+      'enrich' => false,
+      'record' => {
+        'uri' => '/repositories/2/jobs/33',
+        'jsonmodel_type' => 'job',
+        'title' => 'Envelope Job Title',
+        'job_type' => 'import_job',
+        'status' => 'queued',
+        'owner' => 'archivist',
+        'job' => {
+          'jsonmodel_type' => 'import_job',
+        },
+      },
+    }
+    unenriched_doc = {
+      'id' => unenriched_job['uri'],
+      'uri' => unenriched_job['uri'],
+      'title' => 'Envelope Job Title',
+      'primary_type' => 'job',
+      'types' => ['job'],
+      'json' => ASUtils.to_json(unenriched_job['record']),
+      'suppressed' => false,
+      'publish' => false,
+      'system_generated' => 'false',
+      'repository' => 2,
+    }
+
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [unenriched_doc])
+    )
+    expect(builder.build([unenriched_job])).to eq(unenriched_job['uri'] => unenriched_doc)
+
+    bad_marker_doc = unenriched_doc.merge('_archivalist_rust_fields' => ['common_metadata', 'fullrecord', 'job_metadata'])
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [bad_marker_doc])
+    )
+    expect { builder.build([unenriched_job]) }.to raise_error(/unexpected response enrichment marker/)
+  end
+
+  it 'rejects job_metadata marker on unrelated record types' do
+    resource_input = {
+      'uri' => '/repositories/2/resources/99',
+      'record_type' => 'resource',
+      'repository' => 2,
+      'enrich' => true,
+      'record' => {
+        'uri' => '/repositories/2/resources/99',
+        'title' => 'Test Resource',
+        'id_0' => 'RES-99',
+        'level' => 'collection',
+      },
+    }
+    unrelated_doc_with_job_marker = {
+      'id' => resource_input['uri'],
+      'uri' => resource_input['uri'],
+      'title' => 'Test Resource',
+      'primary_type' => 'resource',
+      'types' => ['resource'],
+      'json' => ASUtils.to_json(resource_input['record']),
+      'suppressed' => false,
+      'publish' => false,
+      'system_generated' => 'false',
+      'repository' => 2,
+      'fullrecord_published' => [],
+      'fullrecord' => [],
+      'finding_aid_title' => nil,
+      'finding_aid_filing_title' => nil,
+      'identifier' => 'RES-99',
+      'resource_type' => nil,
+      'level' => 'collection',
+      'restrictions' => false,
+      'ead_id' => nil,
+      'finding_aid_status' => nil,
+      'related_accession_uris' => [],
+      'slug' => nil,
+      'is_slug_auto' => false,
+      'external_id' => [],
+      'ancestors' => [],
+      'langcode' => [],
+      'four_part_id' => 'RES-99',
+      '_archivalist_rust_fields' => [
+        'common_metadata',
+        'fullrecord',
+        'resource_archival_object_metadata',
+        'job_metadata',
+      ],
+    }
+
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [unrelated_doc_with_job_marker])
+    )
+    expect { builder.build([resource_input]) }.to raise_error(/response enrichment marker mismatch/)
+  end
 end

@@ -806,7 +806,7 @@ describe "periodic indexer" do
       expect(tc_doc).not_to have_key('_archivalist_rust_fields')
     end
 
-    it "falls back to the native top_container hook when the sidecar returns nil and keeps jobs and instance container links native" do
+    it "falls back to the native top_container hook when the sidecar returns nil and keeps instance container links native" do
       top_container = {
         'uri' => '/repositories/2/top_containers/45',
         'record' => {
@@ -916,6 +916,202 @@ describe "periodic indexer" do
       expect(ao_doc['child_container_u_sstr']).to eq(['folder 3 FOLD-3'])
       expect(ao_doc['grand_child_container_u_sstr']).to eq(['item 1'])
       expect(ao_doc).not_to have_key('location_uris')
+    end
+
+    it "retains Rust job fields, executes native I18n, time, HTTP, files, and job_data exactly once, strips job_metadata before downstream hooks, and bypasses PUI" do
+      report_job = {
+        'uri' => '/repositories/2/jobs/101',
+        'record' => {
+          'jsonmodel_type' => 'job',
+          'job_type' => 'report_job',
+          'status' => 'native_status',
+          'owner' => 'native_owner',
+          'queue_position' => 99,
+          'time_submitted' => '2026-10-17 10:00:00 UTC',
+          'time_started' => '2026-10-17 10:01:00 UTC',
+          'time_finished' => '2026-10-17 10:05:00 UTC',
+          'job' => {
+            'jsonmodel_type' => 'report_job',
+            'report_type' => 'assessment_list_report',
+            'format' => 'pdf',
+            'custom_param' => 'custom_val',
+          },
+        },
+      }
+      import_job = {
+        'uri' => '/repositories/2/jobs/102',
+        'record' => {
+          'jsonmodel_type' => 'job',
+          'job_type' => 'import_job',
+          'status' => 'native_status',
+          'owner' => 'native_owner',
+          'queue_position' => 88,
+          'job' => {
+            'jsonmodel_type' => 'import_job',
+            'filenames' => ['ead_sample.xml'],
+            'import_type' => 'ead_xml',
+          },
+        },
+      }
+
+      allow(JSONModel::HTTP).to receive(:get_json).with('/repositories/2/jobs/101/output_files').and_return(['report.pdf'])
+      allow(JSONModel::HTTP).to receive(:get_json).with('/repositories/2/jobs/102/output_files').and_return(['import.log'])
+
+      marker_seen_in_downstream_hook = :uncalled
+      indexer.add_document_prepare_hook do |doc, record|
+        if record['record']['jsonmodel_type'] == 'job'
+          marker_seen_in_downstream_hook = doc['_archivalist_rust_fields']
+        end
+      end
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prepared, documents|
+          doc = indexer.native_index_document(
+            prepared[:uri], prepared[:record_type], prepared[:values]
+          )
+          doc['fullrecord_published'] = []
+          doc['fullrecord'] = []
+          doc['external_id'] = ['rust-job-ext']
+          doc['ancestors'] = ['/repositories/2/resources/77']
+          doc['langcode'] = ['eng']
+          if prepared[:uri] == '/repositories/2/jobs/101'
+            doc['types'] = ['job', 'report_job', 'assessment_list_report']
+            doc['job_type'] = 'report_job'
+            doc['report_type'] = 'assessment_list_report'
+            doc['job_report_type'] = 'assessment_list_report'
+            doc['status'] = 'queued'
+            doc['owner'] = 'rust_admin'
+            doc['queue_position'] = 2
+          else
+            doc['types'] = ['job', 'import_job', nil]
+            doc['job_type'] = 'import_job'
+            doc['report_type'] = nil
+            doc['job_report_type'] = 'import_job'
+            doc['status'] = 'running'
+            doc['owner'] = 'rust_archivist'
+            doc['queue_position'] = nil
+          end
+          doc['_archivalist_rust_fields'] = [
+            'common_metadata',
+            'fullrecord',
+            'job_metadata',
+          ]
+          documents[prepared[:uri]] = doc
+        end
+      end
+
+      indexer.index_records([report_job, import_job])
+      rep_doc = indexer.records.find {|d| d['primary_type'] == 'job' && d['id'] == '/repositories/2/jobs/101'}
+      imp_doc = indexer.records.find {|d| d['primary_type'] == 'job' && d['id'] == '/repositories/2/jobs/102'}
+
+      expect(marker_seen_in_downstream_hook).to be_nil
+
+      # Rust owns deterministic staff metadata:
+      expect(rep_doc['job_type']).to eq('report_job')
+      expect(rep_doc['report_type']).to eq('assessment_list_report')
+      expect(rep_doc['job_report_type']).to eq('assessment_list_report')
+      expect(rep_doc['status']).to eq('queued')
+      expect(rep_doc['owner']).to eq('rust_admin')
+      expect(rep_doc['queue_position']).to eq(2)
+      expect(rep_doc['types']).to eq(['job', 'report_job', 'assessment_list_report'])
+
+      expect(imp_doc['job_type']).to eq('import_job')
+      expect(imp_doc['report_type']).to be_nil
+      expect(imp_doc['job_report_type']).to eq('import_job')
+      expect(imp_doc['status']).to eq('running')
+      expect(imp_doc['owner']).to eq('rust_archivist')
+      expect(imp_doc['queue_position']).to be_nil
+      expect(imp_doc['types']).to eq(['job', 'import_job', nil])
+
+      # Ruby retains translated title via I18n:
+      expect(rep_doc['title']).to eq(I18n.t("reports.assessment_list_report.title", :default => 'assessment_list_report'))
+      expect(imp_doc['title']).to eq(I18n.t("job.types.import_job"))
+
+      # Ruby retains Time.parse(...).getlocal:
+      expect(rep_doc['time_submitted']).to eq(Time.parse('2026-10-17 10:00:00 UTC').getlocal)
+      expect(rep_doc['time_started']).to eq(Time.parse('2026-10-17 10:01:00 UTC').getlocal)
+      expect(rep_doc['time_finished']).to eq(Time.parse('2026-10-17 10:05:00 UTC').getlocal)
+
+      # Ruby retains JSONModel::HTTP output_files lookup and files/job_data construction:
+      expect(rep_doc['files']).to eq(['/jobs/101/file/report.pdf'])
+      expect(rep_doc['job_data']).to include('output_file --- /jobs/101/file/report.pdf')
+      expect(rep_doc['job_data']).to include('format --- pdf')
+      expect(rep_doc['job_data']).to include('custom_param --- custom_val')
+
+      expect(imp_doc['files']).to eq(['/jobs/102/file/import.log'])
+      expect(imp_doc['job_data']).to include('input_file --- ead_sample.xml')
+      expect(imp_doc['job_data']).to include('import_type --- ead_xml')
+
+      # Marker removed before Solr / downstream:
+      expect(rep_doc).not_to have_key('_archivalist_rust_fields')
+      expect(imp_doc).not_to have_key('_archivalist_rust_fields')
+
+      # PUI bypass:
+      expect(rep_doc['publish']).to eq(false)
+      expect(rep_doc['types']).not_to include('pui', 'pui_record')
+      expect(imp_doc['publish']).to eq(false)
+      expect(imp_doc['types']).not_to include('pui', 'pui_record')
+    end
+
+    it "falls back to the native job hook when the sidecar returns nil or errors, preserving all native job fields and unrelated types" do
+      report_job = {
+        'uri' => '/repositories/2/jobs/103',
+        'record' => {
+          'jsonmodel_type' => 'job',
+          'job_type' => 'report_job',
+          'status' => 'completed',
+          'owner' => 'fallback_user',
+          'queue_position' => 5,
+          'time_submitted' => '2026-10-17 11:00:00 UTC',
+          'time_started' => '2026-10-17 11:01:00 UTC',
+          'time_finished' => '2026-10-17 11:04:00 UTC',
+          'job' => {
+            'jsonmodel_type' => 'report_job',
+            'report_type' => 'assessment_list_report',
+            'format' => 'csv',
+          },
+        },
+      }
+      top_container = {
+        'uri' => '/repositories/2/top_containers/46',
+        'record' => {
+          'jsonmodel_type' => 'top_container',
+          'long_display_string' => 'Box 46',
+          'display_string' => 'Box 46',
+          'type' => 'box',
+          'indicator' => '46',
+          'barcode' => 'FB-46',
+          'is_linked_to_published_record' => false,
+        },
+      }
+
+      allow(JSONModel::HTTP).to receive(:get_json).with('/repositories/2/jobs/103/output_files').and_return(['report.csv'])
+
+      allow(indexer).to receive(:rust_index_documents).and_return(nil)
+
+      indexer.index_records([report_job, top_container])
+      job_doc = indexer.records.find {|d| d['primary_type'] == 'job' && d['id'] == '/repositories/2/jobs/103'}
+      tc_doc = indexer.records.find {|d| d['primary_type'] == 'top_container' && d['id'] == '/repositories/2/top_containers/46'}
+
+      expect(job_doc['job_type']).to eq('report_job')
+      expect(job_doc['report_type']).to eq('assessment_list_report')
+      expect(job_doc['job_report_type']).to eq('assessment_list_report')
+      expect(job_doc['status']).to eq('completed')
+      expect(job_doc['owner']).to eq('fallback_user')
+      expect(job_doc['queue_position']).to eq(5)
+      expect(job_doc['types']).to eq(['job', 'report_job', 'assessment_list_report'])
+      expect(job_doc['title']).to eq(I18n.t("reports.assessment_list_report.title", :default => 'assessment_list_report'))
+      expect(job_doc['time_submitted']).to eq(Time.parse('2026-10-17 11:00:00 UTC').getlocal)
+      expect(job_doc['files']).to eq(['/jobs/103/file/report.csv'])
+      expect(job_doc['job_data']).to include('output_file --- /jobs/103/file/report.csv')
+      expect(job_doc['job_data']).to include('format --- csv')
+      expect(job_doc).not_to have_key('_archivalist_rust_fields')
+      expect(job_doc['publish']).to eq(false)
+
+      # Unrelated top container remains correctly indexed via its native fallback:
+      expect(tc_doc['display_string']).to eq('Box 46')
+      expect(tc_doc['barcode_u_sstr']).to eq('FB-46')
+      expect(tc_doc).not_to have_key('_archivalist_rust_fields')
     end
   end
 end
