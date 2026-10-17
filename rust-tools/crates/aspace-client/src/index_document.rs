@@ -1067,6 +1067,201 @@ fn clean_for_sort(value: &str) -> String {
     filtered.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Private handoff key carrying synthetic `collection_management` child documents.
+/// Ruby removes it before any hook, plugin, or Solr serialization sees the document.
+pub const COLLECTION_MANAGEMENT_DOCUMENTS_KEY: &str =
+    "_archivalist_collection_management_documents";
+
+fn is_ruby_strip_char(character: char) -> bool {
+    matches!(
+        character,
+        '\0' | '\t' | '\n' | '\u{0b}' | '\u{0c}' | '\r' | ' '
+    )
+}
+
+fn is_ruby_space_class(character: char) -> bool {
+    matches!(character, '\t' | '\n' | '\u{0b}' | '\u{0c}' | '\r' | ' ')
+}
+
+/// Ruby `String#strip`: ASCII whitespace and NUL at both ends only.
+fn ruby_strip(value: &str) -> &str {
+    value.trim_matches(is_ruby_strip_char)
+}
+
+/// Alphabetic characters for which Rust's `is_alphabetic` is known to equal
+/// Ruby's `\p{L}`. Outside these ranges some alphabetic characters are marks or
+/// letter numbers, which Ruby's `clean_for_sort` removes.
+fn has_exact_sort_letters(value: &str) -> bool {
+    value.chars().all(|character| {
+        !character.is_alphabetic()
+            || character.is_ascii()
+            || ('\u{00aa}'..='\u{024f}').contains(&character)
+            || ('\u{1e00}'..='\u{1eff}').contains(&character)
+    })
+}
+
+/// Exact port of `IndexerCommon#clean_for_sort` for inputs accepted by
+/// `has_exact_sort_letters`; `\s` and `strip` are ASCII-only in Ruby.
+fn ruby_clean_for_sort(value: &str) -> String {
+    let without_tags = strip_angle_tags(value);
+    let mut output = String::with_capacity(without_tags.len());
+    let mut pending_space = false;
+    for character in without_tags.chars() {
+        let character = if character == '-' { ' ' } else { character };
+        if is_ruby_space_class(character) {
+            pending_space = true;
+        } else if character.is_alphabetic() || character.is_ascii_digit() || character == '_' {
+            if pending_space && !output.is_empty() {
+                output.push(' ');
+            }
+            pending_space = false;
+            output.push(character);
+        }
+    }
+    output
+}
+
+fn strip_fullrecord_array(values: &mut [Value]) {
+    for value in values {
+        match value {
+            Value::String(text) => {
+                let stripped = ruby_strip(text);
+                if stripped.len() != text.len() {
+                    *text = stripped.to_string();
+                }
+            }
+            Value::Object(object) => strip_fullrecord_object(object),
+            Value::Array(nested) => strip_fullrecord_array(nested),
+            _ => {}
+        }
+    }
+}
+
+/// Native indexing aliases every `extract_string_values` string into the parent
+/// document's `fullrecord`, and `clean_whitespace` then strips those strings in
+/// place before the collection-management child hook runs. Mirror that effect.
+fn strip_fullrecord_object(object: &mut Map<String, Value>) {
+    for (key, value) in object.iter_mut() {
+        if FULLRECORD_EXCLUDES.contains(&key.as_str()) || key.ends_with("_enum_s") {
+            continue;
+        }
+        match value {
+            Value::String(text) => {
+                let stripped = ruby_strip(text);
+                if stripped.len() != text.len() {
+                    *text = stripped.to_string();
+                }
+            }
+            Value::Object(nested) => strip_fullrecord_object(nested),
+            Value::Array(values) => strip_fullrecord_array(values),
+            _ => {}
+        }
+    }
+}
+
+/// Builds the synthetic STAFF `collection_management` child document emitted by
+/// the native `add_extra_documents_hook`. Returns `None` when the record has no
+/// collection-management object, or when exact parity cannot be guaranteed, so
+/// Ruby falls back to the native generator for that record.
+fn collection_management_document(
+    uri: &str,
+    record_type: &str,
+    repository: &Value,
+    record: &Map<String, Value>,
+) -> Result<Option<Value>, IndexDocumentError> {
+    if !matches!(record_type, "resource" | "accession" | "digital_object") {
+        return Ok(None);
+    }
+    let Some(collection_management) = record
+        .get("collection_management")
+        .and_then(Value::as_object)
+    else {
+        return Ok(None);
+    };
+    let Some(cm_uri) = collection_management.get("uri").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if cm_uri.trim().is_empty() {
+        return Ok(None);
+    }
+    let mut collection_management = collection_management.clone();
+    strip_fullrecord_object(&mut collection_management);
+
+    let title = if ruby_truthy(record.get("title")) {
+        record.get("title")
+    } else {
+        record.get("display_string")
+    };
+    let (title, title_sort) = match title {
+        None | Some(Value::Null) => (Value::Null, Value::Null),
+        Some(Value::String(text)) => {
+            let stripped = ruby_strip(text);
+            if !has_exact_sort_letters(stripped) {
+                return Ok(None);
+            }
+            (
+                Value::String(stripped.to_string()),
+                Value::String(ruby_clean_for_sort(stripped)),
+            )
+        }
+        Some(_) => {
+            return Err(error(
+                "collection management parent title must be a string or null",
+            ))
+        }
+    };
+    let field = |name: &str| {
+        collection_management
+            .get(name)
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let json = serde_json::to_string(&collection_management)
+        .map_err(|err| error(format!("failed to serialize collection management: {err}")))?;
+
+    let mut document = Map::new();
+    document.insert("id".to_string(), field("uri"));
+    document.insert("uri".to_string(), field("uri"));
+    document.insert("parent_id".to_string(), json_string(uri));
+    document.insert("parent_title".to_string(), title.clone());
+    document.insert("parent_type".to_string(), json_string(record_type));
+    document.insert("title".to_string(), title);
+    document.insert("title_sort".to_string(), title_sort);
+    document.insert(
+        "types".to_string(),
+        Value::Array(vec![json_string("collection_management")]),
+    );
+    document.insert(
+        "primary_type".to_string(),
+        json_string("collection_management"),
+    );
+    document.insert("json".to_string(), Value::String(json));
+    for name in [
+        "processing_priority",
+        "processing_status",
+        "processing_hours_total",
+        "processing_funding_source",
+        "processors",
+    ] {
+        document.insert(name.to_string(), field(name));
+    }
+    document.insert(
+        "suppressed".to_string(),
+        record.get("suppressed").cloned().unwrap_or(Value::Null),
+    );
+    document.insert("repository".to_string(), repository.clone());
+    for name in [
+        "created_by",
+        "last_modified_by",
+        "system_mtime",
+        "user_mtime",
+        "create_time",
+    ] {
+        document.insert(name.to_string(), field(name));
+    }
+    Ok(Some(Value::Object(document)))
+}
+
 fn add_repository_fields(
     document: &mut Map<String, Value>,
     record: &Map<String, Value>,
@@ -2311,6 +2506,12 @@ pub fn build_index_document(input: IndexDocumentInput) -> Result<Value, IndexDoc
         return Err(error("field 'title' must be a string or null when present"));
     }
 
+    let collection_management = if input.enrich {
+        collection_management_document(&input.uri, &input.record_type, &input.repository, record)?
+    } else {
+        None
+    };
+
     let mut document = Map::new();
     document.insert("id".to_string(), Value::String(input.uri.clone()));
     document.insert("uri".to_string(), Value::String(input.uri));
@@ -2340,6 +2541,12 @@ pub fn build_index_document(input: IndexDocumentInput) -> Result<Value, IndexDoc
 
     if input.enrich {
         add_enriched_fields(&mut document, &input.record_type, record, &input.record)?;
+    }
+    if let Some(child) = collection_management {
+        document.insert(
+            COLLECTION_MANAGEMENT_DOCUMENTS_KEY.to_string(),
+            Value::Array(vec![child]),
+        );
     }
 
     Ok(Value::Object(document))
@@ -4555,6 +4762,232 @@ mod tests {
         assert_eq!(document["notes"], "Profile note");
         assert_eq!(document["years"], json!(["10", "11", "9"]));
         assert_eq!(document["year_sort"], "00100009");
+    }
+
+    #[test]
+    fn builds_collection_management_child_document_for_full_and_minimal_records() {
+        // Full resource parent with collection_management
+        let full_cm = json!({
+            "uri": "/repositories/2/collection_management/10",
+            "processing_priority": " high ",
+            "processing_status": " completed ",
+            "processing_hours_total": " 40 ",
+            "processing_funding_source": " grant-funded ",
+            "processors": " Alice and Bob ",
+            "created_by": " admin ",
+            "last_modified_by": " archivist ",
+            "system_mtime": "2026-01-01T00:00:00Z",
+            "user_mtime": "2026-01-01T00:00:00Z",
+            "create_time": "2026-01-01T00:00:00Z"
+        });
+        let mut full_resource = input(json!({
+            "uri": "/repositories/2/resources/7",
+            "title": " <emph render='italic'>Papers</emph> - Collection 1 ",
+            "suppressed": true,
+            "collection_management": full_cm
+        }));
+        full_resource.enrich = true;
+        let full_doc = build_index_document(full_resource).unwrap();
+        let cm_children = full_doc[COLLECTION_MANAGEMENT_DOCUMENTS_KEY]
+            .as_array()
+            .expect("child documents array");
+        assert_eq!(cm_children.len(), 1);
+        let child = &cm_children[0];
+        assert_eq!(child["id"], "/repositories/2/collection_management/10");
+        assert_eq!(child["uri"], "/repositories/2/collection_management/10");
+        assert_eq!(child["parent_id"], "/repositories/2/resources/7");
+        assert_eq!(
+            child["parent_title"],
+            "<emph render='italic'>Papers</emph> - Collection 1"
+        );
+        assert_eq!(child["parent_type"], "resource");
+        assert_eq!(
+            child["title"],
+            "<emph render='italic'>Papers</emph> - Collection 1"
+        );
+        assert_eq!(child["title_sort"], "Papers Collection 1");
+        assert_eq!(child["primary_type"], "collection_management");
+        assert_eq!(child["types"], json!(["collection_management"]));
+        assert_eq!(child["suppressed"], true);
+        assert_eq!(child["repository"], 2);
+        // Stripped processing strings:
+        assert_eq!(child["processing_priority"], "high");
+        assert_eq!(child["processing_status"], "completed");
+        assert_eq!(child["processing_hours_total"], "40");
+        assert_eq!(child["processing_funding_source"], "grant-funded");
+        assert_eq!(child["processors"], "Alice and Bob");
+        // Audit fields from fullrecord_excludes:
+        assert_eq!(child["created_by"], " admin ");
+        assert_eq!(child["last_modified_by"], " archivist ");
+        assert_eq!(child["system_mtime"], "2026-01-01T00:00:00Z");
+        assert_eq!(child["user_mtime"], "2026-01-01T00:00:00Z");
+        assert_eq!(child["create_time"], "2026-01-01T00:00:00Z");
+        // Verify JSON string parses and has stripped processing fields
+        let parsed_json: Value = serde_json::from_str(child["json"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed_json["processing_priority"], "high");
+        assert_eq!(
+            parsed_json["uri"],
+            "/repositories/2/collection_management/10"
+        );
+
+        // Minimal accession parent with minimal collection_management
+        let minimal_cm = json!({
+            "uri": "/repositories/2/collection_management/11"
+        });
+        let minimal_accession = IndexDocumentInput {
+            uri: "/repositories/2/accessions/2".to_string(),
+            record_type: "accession".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/accessions/2",
+                "display_string": "Accession 2026-01",
+                "title": Value::Null,
+                "collection_management": minimal_cm
+            }),
+            enrich: true,
+        };
+        let acc_doc = build_index_document(minimal_accession).unwrap();
+        let acc_children = acc_doc[COLLECTION_MANAGEMENT_DOCUMENTS_KEY]
+            .as_array()
+            .unwrap();
+        assert_eq!(acc_children.len(), 1);
+        let acc_child = &acc_children[0];
+        assert_eq!(acc_child["id"], "/repositories/2/collection_management/11");
+        assert_eq!(acc_child["uri"], "/repositories/2/collection_management/11");
+        assert_eq!(acc_child["parent_id"], "/repositories/2/accessions/2");
+        assert_eq!(acc_child["parent_title"], "Accession 2026-01");
+        assert_eq!(acc_child["parent_type"], "accession");
+        assert_eq!(acc_child["title"], "Accession 2026-01");
+        assert_eq!(acc_child["title_sort"], "Accession 2026 01");
+        assert_eq!(acc_child["primary_type"], "collection_management");
+        assert_eq!(acc_child["types"], json!(["collection_management"]));
+        assert_eq!(acc_child["processing_priority"], Value::Null);
+        assert_eq!(acc_child["created_by"], Value::Null);
+
+        // Digital object parent with collection_management
+        let do_cm = json!({
+            "uri": "/repositories/2/collection_management/12"
+        });
+        let digital_object = IndexDocumentInput {
+            uri: "/repositories/2/digital_objects/3".to_string(),
+            record_type: "digital_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/digital_objects/3",
+                "title": "Digital Photo Collection",
+                "collection_management": do_cm
+            }),
+            enrich: true,
+        };
+        let do_doc = build_index_document(digital_object).unwrap();
+        let do_child = &do_doc[COLLECTION_MANAGEMENT_DOCUMENTS_KEY]
+            .as_array()
+            .unwrap()[0];
+        assert_eq!(do_child["parent_type"], "digital_object");
+        assert_eq!(do_child["title"], "Digital Photo Collection");
+    }
+
+    #[test]
+    fn collection_management_edge_cases_and_withholding() {
+        // Missing CM subrecord: no handoff key
+        let mut no_cm = input(json!({
+            "uri": "/repositories/2/resources/7",
+            "title": "Resource without CM"
+        }));
+        no_cm.enrich = true;
+        let no_cm_doc = build_index_document(no_cm).unwrap();
+        assert!(!no_cm_doc
+            .as_object()
+            .unwrap()
+            .contains_key(COLLECTION_MANAGEMENT_DOCUMENTS_KEY));
+
+        // Enrichment disabled: no handoff key even when CM is present
+        let mut unenriched = input(json!({
+            "uri": "/repositories/2/resources/7",
+            "title": "Unenriched Resource",
+            "collection_management": { "uri": "/repositories/2/collection_management/20" }
+        }));
+        unenriched.enrich = false;
+        let unenriched_doc = build_index_document(unenriched).unwrap();
+        assert!(!unenriched_doc
+            .as_object()
+            .unwrap()
+            .contains_key(COLLECTION_MANAGEMENT_DOCUMENTS_KEY));
+
+        // Unsupported parent type (e.g. archival_object): withheld, no handoff key
+        let unsupported_type = IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/4".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/4",
+                "display_string": "Item 4",
+                "collection_management": { "uri": "/repositories/2/collection_management/21" }
+            }),
+            enrich: true,
+        };
+        let unsupported_doc = build_index_document(unsupported_type).unwrap();
+        assert!(!unsupported_doc
+            .as_object()
+            .unwrap()
+            .contains_key(COLLECTION_MANAGEMENT_DOCUMENTS_KEY));
+
+        // Empty CM uri: withheld, no handoff key
+        let mut empty_cm_uri = input(json!({
+            "uri": "/repositories/2/resources/7",
+            "title": "Resource with empty CM uri",
+            "collection_management": { "uri": "  " }
+        }));
+        empty_cm_uri.enrich = true;
+        let empty_uri_doc = build_index_document(empty_cm_uri).unwrap();
+        assert!(!empty_uri_doc
+            .as_object()
+            .unwrap()
+            .contains_key(COLLECTION_MANAGEMENT_DOCUMENTS_KEY));
+
+        // Title with non-standard Unicode characters (Greek / Cyrillic): withheld, no handoff key
+        let mut non_standard_letters = input(json!({
+            "uri": "/repositories/2/resources/7",
+            "title": "Архив / Επιστολές",
+            "collection_management": { "uri": "/repositories/2/collection_management/22" }
+        }));
+        non_standard_letters.enrich = true;
+        let non_std_doc = build_index_document(non_standard_letters).unwrap();
+        assert!(!non_std_doc
+            .as_object()
+            .unwrap()
+            .contains_key(COLLECTION_MANAGEMENT_DOCUMENTS_KEY));
+
+        // Title is null and display_string is null: child title and title_sort are null
+        let mut null_title = input(json!({
+            "uri": "/repositories/2/resources/7",
+            "title": Value::Null,
+            "display_string": Value::Null,
+            "collection_management": { "uri": "/repositories/2/collection_management/23" }
+        }));
+        null_title.enrich = true;
+        let null_title_doc = build_index_document(null_title).unwrap();
+        let null_child = &null_title_doc[COLLECTION_MANAGEMENT_DOCUMENTS_KEY]
+            .as_array()
+            .unwrap()[0];
+        assert_eq!(null_child["parent_title"], Value::Null);
+        assert_eq!(null_child["title"], Value::Null);
+        assert_eq!(null_child["title_sort"], Value::Null);
+
+        // Title is "" (empty string) and display_string is "Fallback": Ruby truthiness keeps ""
+        let mut empty_title = input(json!({
+            "uri": "/repositories/2/resources/7",
+            "title": "",
+            "display_string": "Fallback Display",
+            "collection_management": { "uri": "/repositories/2/collection_management/24" }
+        }));
+        empty_title.enrich = true;
+        let empty_title_doc = build_index_document(empty_title).unwrap();
+        let empty_child = &empty_title_doc[COLLECTION_MANAGEMENT_DOCUMENTS_KEY]
+            .as_array()
+            .unwrap()[0];
+        assert_eq!(empty_child["title"], "");
+        assert_eq!(empty_child["title_sort"], "");
     }
 
     #[test]

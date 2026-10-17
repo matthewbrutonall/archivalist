@@ -1114,4 +1114,445 @@ describe "periodic indexer" do
       expect(tc_doc).not_to have_key('_archivalist_rust_fields')
     end
   end
+
+  describe "collection_management child document indexing" do
+    let(:full_cm) do
+      {
+        'uri' => '/repositories/2/collection_management/10',
+        'processing_priority' => ' high ',
+        'processing_status' => ' completed ',
+        'processing_hours_total' => ' 40 ',
+        'processing_funding_source' => ' grant-funded ',
+        'processors' => ' Alice and Bob ',
+        'created_by' => 'admin',
+        'last_modified_by' => 'archivist',
+        'system_mtime' => '2026-01-01T00:00:00Z',
+        'user_mtime' => '2026-01-01T00:00:00Z',
+        'create_time' => '2026-01-01T00:00:00Z',
+      }
+    end
+
+    let(:resource_with_cm) do
+      {
+        'uri' => '/repositories/2/resources/1',
+        'record' => {
+          'uri' => '/repositories/2/resources/1',
+          'jsonmodel_type' => 'resource',
+          'title' => ' <emph render="italic">Papers</emph> - Collection 1 ',
+          'id_0' => 'COL-1',
+          'level' => 'collection',
+          'suppressed' => true,
+          'collection_management' => full_cm,
+        },
+      }
+    end
+
+    let(:minimal_cm) do
+      {
+        'uri' => '/repositories/2/collection_management/11',
+      }
+    end
+
+    let(:accession_with_cm) do
+      {
+        'uri' => '/repositories/2/accessions/2',
+        'record' => {
+          'uri' => '/repositories/2/accessions/2',
+          'jsonmodel_type' => 'accession',
+          'display_string' => 'Accession 2026-01',
+          'title' => nil,
+          'id_0' => 'ACC-2',
+          'suppressed' => false,
+          'collection_management' => minimal_cm,
+        },
+      }
+    end
+
+    let(:digital_object_with_cm) do
+      {
+        'uri' => '/repositories/2/digital_objects/3',
+        'record' => {
+          'uri' => '/repositories/2/digital_objects/3',
+          'jsonmodel_type' => 'digital_object',
+          'title' => 'Digital Object 3',
+          'digital_object_id' => 'DO-3',
+          'collection_management' => {
+            'uri' => '/repositories/2/collection_management/12',
+          },
+        },
+      }
+    end
+
+    it "indexes Rust-generated collection_management child documents, suppresses only the built-in hook, and executes third-party hooks exactly once" do
+      third_party_calls = 0
+      indexer.add_extra_documents_hook do |record|
+        third_party_calls += 1
+        [{ 'id' => "#{record['uri']}#plugin_extra", 'types' => ['plugin_doc'], 'primary_type' => 'plugin_doc' }]
+      end
+
+      marker_seen_in_prepare = nil
+      indexer.add_document_prepare_hook do |doc, record|
+        marker_seen_in_prepare = true if doc.has_key?('_archivalist_collection_management_documents')
+      end
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        documents = {}
+        prepared_records.each do |prepared|
+          uri = prepared[:uri]
+          rec = prepared[:values]
+          doc = indexer.native_index_document(uri, prepared[:record_type], rec)
+          if uri == '/repositories/2/resources/1'
+            child = {
+              'id' => '/repositories/2/collection_management/10',
+              'uri' => '/repositories/2/collection_management/10',
+              'parent_id' => '/repositories/2/resources/1',
+              'parent_title' => '<emph render="italic">Papers</emph> - Collection 1',
+              'parent_type' => 'resource',
+              'title' => '<emph render="italic">Papers</emph> - Collection 1',
+              'title_sort' => 'Papers Collection 1',
+              'primary_type' => 'collection_management',
+              'types' => ['collection_management'],
+              'suppressed' => true,
+              'repository' => 2,
+              'processing_priority' => 'high',
+              'processing_status' => 'completed',
+              'processing_hours_total' => '40',
+              'processing_funding_source' => 'grant-funded',
+              'processors' => 'Alice and Bob',
+              'created_by' => 'admin',
+              'last_modified_by' => 'archivist',
+              'system_mtime' => '2026-01-01T00:00:00Z',
+              'user_mtime' => '2026-01-01T00:00:00Z',
+              'create_time' => '2026-01-01T00:00:00Z',
+              'json' => ASUtils.to_json(full_cm),
+            }
+            doc['_archivalist_collection_management_documents'] = [child]
+          elsif uri == '/repositories/2/accessions/2'
+            child = {
+              'id' => '/repositories/2/collection_management/11',
+              'uri' => '/repositories/2/collection_management/11',
+              'parent_id' => '/repositories/2/accessions/2',
+              'parent_title' => 'Accession 2026-01',
+              'parent_type' => 'accession',
+              'title' => 'Accession 2026-01',
+              'title_sort' => 'Accession 2026 01',
+              'primary_type' => 'collection_management',
+              'types' => ['collection_management'],
+              'suppressed' => false,
+              'repository' => 2,
+              'processing_priority' => nil,
+              'processing_status' => nil,
+              'processing_hours_total' => nil,
+              'processing_funding_source' => nil,
+              'processors' => nil,
+              'created_by' => nil,
+              'last_modified_by' => nil,
+              'system_mtime' => nil,
+              'user_mtime' => nil,
+              'create_time' => nil,
+              'json' => ASUtils.to_json(minimal_cm),
+            }
+            doc['_archivalist_collection_management_documents'] = [child]
+          end
+          documents[uri] = doc
+        end
+        documents
+      end
+
+      indexer.index_records([resource_with_cm, accession_with_cm])
+
+      # Exactly one child per parent with CM
+      cm_docs = indexer.records.select {|d| d['primary_type'] == 'collection_management'}
+      expect(cm_docs.length).to eq(2)
+
+      res_child = cm_docs.find {|d| d['parent_id'] == '/repositories/2/resources/1'}
+      expect(res_child['id']).to eq('/repositories/2/collection_management/10')
+      expect(res_child['parent_title']).to eq('<emph render="italic">Papers</emph> - Collection 1')
+      expect(res_child['parent_type']).to eq('resource')
+      expect(res_child['title_sort']).to eq('Papers Collection 1')
+      expect(res_child['processing_priority']).to eq('high')
+      expect(res_child['suppressed']).to eq(true)
+
+      acc_child = cm_docs.find {|d| d['parent_id'] == '/repositories/2/accessions/2'}
+      expect(acc_child['id']).to eq('/repositories/2/collection_management/11')
+      expect(acc_child['parent_title']).to eq('Accession 2026-01')
+      expect(acc_child['parent_type']).to eq('accession')
+      expect(acc_child['title_sort']).to eq('Accession 2026 01')
+      expect(acc_child['suppressed']).to eq(false)
+
+      # Third-party extra documents hook called exactly once per record (2 records)
+      expect(third_party_calls).to eq(2)
+      plugin_docs = indexer.records.select {|d| d['primary_type'] == 'plugin_doc'}
+      expect(plugin_docs.length).to eq(2)
+
+      # Document ordering in batch: parent -> collection_management -> third-party
+      res_idx = indexer.records.index {|d| d['id'] == '/repositories/2/resources/1'}
+      cm_idx = indexer.records.index {|d| d['id'] == '/repositories/2/collection_management/10'}
+      plugin_idx = indexer.records.index {|d| d['id'] == '/repositories/2/resources/1#plugin_extra'}
+      expect(res_idx).to be < cm_idx
+      expect(cm_idx).to be < plugin_idx
+
+      # No private metadata in prepare hook or final batch
+      expect(marker_seen_in_prepare).to be_nil
+      indexer.records.each do |doc|
+        expect(doc.keys.none? {|k| k.start_with?('_archivalist_')}).to be(true)
+      end
+
+      # records_with_children retains collection_management for stale-child deletion
+      expect(indexer.records_with_children).to include('collection_management')
+
+      # Proves no mutable cross-record instance state is retained on indexer
+      expect(indexer.instance_variable_defined?(:@active_collection_management_children)).to be(false)
+    end
+
+    it "falls back to native child document generation when sidecar is unavailable or returns nil" do
+      allow(indexer).to receive(:rust_index_documents).and_return(nil)
+
+      indexer.index_records([resource_with_cm])
+
+      cm_docs = indexer.records.select {|d| d['primary_type'] == 'collection_management'}
+      expect(cm_docs.length).to eq(1)
+      child = cm_docs.first
+      expect(child['id']).to eq('/repositories/2/collection_management/10')
+      expect(child['parent_id']).to eq('/repositories/2/resources/1')
+      expect(child['parent_type']).to eq('resource')
+      expect(child['suppressed']).to eq(true)
+      expect(child.keys.none? {|k| k.start_with?('_archivalist_')}).to be(true)
+    end
+
+    it "falls back to native child document generation when enrichment is disabled" do
+      allow(indexer).to receive(:rust_index_document_enrichment_enabled?).and_return(false)
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        # When enrich is false, Rust returns envelope without child handoff
+        prepared_records.each_with_object({}) do |prepared, docs|
+          docs[prepared[:uri]] = indexer.native_index_document(prepared[:uri], prepared[:record_type], prepared[:values])
+        end
+      end
+
+      indexer.index_records([resource_with_cm])
+
+      cm_docs = indexer.records.select {|d| d['primary_type'] == 'collection_management'}
+      expect(cm_docs.length).to eq(1)
+      child = cm_docs.first
+      expect(child['id']).to eq('/repositories/2/collection_management/10')
+      expect(child['parent_id']).to eq('/repositories/2/resources/1')
+    end
+
+    it "falls back to native child document generation when Rust withholds child handoff" do
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prepared, docs|
+          # Enriched doc returned, but child handoff omitted (withheld due to parity gate)
+          doc = indexer.native_index_document(prepared[:uri], prepared[:record_type], prepared[:values])
+          doc['_archivalist_rust_fields'] = ['common_metadata', 'fullrecord', 'resource_archival_object_metadata']
+          docs[prepared[:uri]] = doc
+        end
+      end
+
+      indexer.index_records([resource_with_cm])
+
+      cm_docs = indexer.records.select {|d| d['primary_type'] == 'collection_management'}
+      expect(cm_docs.length).to eq(1)
+      child = cm_docs.first
+      expect(child['id']).to eq('/repositories/2/collection_management/10')
+      expect(child['parent_id']).to eq('/repositories/2/resources/1')
+      expect(child.keys.none? {|k| k.start_with?('_archivalist_')}).to be(true)
+    end
+
+    it "does not emit child documents or suppression signal when collection_management is absent" do
+      resource_no_cm = {
+        'uri' => '/repositories/2/resources/99',
+        'record' => {
+          'uri' => '/repositories/2/resources/99',
+          'jsonmodel_type' => 'resource',
+          'title' => 'Resource without CM',
+          'id_0' => 'R99',
+          'level' => 'collection',
+        },
+      }
+
+      indexer.index_records([resource_no_cm])
+
+      cm_docs = indexer.records.select {|d| d['primary_type'] == 'collection_management'}
+      expect(cm_docs).to be_empty
+    end
+
+    it "indexes digital_object parent with collection_management via native path" do
+      indexer.index_records([digital_object_with_cm])
+
+      cm_docs = indexer.records.select {|d| d['primary_type'] == 'collection_management'}
+      expect(cm_docs.length).to eq(1)
+      expect(cm_docs.first['parent_type']).to eq('digital_object')
+      expect(cm_docs.first['parent_id']).to eq('/repositories/2/digital_objects/3')
+    end
+
+    it "ensures PUI indexer path uses no Rust child handoff and retains native behavior" do
+      pui_idx = PeriodicIndexer.new
+      def pui_idx.index_batch(batch, timing); @index_batch = batch; end
+      def pui_idx.records; @index_batch ? @index_batch.to_a : []; end
+      allow(pui_idx).to receive_message_chain(:class, :name).and_return('PUIIndexer')
+      expect(pui_idx.rust_index_document_enrichment_enabled?).to be(false)
+
+      pui_idx.index_records([resource_with_cm])
+
+      cm_docs = pui_idx.records.select {|d| d['primary_type'] == 'collection_management'}
+      expect(cm_docs.length).to eq(1)
+      child = cm_docs.first
+      expect(child['id']).to eq('/repositories/2/collection_management/10')
+      expect(child['parent_id']).to eq('/repositories/2/resources/1')
+      expect(child['parent_type']).to eq('resource')
+      expect(child.keys.none? {|k| k.start_with?('_archivalist_')}).to be(true)
+    end
+
+    it "ensures no Rust child state can leak into a later record if a document-prepare hook raises or interrupts" do
+      hook_should_raise = true
+      indexer.add_document_prepare_hook do |doc, record|
+        if hook_should_raise && record['uri'] == '/repositories/2/resources/1'
+          raise "Simulated failure in document-prepare hook"
+        end
+      end
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        documents = {}
+        prepared_records.each do |prepared|
+          uri = prepared[:uri]
+          rec = prepared[:values]
+          doc = indexer.native_index_document(uri, prepared[:record_type], rec)
+          if uri == '/repositories/2/resources/1'
+            child = {
+              'id' => '/repositories/2/collection_management/10',
+              'uri' => '/repositories/2/collection_management/10',
+              'parent_id' => '/repositories/2/resources/1',
+              'parent_title' => 'Papers - Collection 1',
+              'parent_type' => 'resource',
+              'title' => 'Papers - Collection 1',
+              'title_sort' => 'Papers Collection 1',
+              'primary_type' => 'collection_management',
+              'types' => ['collection_management'],
+              'suppressed' => true,
+              'repository' => 2,
+              'processing_priority' => 'high',
+              'processing_status' => 'completed',
+              'processing_hours_total' => '40',
+              'processing_funding_source' => 'grant-funded',
+              'processors' => 'Alice and Bob',
+              'created_by' => 'admin',
+              'last_modified_by' => 'archivist',
+              'system_mtime' => '2026-01-01T00:00:00Z',
+              'user_mtime' => '2026-01-01T00:00:00Z',
+              'create_time' => '2026-01-01T00:00:00Z',
+              'json' => ASUtils.to_json(full_cm),
+            }
+            doc['_archivalist_collection_management_documents'] = [child]
+          end
+          documents[uri] = doc
+        end
+        documents
+      end
+
+      expect {
+        indexer.index_records([resource_with_cm])
+      }.to raise_error("Simulated failure in document-prepare hook")
+
+      expect(indexer.instance_variable_defined?(:@active_collection_management_children)).to be(false)
+
+      hook_should_raise = false
+      resource_no_cm = {
+        'uri' => '/repositories/2/resources/99',
+        'record' => {
+          'uri' => '/repositories/2/resources/99',
+          'jsonmodel_type' => 'resource',
+          'title' => 'Resource without CM',
+          'id_0' => 'R99',
+          'level' => 'collection',
+        },
+      }
+
+      indexer.index_records([resource_no_cm])
+
+      cm_docs = indexer.records.select {|d| d['primary_type'] == 'collection_management'}
+      expect(cm_docs).to be_empty
+    end
+
+    it "falls back natively at the IndexerCommon integration boundary when Rust child is malformed" do
+      corrupted_child = {
+        'id' => '/repositories/2/collection_management/10',
+        'uri' => '/repositories/2/collection_management/10',
+        'parent_id' => '/repositories/2/resources/WRONG_PARENT',
+        'parent_title' => 'Papers - Collection 1',
+        'parent_type' => 'resource',
+        'title' => 'Papers - Collection 1',
+        'title_sort' => 'Papers Collection 1',
+        'primary_type' => 'collection_management',
+        'types' => ['collection_management'],
+        'suppressed' => true,
+        'repository' => 2,
+        'processing_priority' => 'high',
+        'processing_status' => 'completed',
+        'processing_hours_total' => '40',
+        'processing_funding_source' => 'grant-funded',
+        'processors' => 'Alice and Bob',
+        'created_by' => 'admin',
+        'last_modified_by' => 'archivist',
+        'system_mtime' => '2026-01-01T00:00:00Z',
+        'user_mtime' => '2026-01-01T00:00:00Z',
+        'create_time' => '2026-01-01T00:00:00Z',
+        'json' => ASUtils.to_json(full_cm),
+      }
+
+      mock_response = Struct.new(:code, :body).new(
+        '200',
+        ASUtils.to_json(
+          'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+          'documents' => [{
+            'id' => '/repositories/2/resources/1',
+            'uri' => '/repositories/2/resources/1',
+            'title' => 'Papers - Collection 1',
+            'primary_type' => 'resource',
+            'types' => ['resource'],
+            'json' => ASUtils.to_json(resource_with_cm['record']),
+            'suppressed' => true,
+            'publish' => false,
+            'system_generated' => 'false',
+            'repository' => 2,
+            'fullrecord_published' => [],
+            'fullrecord' => [],
+            'finding_aid_title' => nil,
+            'finding_aid_filing_title' => nil,
+            'identifier' => 'COL-1',
+            'resource_type' => nil,
+            'level' => 'collection',
+            'restrictions' => false,
+            'ead_id' => nil,
+            'finding_aid_status' => nil,
+            'related_accession_uris' => [],
+            'slug' => nil,
+            'is_slug_auto' => false,
+            'external_id' => [],
+            'ancestors' => [],
+            'langcode' => [],
+            'four_part_id' => 'COL-1',
+            'processing_priority' => 'high',
+            'processors' => 'Alice and Bob',
+            '_archivalist_rust_fields' => [
+              'common_metadata',
+              'fullrecord',
+              'resource_archival_object_metadata',
+            ],
+            '_archivalist_collection_management_documents' => [corrupted_child],
+          }]
+        )
+      )
+      allow_any_instance_of(RustIndexDocumentBuilder).to receive(:perform_request).and_return(mock_response)
+
+      indexer.index_records([resource_with_cm])
+
+      cm_docs = indexer.records.select {|d| d['primary_type'] == 'collection_management'}
+      expect(cm_docs.length).to eq(1)
+      child = cm_docs.first
+      expect(child['id']).to eq('/repositories/2/collection_management/10')
+      expect(child['parent_id']).to eq('/repositories/2/resources/1')
+      expect(child['parent_type']).to eq('resource')
+      expect(child.keys.none? {|k| k.start_with?('_archivalist_')}).to be(true)
+    end
+  end
 end

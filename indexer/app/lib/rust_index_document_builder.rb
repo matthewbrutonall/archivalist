@@ -1,9 +1,35 @@
 require 'net/http'
 require 'uri'
 require 'json'
+require_relative 'indexer_common_config'
 
 class RustIndexDocumentBuilder
   EXPECTED_SERVER = 'archivalist-rust-index-document-builder'
+
+  COLLECTION_MANAGEMENT_CHILD_FIELDS = [
+    'id',
+    'uri',
+    'parent_id',
+    'parent_title',
+    'parent_type',
+    'title',
+    'title_sort',
+    'types',
+    'primary_type',
+    'json',
+    'processing_priority',
+    'processing_status',
+    'processing_hours_total',
+    'processing_funding_source',
+    'processors',
+    'suppressed',
+    'repository',
+    'created_by',
+    'last_modified_by',
+    'system_mtime',
+    'user_mtime',
+    'create_time',
+  ].freeze
 
   def initialize(base_url, timeout_seconds)
     @url = URI.parse("#{base_url.to_s.chomp('/')}/index/documents")
@@ -333,11 +359,168 @@ class RustIndexDocumentBuilder
       elsif document.has_key?('_archivalist_rust_fields')
         raise "unexpected response enrichment marker for #{uri}"
       end
+
+      cm = record.is_a?(Hash) && record['collection_management']
+      has_cm = cm.is_a?(Hash)
+      valid_cm_parent = ['resource', 'accession', 'digital_object'].include?(record_type)
+
+      if document.has_key?('_archivalist_collection_management_documents')
+        unless input['enrich'] && has_cm && valid_cm_parent
+          raise "unexpected response collection management documents for #{uri}"
+        end
+
+        cm_docs = document['_archivalist_collection_management_documents']
+        raise "collection management documents must be an array for #{uri}" unless cm_docs.is_a?(Array)
+        raise "collection management documents count mismatch for #{uri}" unless cm_docs.length == 1
+
+        cm_doc = cm_docs.first
+        raise "collection management document must be an object for #{uri}" unless cm_doc.is_a?(Hash)
+        raise "child document contains private handoff field" if cm_doc.keys.any? {|k| k.start_with?('_archivalist_')}
+
+        missing_keys = COLLECTION_MANAGEMENT_CHILD_FIELDS - cm_doc.keys
+        unless missing_keys.empty?
+          raise "child document missing required fields for #{uri}: #{missing_keys.sort.join(', ')}"
+        end
+
+        extra_keys = cm_doc.keys - COLLECTION_MANAGEMENT_CHILD_FIELDS
+        unless extra_keys.empty?
+          raise "child document contains unexpected fields for #{uri}: #{extra_keys.sort.join(', ')}"
+        end
+
+        raise "child id mismatch for #{uri}" unless cm_doc['id'] == cm['uri']
+        raise "child uri mismatch for #{uri}" unless cm_doc['uri'] == cm['uri']
+        raise "child parent_id mismatch for #{uri}" unless cm_doc['parent_id'] == uri
+        raise "child parent_type mismatch for #{uri}" unless cm_doc['parent_type'] == record_type
+
+        raw_title = record['title'] || record['display_string']
+        expected_cm_title = raw_title.is_a?(String) ? raw_title.strip : raw_title
+        raise "child parent_title mismatch for #{uri}" unless cm_doc['parent_title'] == expected_cm_title
+        raise "child title mismatch for #{uri}" unless cm_doc['title'] == expected_cm_title
+
+        expected_title_sort = expected_cm_title ? clean_for_sort(expected_cm_title) : nil
+        raise "child title_sort mismatch for #{uri}" unless cm_doc['title_sort'] == expected_title_sort
+
+        raise "child primary_type mismatch for #{uri}" unless cm_doc['primary_type'] == 'collection_management'
+        raise "child types mismatch for #{uri}" unless cm_doc['types'] == ['collection_management']
+
+        expected_child_repo = record_type == 'repository' && input['enrich'] ? uri : input['repository']
+        raise "child repository mismatch for #{uri}" unless cm_doc['repository'] == expected_child_repo
+        raise "child suppression mismatch for #{uri}" unless cm_doc['suppressed'] == record['suppressed']
+
+        raise "child json missing for #{uri}" unless cm_doc['json'].is_a?(String)
+        parsed_json = ASUtils.json_parse(cm_doc['json'])
+        raise "child json must be an object for #{uri}" unless parsed_json.is_a?(Hash)
+
+        expected_cm_json = reconstruct_expected_collection_management_json(cm)
+        validate_json_equal!(expected_cm_json, parsed_json, "child json for #{uri}")
+
+        expected_json_string = ASUtils.to_json(expected_cm_json)
+        raise "child json serialization mismatch for #{uri}" unless cm_doc['json'] == expected_json_string
+
+        ['processing_priority', 'processing_status', 'processing_hours_total', 'processing_funding_source', 'processors'].each do |field|
+          expected_val = cm[field]
+          expected_val = expected_val.strip if expected_val.is_a?(String)
+          raise "child #{field} mismatch for #{uri}" unless cm_doc[field] == expected_val
+        end
+
+        ['created_by', 'last_modified_by', 'system_mtime', 'user_mtime', 'create_time'].each do |field|
+          expected_val = cm[field]
+          raise "child #{field} mismatch for #{uri}" unless cm_doc[field] == expected_val
+        end
+      end
+
       result[uri] = document
     end
   end
 
   private
+
+  def reconstruct_expected_collection_management_json(cm)
+    expected = deep_copy_json_value(cm)
+    strip_fullrecord_object(expected)
+    expected
+  end
+
+  def deep_copy_json_value(val)
+    case val
+    when Hash
+      val.each_with_object({}) { |(k, v), h| h[k.to_s] = deep_copy_json_value(v) }
+    when Array
+      val.map { |v| deep_copy_json_value(v) }
+    when String
+      val.dup
+    else
+      val
+    end
+  end
+
+  def strip_fullrecord_object(hash)
+    hash.each do |key, val|
+      key_str = key.to_s
+      next if IndexerCommonConfig.fullrecord_excludes.include?(key_str) || key_str =~ /_enum_s$/
+      case val
+      when String
+        hash[key] = val.strip
+      when Hash
+        strip_fullrecord_object(val)
+      when Array
+        strip_fullrecord_array(val)
+      end
+    end
+  end
+
+  def strip_fullrecord_array(arr)
+    arr.each_with_index do |val, idx|
+      case val
+      when String
+        arr[idx] = val.strip
+      when Hash
+        strip_fullrecord_object(val)
+      when Array
+        strip_fullrecord_array(val)
+      end
+    end
+  end
+
+  def validate_json_equal!(expected, actual, path = 'child json')
+    unless expected.class == actual.class
+      raise "#{path} type mismatch: expected #{expected.class}, got #{actual.class}"
+    end
+
+    case expected
+    when Hash
+      expected_keys = expected.keys.map(&:to_s).sort
+      actual_keys = actual.keys.map(&:to_s).sort
+      unless expected_keys == actual_keys
+        missing = expected_keys - actual_keys
+        extra = actual_keys - expected_keys
+        raise "#{path} keys mismatch (missing: #{missing.inspect}, extra: #{extra.inspect})"
+      end
+      expected_keys.each do |key|
+        validate_json_equal!(expected[key], actual[key], "#{path}.#{key}")
+      end
+    when Array
+      unless expected.length == actual.length
+        raise "#{path} array length mismatch: expected #{expected.length}, got #{actual.length}"
+      end
+      expected.each_with_index do |exp_val, idx|
+        validate_json_equal!(exp_val, actual[idx], "#{path}[#{idx}]")
+      end
+    else
+      unless expected == actual
+        raise "#{path} value mismatch: expected #{expected.inspect}, got #{actual.inspect}"
+      end
+    end
+  end
+
+  def clean_for_sort(value)
+    return nil if value.nil?
+    out = value.gsub(/<[^>]+>/, '')
+    out.gsub!(/-/, ' ')
+    out.gsub!(/[^\p{L}\d\s_]/, '')
+    out.gsub!(/\s+/, ' ')
+    out.strip
+  end
 
   def expected_publish(record_type, record, suppressed)
     if record_type == 'subject'

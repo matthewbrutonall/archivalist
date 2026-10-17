@@ -180,20 +180,35 @@ Jobs use `job_metadata`, covering deterministic staff-index fields: `job_type`,
 `report_type`, `job_report_type` (matching Ruby truthiness for empty string vs
 false/nil), `status`, `owner`, `queue_position`, and types ordering
 `['job', job_type, report_type]`.
+Synthetic `collection_management` child documents are generated in Rust for valid
+parent records (`resource`, `accession`, `digital_object`) with a collection-management
+subrecord. The child document includes native fields: `id`, `uri`, `parent_id`,
+`parent_title`, `parent_type`, `title`, `title_sort`, `types`, `primary_type`, `json`,
+`processing_priority`, `processing_status`, `processing_hours_total`,
+`processing_funding_source`, `processors`, `suppressed`, `repository`, and audit
+fields (`created_by`, `last_modified_by`, `system_mtime`, `user_mtime`, `create_time`).
+Inputs where exact parity cannot be guaranteed (such as non-standard alphabetic
+characters outside the ASCII and Latin extended ranges) are withheld by Rust so
+native Ruby child generation runs.
 Accession date localization, unresolved location owner-repository HTTP lookups,
 and job dynamic title translation via I18n, localized timestamps via
 `Time.parse(...).getlocal`, and output-file discovery via `JSONModel::HTTP`
-remain native. All markers are removed before Solr and plugin hooks. It accounts
+remain native. All markers (`_archivalist_rust_fields` and
+`_archivalist_collection_management_documents`) are removed before Solr and plugin
+hooks. A valid Rust child handoff suppresses only the built-in native child generator;
+all third-party `add_extra_documents_hook` registrations execute unchanged exactly
+once. Stale-child deletion via `records_with_children` is preserved. It accounts
 for Solr's intentional copy-field merge of `notes_published` into `notes`. Only
 after this passes should `rust_index_document_enrichment_enabled` be set to `true`.
 The enrichment gate is staff-index only; PUI full-record extraction, top-container
 publication decisions (`is_linked_to_published_record` / `pui_container`), and PUI
 removal of `internal_note` and container-profile notes remain native after
-inheritance and privacy filtering. Job enrichment is completely bypassed in PUI.
+inheritance and privacy filtering. Job and collection-management child enrichment is
+completely bypassed in PUI.
 Before rollout, also require a complete native-versus-Rust reindex comparison so
 accessions, digital objects and components, subjects, agents, classifications,
 repositories, events, locations, container profiles, location profiles,
-assessments, top containers, and jobs are covered.
+assessments, top containers, jobs, and collection-management child documents are covered.
 
 ## 7. Full STAFF index parity gate
 

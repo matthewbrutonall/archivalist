@@ -1286,4 +1286,752 @@ describe RustIndexDocumentBuilder do
     )
     expect { builder.build([resource_input]) }.to raise_error(/response enrichment marker mismatch/)
   end
+
+  it 'validates collection_management child document on enriched resource and accession parents' do
+    full_cm = {
+      'uri' => '/repositories/2/collection_management/10',
+      'processing_priority' => ' high ',
+      'processing_status' => ' completed ',
+      'processing_hours_total' => ' 40 ',
+      'processing_funding_source' => ' grant-funded ',
+      'processors' => ' Alice and Bob ',
+      'created_by' => 'admin',
+      'last_modified_by' => 'archivist',
+      'system_mtime' => '2026-01-01T00:00:00Z',
+      'user_mtime' => '2026-01-01T00:00:00Z',
+      'create_time' => '2026-01-01T00:00:00Z',
+    }
+    resource_input = {
+      'uri' => '/repositories/2/resources/1',
+      'record_type' => 'resource',
+      'repository' => 2,
+      'enrich' => true,
+      'record' => {
+        'uri' => '/repositories/2/resources/1',
+        'title' => ' <emph render="italic">Papers</emph> - Collection 1 ',
+        'suppressed' => true,
+        'id_0' => 'COL-1',
+        'level' => 'collection',
+        'collection_management' => full_cm,
+      },
+    }
+    child_doc = {
+      'id' => '/repositories/2/collection_management/10',
+      'uri' => '/repositories/2/collection_management/10',
+      'parent_id' => '/repositories/2/resources/1',
+      'parent_title' => '<emph render="italic">Papers</emph> - Collection 1',
+      'parent_type' => 'resource',
+      'title' => '<emph render="italic">Papers</emph> - Collection 1',
+      'title_sort' => 'Papers Collection 1',
+      'primary_type' => 'collection_management',
+      'types' => ['collection_management'],
+      'suppressed' => true,
+      'repository' => 2,
+      'processing_priority' => 'high',
+      'processing_status' => 'completed',
+      'processing_hours_total' => '40',
+      'processing_funding_source' => 'grant-funded',
+      'processors' => 'Alice and Bob',
+      'created_by' => 'admin',
+      'last_modified_by' => 'archivist',
+      'system_mtime' => '2026-01-01T00:00:00Z',
+      'user_mtime' => '2026-01-01T00:00:00Z',
+      'create_time' => '2026-01-01T00:00:00Z',
+      'json' => ASUtils.to_json(full_cm),
+    }
+    resource_doc = {
+      'id' => resource_input['uri'],
+      'uri' => resource_input['uri'],
+      'title' => ' <emph render="italic">Papers</emph> - Collection 1 ',
+      'primary_type' => 'resource',
+      'types' => ['resource'],
+      'json' => ASUtils.to_json(resource_input['record']),
+      'suppressed' => true,
+      'publish' => false,
+      'system_generated' => 'false',
+      'repository' => 2,
+      'fullrecord_published' => [],
+      'fullrecord' => [],
+      'finding_aid_title' => nil,
+      'finding_aid_filing_title' => nil,
+      'identifier' => 'COL-1',
+      'resource_type' => nil,
+      'level' => 'collection',
+      'restrictions' => false,
+      'ead_id' => nil,
+      'finding_aid_status' => nil,
+      'related_accession_uris' => [],
+      'slug' => nil,
+      'is_slug_auto' => false,
+      'external_id' => [],
+      'ancestors' => [],
+      'langcode' => [],
+      'four_part_id' => 'COL-1',
+      'processing_priority' => 'high',
+      'processors' => 'Alice and Bob',
+      '_archivalist_rust_fields' => [
+        'common_metadata',
+        'fullrecord',
+        'resource_archival_object_metadata',
+      ],
+      '_archivalist_collection_management_documents' => [child_doc],
+    }
+
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [resource_doc])
+    )
+    result = builder.build([resource_input])
+    expect(result[resource_input['uri']]).to eq(resource_doc)
+
+    # Minimal accession parent
+    minimal_cm = {
+      'uri' => '/repositories/2/collection_management/11',
+    }
+    accession_input = {
+      'uri' => '/repositories/2/accessions/2',
+      'record_type' => 'accession',
+      'repository' => 2,
+      'enrich' => true,
+      'record' => {
+        'uri' => '/repositories/2/accessions/2',
+        'display_string' => 'Accession 2026-01',
+        'title' => nil,
+        'id_0' => 'ACC-2',
+        'acquisition_type' => nil,
+        'resource_type' => nil,
+        'restrictions_apply' => false,
+        'access_restrictions' => false,
+        'use_restrictions' => false,
+        'related_resources' => [],
+        'related_accessions' => [],
+        'slug' => nil,
+        'is_slug_auto' => false,
+        'collection_management' => minimal_cm,
+      },
+    }
+    minimal_child = {
+      'id' => '/repositories/2/collection_management/11',
+      'uri' => '/repositories/2/collection_management/11',
+      'parent_id' => '/repositories/2/accessions/2',
+      'parent_title' => 'Accession 2026-01',
+      'parent_type' => 'accession',
+      'title' => 'Accession 2026-01',
+      'title_sort' => 'Accession 2026 01',
+      'primary_type' => 'collection_management',
+      'types' => ['collection_management'],
+      'suppressed' => false,
+      'repository' => 2,
+      'processing_priority' => nil,
+      'processing_status' => nil,
+      'processing_hours_total' => nil,
+      'processing_funding_source' => nil,
+      'processors' => nil,
+      'created_by' => nil,
+      'last_modified_by' => nil,
+      'system_mtime' => nil,
+      'user_mtime' => nil,
+      'create_time' => nil,
+      'json' => ASUtils.to_json(minimal_cm),
+    }
+    accession_doc = {
+      'id' => accession_input['uri'],
+      'uri' => accession_input['uri'],
+      'title' => 'Accession 2026-01',
+      'primary_type' => 'accession',
+      'types' => ['accession'],
+      'json' => ASUtils.to_json(accession_input['record']),
+      'suppressed' => false,
+      'publish' => false,
+      'system_generated' => 'false',
+      'repository' => 2,
+      'fullrecord_published' => [],
+      'fullrecord' => [],
+      'identifier' => 'ACC-2',
+      'acquisition_type' => nil,
+      'resource_type' => nil,
+      'restrictions_apply' => false,
+      'access_restrictions' => false,
+      'use_restrictions' => false,
+      'related_resource_uris' => [],
+      'related_accession_uris' => [],
+      'slug' => nil,
+      'is_slug_auto' => false,
+      'external_id' => [],
+      'ancestors' => [],
+      'langcode' => [],
+      'four_part_id' => 'ACC-2',
+      'processing_priority' => nil,
+      'processors' => nil,
+      '_archivalist_rust_fields' => [
+        'common_metadata',
+        'fullrecord',
+        'accession_digital_object_metadata',
+      ],
+      '_archivalist_collection_management_documents' => [minimal_child],
+    }
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [accession_doc])
+    )
+    result = builder.build([accession_input])
+    expect(result[accession_input['uri']]).to eq(accession_doc)
+  end
+
+  it 'rejects mismatched or malformed collection_management child document metadata' do
+    cm = { 'uri' => '/repositories/2/collection_management/10' }
+    valid_input = {
+      'uri' => '/repositories/2/resources/1',
+      'record_type' => 'resource',
+      'repository' => 2,
+      'enrich' => true,
+      'record' => {
+        'uri' => '/repositories/2/resources/1',
+        'title' => 'Resource 1',
+        'id_0' => 'R1',
+        'level' => 'collection',
+        'collection_management' => cm,
+      },
+    }
+    base_child = {
+      'id' => '/repositories/2/collection_management/10',
+      'uri' => '/repositories/2/collection_management/10',
+      'parent_id' => '/repositories/2/resources/1',
+      'parent_title' => 'Resource 1',
+      'parent_type' => 'resource',
+      'title' => 'Resource 1',
+      'title_sort' => 'Resource 1',
+      'primary_type' => 'collection_management',
+      'types' => ['collection_management'],
+      'suppressed' => false,
+      'repository' => 2,
+      'processing_priority' => nil,
+      'processing_status' => nil,
+      'processing_hours_total' => nil,
+      'processing_funding_source' => nil,
+      'processors' => nil,
+      'created_by' => nil,
+      'last_modified_by' => nil,
+      'system_mtime' => nil,
+      'user_mtime' => nil,
+      'create_time' => nil,
+      'json' => ASUtils.to_json(cm),
+    }
+    build_doc = lambda do |child|
+      {
+        'id' => valid_input['uri'],
+        'uri' => valid_input['uri'],
+        'title' => 'Resource 1',
+        'primary_type' => 'resource',
+        'types' => ['resource'],
+        'json' => ASUtils.to_json(valid_input['record']),
+        'suppressed' => false,
+        'publish' => false,
+        'system_generated' => 'false',
+        'repository' => 2,
+        'fullrecord_published' => [],
+        'fullrecord' => [],
+        'finding_aid_title' => nil,
+        'finding_aid_filing_title' => nil,
+        'identifier' => 'R1',
+        'resource_type' => nil,
+        'level' => 'collection',
+        'restrictions' => false,
+        'ead_id' => nil,
+        'finding_aid_status' => nil,
+        'related_accession_uris' => [],
+        'slug' => nil,
+        'is_slug_auto' => false,
+        'external_id' => [],
+        'ancestors' => [],
+        'langcode' => [],
+        'four_part_id' => 'R1',
+        'processing_priority' => nil,
+        'processors' => nil,
+        '_archivalist_rust_fields' => [
+          'common_metadata',
+          'fullrecord',
+          'resource_archival_object_metadata',
+        ],
+        '_archivalist_collection_management_documents' => child ? [child] : [],
+      }
+    end
+
+    # Mismatched child id
+    bad_id_doc = build_doc.call(base_child.merge('id' => '/repositories/2/collection_management/999'))
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [bad_id_doc])
+    )
+    expect { builder.build([valid_input]) }.to raise_error(/child id mismatch/)
+
+    # Mismatched child uri
+    bad_uri_doc = build_doc.call(base_child.merge('uri' => '/repositories/2/collection_management/999'))
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [bad_uri_doc])
+    )
+    expect { builder.build([valid_input]) }.to raise_error(/child uri mismatch/)
+
+    # Mismatched parent_id
+    bad_parent_id_doc = build_doc.call(base_child.merge('parent_id' => '/repositories/2/resources/999'))
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [bad_parent_id_doc])
+    )
+    expect { builder.build([valid_input]) }.to raise_error(/child parent_id mismatch/)
+
+    # Mismatched parent_type
+    bad_parent_type_doc = build_doc.call(base_child.merge('parent_type' => 'accession'))
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [bad_parent_type_doc])
+    )
+    expect { builder.build([valid_input]) }.to raise_error(/child parent_type mismatch/)
+
+    # Mismatched title / parent_title
+    bad_title_doc = build_doc.call(base_child.merge('title' => 'Wrong Title'))
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [bad_title_doc])
+    )
+    expect { builder.build([valid_input]) }.to raise_error(/child title mismatch/)
+
+    # Mismatched primary_type
+    bad_type_doc = build_doc.call(base_child.merge('primary_type' => 'resource'))
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [bad_type_doc])
+    )
+    expect { builder.build([valid_input]) }.to raise_error(/child primary_type mismatch/)
+
+    # Mismatched types
+    bad_types_doc = build_doc.call(base_child.merge('types' => ['wrong_type']))
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [bad_types_doc])
+    )
+    expect { builder.build([valid_input]) }.to raise_error(/child types mismatch/)
+
+    # Mismatched repository
+    bad_repo_doc = build_doc.call(base_child.merge('repository' => 999))
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [bad_repo_doc])
+    )
+    expect { builder.build([valid_input]) }.to raise_error(/child repository mismatch/)
+
+    # Mismatched suppression
+    bad_suppressed_doc = build_doc.call(base_child.merge('suppressed' => true))
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [bad_suppressed_doc])
+    )
+    expect { builder.build([valid_input]) }.to raise_error(/child suppression mismatch/)
+
+    # Child documents count mismatch (0 children)
+    empty_children_doc = build_doc.call(nil)
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [empty_children_doc])
+    )
+    expect { builder.build([valid_input]) }.to raise_error(/collection management documents count mismatch/)
+
+    # Child document contains private handoff field
+    private_child_doc = build_doc.call(base_child.merge('_archivalist_private' => 'leaked'))
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [private_child_doc])
+    )
+    expect { builder.build([valid_input]) }.to raise_error(/child document contains private handoff field/)
+
+    # Missing nil-valued optional key (e.g. 'processors' omitted from child hash)
+    missing_key_child = base_child.reject {|k, _| k == 'processors'}
+    expect(base_child['processors']).to be_nil
+    missing_key_doc = build_doc.call(missing_key_child)
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [missing_key_doc])
+    )
+    expect { builder.build([valid_input]) }.to raise_error(/child document missing required fields.*processors/)
+
+    # Extra ordinary Solr field (not a private handoff field)
+    extra_field_child = base_child.merge('extra_solr_field' => 'unexpected_value')
+    extra_field_doc = build_doc.call(extra_field_child)
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [extra_field_doc])
+    )
+    expect { builder.build([valid_input]) }.to raise_error(/child document contains unexpected fields.*extra_solr_field/)
+
+    # Unexpected collection management documents when record has no collection_management
+    no_cm_input = valid_input.merge('record' => valid_input['record'].reject {|k, _| k == 'collection_management'})
+    doc_with_unwanted_child = build_doc.call(base_child)
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [doc_with_unwanted_child])
+    )
+    expect { builder.build([no_cm_input]) }.to raise_error(/unexpected response collection management documents/)
+  end
+
+  it 'accepts enriched parent document when collection_management child is withheld by Rust' do
+    cm = { 'uri' => '/repositories/2/collection_management/10' }
+    valid_input = {
+      'uri' => '/repositories/2/resources/1',
+      'record_type' => 'resource',
+      'repository' => 2,
+      'enrich' => true,
+      'record' => {
+        'uri' => '/repositories/2/resources/1',
+        'title' => 'Resource Withheld CM',
+        'id_0' => 'R1',
+        'level' => 'collection',
+        'collection_management' => cm,
+      },
+    }
+    withheld_doc = {
+      'id' => valid_input['uri'],
+      'uri' => valid_input['uri'],
+      'title' => 'Resource Withheld CM',
+      'primary_type' => 'resource',
+      'types' => ['resource'],
+      'json' => ASUtils.to_json(valid_input['record']),
+      'suppressed' => false,
+      'publish' => false,
+      'system_generated' => 'false',
+      'repository' => 2,
+      'fullrecord_published' => [],
+      'fullrecord' => [],
+      'finding_aid_title' => nil,
+      'finding_aid_filing_title' => nil,
+      'identifier' => 'R1',
+      'resource_type' => nil,
+      'level' => 'collection',
+      'restrictions' => false,
+      'ead_id' => nil,
+      'finding_aid_status' => nil,
+      'related_accession_uris' => [],
+      'slug' => nil,
+      'is_slug_auto' => false,
+      'external_id' => [],
+      'ancestors' => [],
+      'langcode' => [],
+      'four_part_id' => 'R1',
+      'processing_priority' => nil,
+      'processors' => nil,
+      '_archivalist_rust_fields' => [
+        'common_metadata',
+        'fullrecord',
+        'resource_archival_object_metadata',
+      ],
+      # Notice: _archivalist_collection_management_documents is absent because Rust withheld it
+    }
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [withheld_doc])
+    )
+    result = builder.build([valid_input])
+    expect(result[valid_input['uri']]).to eq(withheld_doc)
+  end
+
+  it 'deeply validates collection_management child JSON with native stripping and rejects corrupted JSON' do
+    full_cm = {
+      'uri' => '/repositories/2/collection_management/10',
+      'processing_priority' => ' high ',
+      'processing_status' => ' completed ',
+      'processing_hours_total' => ' 40 ',
+      'processing_funding_source' => ' grant-funded ',
+      'processors' => ' Alice and Bob ',
+      'created_by' => ' admin ',
+      'last_modified_by' => ' archivist ',
+      'system_mtime' => ' 2026-01-01T00:00:00Z ',
+      'user_mtime' => ' 2026-01-01T00:00:00Z ',
+      'create_time' => ' 2026-01-01T00:00:00Z ',
+      'user_defined_enum_s' => ' unstripped_enum ',
+      'external_ids' => [
+        {
+          'external_id' => ' ext-1 ',
+          'source' => ' local ',
+        }
+      ],
+      'nested' => {
+        'title' => ' nested title ',
+        'created_by' => ' unstripped_audit ',
+      },
+    }
+
+    valid_input = {
+      'uri' => '/repositories/2/resources/1',
+      'record_type' => 'resource',
+      'repository' => 2,
+      'enrich' => true,
+      'record' => {
+        'uri' => '/repositories/2/resources/1',
+        'title' => 'Resource 1',
+        'id_0' => 'R1',
+        'level' => 'collection',
+        'suppressed' => false,
+        'collection_management' => full_cm,
+      },
+    }
+
+    expected_cm_json = {
+      'uri' => '/repositories/2/collection_management/10',
+      'processing_priority' => 'high',
+      'processing_status' => 'completed',
+      'processing_hours_total' => '40',
+      'processing_funding_source' => 'grant-funded',
+      'processors' => 'Alice and Bob',
+      'created_by' => ' admin ',
+      'last_modified_by' => ' archivist ',
+      'system_mtime' => ' 2026-01-01T00:00:00Z ',
+      'user_mtime' => ' 2026-01-01T00:00:00Z ',
+      'create_time' => ' 2026-01-01T00:00:00Z ',
+      'user_defined_enum_s' => ' unstripped_enum ',
+      'external_ids' => [
+        {
+          'external_id' => 'ext-1',
+          'source' => ' local ',
+        }
+      ],
+      'nested' => {
+        'title' => 'nested title',
+        'created_by' => ' unstripped_audit ',
+      },
+    }
+
+    valid_child = {
+      'id' => '/repositories/2/collection_management/10',
+      'uri' => '/repositories/2/collection_management/10',
+      'parent_id' => '/repositories/2/resources/1',
+      'parent_title' => 'Resource 1',
+      'parent_type' => 'resource',
+      'title' => 'Resource 1',
+      'title_sort' => 'Resource 1',
+      'primary_type' => 'collection_management',
+      'types' => ['collection_management'],
+      'suppressed' => false,
+      'repository' => 2,
+      'processing_priority' => 'high',
+      'processing_status' => 'completed',
+      'processing_hours_total' => '40',
+      'processing_funding_source' => 'grant-funded',
+      'processors' => 'Alice and Bob',
+      'created_by' => ' admin ',
+      'last_modified_by' => ' archivist ',
+      'system_mtime' => ' 2026-01-01T00:00:00Z ',
+      'user_mtime' => ' 2026-01-01T00:00:00Z ',
+      'create_time' => ' 2026-01-01T00:00:00Z ',
+      'json' => ASUtils.to_json(expected_cm_json),
+    }
+
+    build_doc = lambda do |child|
+      {
+        'id' => valid_input['uri'],
+        'uri' => valid_input['uri'],
+        'title' => 'Resource 1',
+        'primary_type' => 'resource',
+        'types' => ['resource'],
+        'json' => ASUtils.to_json(valid_input['record']),
+        'suppressed' => false,
+        'publish' => false,
+        'system_generated' => 'false',
+        'repository' => 2,
+        'fullrecord_published' => [],
+        'fullrecord' => [],
+        'finding_aid_title' => nil,
+        'finding_aid_filing_title' => nil,
+        'identifier' => 'R1',
+        'resource_type' => nil,
+        'level' => 'collection',
+        'restrictions' => false,
+        'ead_id' => nil,
+        'finding_aid_status' => nil,
+        'related_accession_uris' => [],
+        'slug' => nil,
+        'is_slug_auto' => false,
+        'external_id' => [],
+        'ancestors' => [],
+        'langcode' => [],
+        'four_part_id' => 'R1',
+        'processing_priority' => 'high',
+        'processors' => 'Alice and Bob',
+        '_archivalist_rust_fields' => [
+          'common_metadata',
+          'fullrecord',
+          'resource_archival_object_metadata',
+        ],
+        '_archivalist_collection_management_documents' => [child],
+      }
+    end
+
+    # 1. Exact expected JSON is accepted, and input record is NOT mutated
+    full_cm_before = ASUtils.json_parse(ASUtils.to_json(full_cm))
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [build_doc.call(valid_child)])
+    )
+    result = builder.build([valid_input])
+    expect(result[valid_input['uri']]).not_to be_nil
+    expect(valid_input['record']['collection_management']).to eq(full_cm_before)
+    expect(result[valid_input['uri']]['_archivalist_collection_management_documents'].first['json']).to eq(ASUtils.to_json(expected_cm_json))
+
+    test_rejection = lambda do |corrupt_json, error_match|
+      corrupt_child = valid_child.merge('json' => ASUtils.to_json(corrupt_json))
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [build_doc.call(corrupt_child)])
+      )
+      expect { builder.build([valid_input]) }.to raise_error(error_match)
+    end
+
+    # 2. Same-URI but missing field
+    missing_field_json = expected_cm_json.reject {|k, _| k == 'processing_status'}
+    test_rejection.call(missing_field_json, /keys mismatch.*missing.*processing_status/)
+
+    # 3. Same-URI but extra field
+    extra_field_json = expected_cm_json.merge('unexpected_extra_field' => 'bogus')
+    test_rejection.call(extra_field_json, /keys mismatch.*extra.*unexpected_extra_field/)
+
+    # 4. Same-URI but altered processing value
+    altered_processing_json = expected_cm_json.merge('processing_priority' => 'low')
+    test_rejection.call(altered_processing_json, /processing_priority value mismatch/)
+
+    # 5. Same-URI but altered audit value
+    altered_audit_json = expected_cm_json.merge('created_by' => 'altered_admin')
+    test_rejection.call(altered_audit_json, /created_by value mismatch/)
+
+    # 6. Same-URI but altered nested value
+    corrupt_nested = expected_cm_json.dup
+    corrupt_nested['nested'] = expected_cm_json['nested'].merge('title' => 'corrupted title')
+    test_rejection.call(corrupt_nested, /nested\.title value mismatch/)
+
+    # 7. Same-URI but type change
+    type_change_json = expected_cm_json.merge('processing_hours_total' => 40)
+    test_rejection.call(type_change_json, /processing_hours_total type mismatch/)
+
+    # 8. Same parsed JSON object but different key order
+    reordered_cm_hash = expected_cm_json.to_a.reverse.to_h
+    expect(reordered_cm_hash).to eq(expected_cm_json)
+    reordered_json_string = ASUtils.to_json(reordered_cm_hash)
+    expect(reordered_json_string).not_to eq(ASUtils.to_json(expected_cm_json))
+    corrupt_child = valid_child.merge('json' => reordered_json_string)
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [build_doc.call(corrupt_child)])
+    )
+    expect { builder.build([valid_input]) }.to raise_error(/child json serialization mismatch/)
+  end
+
+  it 'requires byte-for-byte exact stored JSON string equality for collection_management child document' do
+    full_cm = {
+      'uri' => '/repositories/2/collection_management/10',
+      'processing_priority' => ' high ',
+      'processing_status' => ' completed ',
+    }
+    valid_input = {
+      'uri' => '/repositories/2/resources/1',
+      'record_type' => 'resource',
+      'repository' => 2,
+      'enrich' => true,
+      'record' => {
+        'uri' => '/repositories/2/resources/1',
+        'title' => 'Resource 1',
+        'id_0' => 'R1',
+        'level' => 'collection',
+        'suppressed' => false,
+        'collection_management' => full_cm,
+      },
+    }
+    expected_cm_json = {
+      'uri' => '/repositories/2/collection_management/10',
+      'processing_priority' => 'high',
+      'processing_status' => 'completed',
+    }
+    expected_json_string = ASUtils.to_json(expected_cm_json)
+    valid_child = {
+      'id' => '/repositories/2/collection_management/10',
+      'uri' => '/repositories/2/collection_management/10',
+      'parent_id' => '/repositories/2/resources/1',
+      'parent_title' => 'Resource 1',
+      'parent_type' => 'resource',
+      'title' => 'Resource 1',
+      'title_sort' => 'Resource 1',
+      'primary_type' => 'collection_management',
+      'types' => ['collection_management'],
+      'suppressed' => false,
+      'repository' => 2,
+      'processing_priority' => 'high',
+      'processing_status' => 'completed',
+      'processing_hours_total' => nil,
+      'processing_funding_source' => nil,
+      'processors' => nil,
+      'created_by' => nil,
+      'last_modified_by' => nil,
+      'system_mtime' => nil,
+      'user_mtime' => nil,
+      'create_time' => nil,
+      'json' => expected_json_string,
+    }
+    doc = {
+      'id' => valid_input['uri'],
+      'uri' => valid_input['uri'],
+      'title' => 'Resource 1',
+      'primary_type' => 'resource',
+      'types' => ['resource'],
+      'json' => ASUtils.to_json(valid_input['record']),
+      'suppressed' => false,
+      'publish' => false,
+      'system_generated' => 'false',
+      'repository' => 2,
+      'fullrecord_published' => [],
+      'fullrecord' => [],
+      'finding_aid_title' => nil,
+      'finding_aid_filing_title' => nil,
+      'identifier' => 'R1',
+      'resource_type' => nil,
+      'level' => 'collection',
+      'restrictions' => false,
+      'ead_id' => nil,
+      'finding_aid_status' => nil,
+      'related_accession_uris' => [],
+      'slug' => nil,
+      'is_slug_auto' => false,
+      'external_id' => [],
+      'ancestors' => [],
+      'langcode' => [],
+      'four_part_id' => 'R1',
+      'processing_priority' => 'high',
+      'processors' => nil,
+      '_archivalist_rust_fields' => [
+        'common_metadata',
+        'fullrecord',
+        'resource_archival_object_metadata',
+      ],
+      '_archivalist_collection_management_documents' => [valid_child],
+    }
+
+    # Positive exact-string test
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [doc])
+    )
+    result = builder.build([valid_input])
+    emitted_child = result[valid_input['uri']]['_archivalist_collection_management_documents'].first
+    expect(emitted_child['json']).to eq(expected_json_string)
+
+    # Key order variation with identical parsed hash is rejected
+    reordered_cm_hash = expected_cm_json.to_a.reverse.to_h
+    expect(reordered_cm_hash).to eq(expected_cm_json)
+    reordered_doc = doc.merge(
+      '_archivalist_collection_management_documents' => [
+        valid_child.merge('json' => ASUtils.to_json(reordered_cm_hash))
+      ]
+    )
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [reordered_doc])
+    )
+    expect { builder.build([valid_input]) }.to raise_error(/child json serialization mismatch/)
+  end
 end

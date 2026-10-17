@@ -95,7 +95,8 @@ Endpoints:
   when enrichment is requested, staff-index mappings for resources, archival
   objects, accessions, digital objects and components, subjects, classifications,
   repositories, events, locations, container profiles, location profiles,
-  assessments, top containers, jobs (deterministic staff metadata), and all
+  assessments, top containers, jobs (deterministic staff metadata), synthetic
+  collection-management child documents for valid parent records, and all
   agent authority types.
 
 The example systemd unit in `deploy/` binds to loopback by default. Put authentication
@@ -114,7 +115,9 @@ parity comparator, `scripts/compare_staff_index_parity.py`. PUI full-record
 preparation, publication decisions, internal-note privacy filtering, and
 job-specific dynamic I18n translation, local timestamps, and output-file
 discovery intentionally remain native because inheritance, localization, and
-external I/O are handled by Ruby.
+external I/O are handled by Ruby. Collection-management child documents are generated
+exclusively for staff enrichment; PUI indexing remains native, and Ruby retains sole
+ownership of Solr writes and stale-child deletions.
 
 ## Test and benchmark helpers
 

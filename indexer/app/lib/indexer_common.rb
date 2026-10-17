@@ -1026,7 +1026,7 @@ class IndexerCommon
     }
 
     record_has_children('collection_management')
-    add_extra_documents_hook {|record|
+    @collection_management_extra_hook = proc {|record|
       docs = []
 
       cm = record['record']['collection_management']
@@ -1061,6 +1061,7 @@ class IndexerCommon
 
       docs
     }
+    add_extra_documents_hook(&@collection_management_extra_hook)
 
 
     add_document_prepare_hook {|doc, record|
@@ -1126,7 +1127,7 @@ class IndexerCommon
 
     # Internal handoff metadata must never reach Solr or plugin hooks.
     add_document_prepare_hook {|doc, _record|
-      doc.delete('_archivalist_rust_fields')
+      doc.delete_if {|k, _| k.start_with?('_archivalist_')}
     }
   end
 
@@ -1464,6 +1465,11 @@ class IndexerCommon
         doc = rust_documents && rust_documents[uri]
         doc ||= native_index_document(uri, record_type, values)
 
+        rust_cm_docs = doc.delete('_archivalist_collection_management_documents')
+        if rust_cm_docs
+          rust_cm_docs.each {|child| child.delete_if {|k, _| k.start_with?('_archivalist_')}}
+        end
+
         @document_prepare_hooks.each do |hook|
           hook.call(doc, record)
         end
@@ -1483,7 +1489,11 @@ class IndexerCommon
 
         # Allow a single record to spawn multiple Solr documents if desired
         @extra_documents_hooks.each do |hook|
-          batch.concat(hook.call(record))
+          if hook.equal?(@collection_management_extra_hook) && rust_cm_docs && !rust_cm_docs.empty?
+            batch.concat(rust_cm_docs)
+          else
+            batch.concat(hook.call(record))
+          end
         end
       end
     end
