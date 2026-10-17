@@ -46,6 +46,8 @@ class RustIndexDocumentBuilder
                          input['enrich'] ? record['repo_code'] : record['title']
                        elsif record_type == 'event'
                          input['enrich'] ? record['event_type'] : record['title']
+                       elsif ['container_profile', 'location_profile', 'assessment'].include?(record_type)
+                         input['enrich'] ? record['display_string'] : record['title']
                        else
                          record['title']
                        end
@@ -77,6 +79,8 @@ class RustIndexDocumentBuilder
           expected_fields << 'component_classification_metadata'
         elsif ['repository', 'event', 'location'].include?(record_type)
           expected_fields << 'repository_event_location_metadata'
+        elsif ['container_profile', 'location_profile', 'assessment'].include?(record_type)
+          expected_fields << 'profile_assessment_metadata'
         end
         unless document['_archivalist_rust_fields'] == expected_fields
           raise "response enrichment marker mismatch for #{uri}"
@@ -188,6 +192,49 @@ class RustIndexDocumentBuilder
                               'location_profile_uri_u_sstr',
                               'location_profile_display_string_u_ssort'
                             ])
+          end
+        elsif record_type == 'container_profile'
+          required.concat([
+                            'title', 'title_sort', 'display_string', 'note',
+                            'container_profile_width_u_sstr',
+                            'container_profile_height_u_sstr',
+                            'container_profile_depth_u_sstr',
+                            'container_profile_dimension_units_u_sstr',
+                            'typeahead_sort_key_u_sort',
+                            'external_id', 'ancestors', 'langcode'
+                          ])
+        elsif record_type == 'location_profile'
+          required.concat([
+                            'title', 'title_sort', 'display_string',
+                            'location_profile_width_u_sstr',
+                            'location_profile_height_u_sstr',
+                            'location_profile_depth_u_sstr',
+                            'location_profile_dimension_units_u_sstr',
+                            'typeahead_sort_key_u_sort',
+                            'external_id', 'ancestors', 'langcode'
+                          ])
+        elsif record_type == 'assessment'
+          required.concat([
+                            'assessment_id', 'title', 'display_string',
+                            'assessment_record_uris', 'assessment_records',
+                            'assessment_record_types',
+                            'assessment_surveyor_uris', 'assessment_surveyors',
+                            'assessment_survey_begin',
+                            'assessment_review_required',
+                            'assessment_sensitive_material',
+                            'assessment_inactive',
+                            'assessment_survey_year',
+                            'assessment_collection_uris', 'assessment_collections',
+                            'assessment_completed',
+                            'assessment_formats', 'assessment_ratings',
+                            'assessment_conservation_issues',
+                            'title_sort',
+                            'external_id', 'ancestors', 'langcode'
+                          ])
+          required << 'assessment_survey_end' if record['survey_end']
+          reviewers = record['reviewer'].is_a?(Array) ? record['reviewer'] : [record['reviewer']].compact
+          unless reviewers.empty?
+            required.concat(['assessment_reviewer_uris', 'assessment_reviewers'])
           end
         end
         if record_type == 'subject' || agent_types.include?(record_type)

@@ -166,15 +166,19 @@ subject/place terms. Digital-object components and classifications use
 `component_classification_metadata`. Repositories, events, and locations use
 `repository_event_location_metadata`, including repository sort fields, event
 linked-record titles and URIs, and location profile and resolved owner-repository
-fields. Accession date localization and unresolved location owner-repository HTTP
-lookups remain native. All markers are removed before Solr and plugin hooks. It
-accounts for Solr's intentional copy-field merge of `notes_published` into `notes`.
-Only after this passes should `rust_index_document_enrichment_enabled` be set to
-`true`. The enrichment gate is staff-index only; PUI full-record extraction remains
-native after inheritance and privacy filtering. Before rollout, also require a
-complete native-versus-Rust reindex comparison so accessions, digital objects and
-components, subjects, agents, classifications, repositories, events, and locations
-are covered.
+fields. Container profiles, location profiles, and assessments use
+`profile_assessment_metadata`, including profile dimensions, units, notes, and
+typeahead sort keys, plus assessment linked records, collections, surveyors,
+reviewers, survey year ranges, booleans, formats, ratings, and conservation issues.
+Accession date localization and unresolved location owner-repository HTTP lookups
+remain native. All markers are removed before Solr and plugin hooks. It accounts
+for Solr's intentional copy-field merge of `notes_published` into `notes`. Only
+after this passes should `rust_index_document_enrichment_enabled` be set to `true`.
+The enrichment gate is staff-index only; PUI full-record extraction remains native
+after inheritance and privacy filtering. Before rollout, also require a complete
+native-versus-Rust reindex comparison so accessions, digital objects and
+components, subjects, agents, classifications, repositories, events, locations,
+container profiles, location profiles, and assessments are covered.
 
 ## Rollback
 

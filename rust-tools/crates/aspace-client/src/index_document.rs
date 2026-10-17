@@ -1225,6 +1225,328 @@ fn add_location_fields(
     Ok(())
 }
 
+fn clean_display_string_for_sort(record: &Map<String, Value>) -> Result<Value, IndexDocumentError> {
+    match record.get("display_string") {
+        None | Some(Value::Null) => Ok(Value::Null),
+        Some(Value::String(value)) => Ok(Value::String(clean_for_sort(value))),
+        Some(_) => Err(error("field 'display_string' must be a string")),
+    }
+}
+
+fn add_container_profile_fields(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let display_string = record.get("display_string").cloned().unwrap_or(Value::Null);
+    let title_sort = clean_display_string_for_sort(record)?;
+    document.insert("title".to_string(), display_string.clone());
+    document.insert("title_sort".to_string(), title_sort);
+    document.insert("display_string".to_string(), display_string.clone());
+    document.insert(
+        "note".to_string(),
+        record.get("note").cloned().unwrap_or(Value::Null),
+    );
+    for property in ["width", "height", "depth"] {
+        document.insert(
+            format!("container_profile_{property}_u_sstr"),
+            record.get(property).cloned().unwrap_or(Value::Null),
+        );
+    }
+    document.insert(
+        "container_profile_dimension_units_u_sstr".to_string(),
+        record
+            .get("dimension_units")
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    document.insert("typeahead_sort_key_u_sort".to_string(), display_string);
+    Ok(())
+}
+
+fn add_location_profile_fields(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let display_string = record.get("display_string").cloned().unwrap_or(Value::Null);
+    let title_sort = clean_display_string_for_sort(record)?;
+    document.insert("title".to_string(), display_string.clone());
+    document.insert("title_sort".to_string(), title_sort);
+    document.insert("display_string".to_string(), display_string.clone());
+    for property in ["width", "height", "depth"] {
+        document.insert(
+            format!("location_profile_{property}_u_sstr"),
+            record.get(property).cloned().unwrap_or(Value::Null),
+        );
+    }
+    document.insert(
+        "location_profile_dimension_units_u_sstr".to_string(),
+        record
+            .get("dimension_units")
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    document.insert("typeahead_sort_key_u_sort".to_string(), display_string);
+    Ok(())
+}
+
+fn parse_assessment_id(record: &Map<String, Value>) -> Result<u64, IndexDocumentError> {
+    let uri = required_string(record.get("uri"), "uri")?;
+    let without_fragment = uri.split('#').next().unwrap_or(uri);
+    let Some((prefix, tail)) = without_fragment.rsplit_once("/assessments/") else {
+        return Err(error("assessment uri must contain /assessments/<id>"));
+    };
+    let valid_prefix = prefix
+        .strip_prefix("/repositories/")
+        .is_some_and(|repo| !repo.is_empty() && !repo.contains('/') && !repo.contains(' '));
+    if !valid_prefix {
+        return Err(error(
+            "assessment uri must match /repositories/<repo_id>/assessments/<id>",
+        ));
+    }
+    if tail.is_empty() || !tail.chars().all(|character| character.is_ascii_digit()) {
+        return Err(error("assessment uri must end with a numeric id"));
+    }
+    tail.parse::<u64>()
+        .map_err(|_| error("assessment uri id must be a valid integer"))
+}
+
+fn generate_years_for_date_range(
+    begin_date: Option<&Value>,
+    end_date: Option<&Value>,
+) -> Vec<Value> {
+    if !ruby_truthy(begin_date) {
+        return Vec::new();
+    }
+    let effective_end = if ruby_truthy(end_date) {
+        end_date
+    } else {
+        begin_date
+    };
+    let (Some((begin, begin_width)), Some((end, _))) =
+        (leading_year(begin_date), leading_year(effective_end))
+    else {
+        return Vec::new();
+    };
+    if end >= begin && end - begin <= 10_000 {
+        let width = begin_width;
+        (begin..=end)
+            .map(|year| Value::String(format!("{year:0width$}")))
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+fn resolved_display_string_or_title(resolved: &Map<String, Value>) -> Value {
+    resolved
+        .get("display_string")
+        .filter(|value| ruby_truthy(Some(value)))
+        .or_else(|| resolved.get("title"))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn assessment_attribute_labels(
+    record: &Map<String, Value>,
+    field: &str,
+    include_notes: bool,
+) -> Result<Vec<Value>, IndexDocumentError> {
+    let values = match record.get(field) {
+        None | Some(Value::Null) => &[][..],
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| error(format!("field '{field}' must be an array")))?,
+    };
+    let mut labels = Vec::new();
+    for entry in values {
+        let entry = entry
+            .as_object()
+            .ok_or_else(|| error(format!("{field} entries must be objects")))?;
+        if entry.contains_key("value") || (include_notes && entry.contains_key("note")) {
+            labels.push(entry.get("label").cloned().unwrap_or(Value::Null));
+        }
+    }
+    Ok(labels)
+}
+
+fn add_assessment_fields(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let assessment_id = parse_assessment_id(record)?;
+    document.insert(
+        "assessment_id".to_string(),
+        Value::Number(assessment_id.into()),
+    );
+    let display_string = record.get("display_string").cloned().unwrap_or(Value::Null);
+    document.insert("title".to_string(), display_string.clone());
+    document.insert("display_string".to_string(), display_string);
+
+    let mut record_uris = Vec::new();
+    let mut records = Vec::new();
+    let mut record_types = Vec::new();
+    for linked_record in wrapped_values(record.get("records")) {
+        let linked_record = linked_record
+            .as_object()
+            .ok_or_else(|| error("records entries must be objects"))?;
+        record_uris.push(linked_record.get("ref").cloned().unwrap_or(Value::Null));
+        let resolved = linked_record
+            .get("_resolved")
+            .and_then(Value::as_object)
+            .ok_or_else(|| error("records entries must contain _resolved"))?;
+        records.push(resolved_display_string_or_title(resolved));
+        let record_type = required_string(
+            resolved.get("jsonmodel_type"),
+            "records._resolved.jsonmodel_type",
+        )?;
+        record_types.push(record_type.to_string());
+    }
+    record_types.sort();
+    record_types.dedup();
+    document.insert(
+        "assessment_record_uris".to_string(),
+        Value::Array(record_uris),
+    );
+    document.insert("assessment_records".to_string(), Value::Array(records));
+    document.insert(
+        "assessment_record_types".to_string(),
+        Value::Array(record_types.into_iter().map(Value::String).collect()),
+    );
+
+    let mut surveyor_uris = Vec::new();
+    let mut surveyors = Vec::new();
+    for surveyor in wrapped_values(record.get("surveyed_by")) {
+        let surveyor = surveyor
+            .as_object()
+            .ok_or_else(|| error("surveyed_by entries must be objects"))?;
+        surveyor_uris.push(surveyor.get("ref").cloned().unwrap_or(Value::Null));
+        let resolved = surveyor
+            .get("_resolved")
+            .and_then(Value::as_object)
+            .ok_or_else(|| error("surveyed_by entries must contain _resolved"))?;
+        surveyors.push(resolved.get("title").cloned().unwrap_or(Value::Null));
+    }
+    document.insert(
+        "assessment_surveyor_uris".to_string(),
+        Value::Array(surveyor_uris),
+    );
+    document.insert("assessment_surveyors".to_string(), Value::Array(surveyors));
+
+    document.insert(
+        "assessment_survey_begin".to_string(),
+        Value::String(format!(
+            "{}T00:00:00Z",
+            ruby_string(record.get("survey_begin"))
+        )),
+    );
+    if let Some(survey_end) = record
+        .get("survey_end")
+        .filter(|value| ruby_truthy(Some(value)))
+    {
+        document.insert(
+            "assessment_survey_end".to_string(),
+            Value::String(format!("{}T00:00:00Z", ruby_string(Some(survey_end)))),
+        );
+    }
+    document.insert(
+        "assessment_review_required".to_string(),
+        Value::Bool(ruby_truthy(record.get("review_required"))),
+    );
+    document.insert(
+        "assessment_sensitive_material".to_string(),
+        Value::Bool(ruby_truthy(record.get("sensitive_material"))),
+    );
+
+    let reviewers = wrapped_values(record.get("reviewer"));
+    if !reviewers.is_empty() {
+        let mut reviewer_uris = Vec::new();
+        let mut reviewer_titles = Vec::new();
+        for reviewer in reviewers {
+            let reviewer = reviewer
+                .as_object()
+                .ok_or_else(|| error("reviewer entries must be objects"))?;
+            reviewer_uris.push(reviewer.get("ref").cloned().unwrap_or(Value::Null));
+            let resolved = reviewer
+                .get("_resolved")
+                .and_then(Value::as_object)
+                .ok_or_else(|| error("reviewer entries must contain _resolved"))?;
+            reviewer_titles.push(resolved.get("title").cloned().unwrap_or(Value::Null));
+        }
+        document.insert(
+            "assessment_reviewer_uris".to_string(),
+            Value::Array(reviewer_uris),
+        );
+        document.insert(
+            "assessment_reviewers".to_string(),
+            Value::Array(reviewer_titles),
+        );
+    }
+
+    document.insert(
+        "assessment_inactive".to_string(),
+        Value::Bool(ruby_truthy(record.get("inactive"))),
+    );
+    document.insert(
+        "assessment_survey_year".to_string(),
+        Value::Array(generate_years_for_date_range(
+            record.get("survey_begin"),
+            record.get("survey_end"),
+        )),
+    );
+
+    let mut collection_uris = Vec::new();
+    let mut collections = Vec::new();
+    for collection in wrapped_values(record.get("collections")) {
+        let collection = collection
+            .as_object()
+            .ok_or_else(|| error("collections entries must be objects"))?;
+        collection_uris.push(collection.get("ref").cloned().unwrap_or(Value::Null));
+        let resolved = collection
+            .get("_resolved")
+            .and_then(Value::as_object)
+            .ok_or_else(|| error("collections entries must contain _resolved"))?;
+        collections.push(resolved_display_string_or_title(resolved));
+    }
+    document.insert(
+        "assessment_collection_uris".to_string(),
+        Value::Array(collection_uris),
+    );
+    document.insert(
+        "assessment_collections".to_string(),
+        Value::Array(collections),
+    );
+
+    document.insert(
+        "assessment_completed".to_string(),
+        Value::Bool(
+            record
+                .get("survey_end")
+                .is_some_and(|value| !value.is_null()),
+        ),
+    );
+    document.insert(
+        "assessment_formats".to_string(),
+        Value::Array(assessment_attribute_labels(record, "formats", false)?),
+    );
+    document.insert(
+        "assessment_ratings".to_string(),
+        Value::Array(assessment_attribute_labels(record, "ratings", true)?),
+    );
+    document.insert(
+        "assessment_conservation_issues".to_string(),
+        Value::Array(assessment_attribute_labels(
+            record,
+            "conservation_issues",
+            false,
+        )?),
+    );
+    document.insert(
+        "title_sort".to_string(),
+        Value::String(format!("{assessment_id:010}")),
+    );
+    Ok(())
+}
+
 fn add_type_specific_fields(
     document: &mut Map<String, Value>,
     record_type: &str,
@@ -1372,6 +1694,18 @@ fn add_type_specific_fields(
         "location" => {
             add_location_fields(document, record)?;
             markers.push(json_string("repository_event_location_metadata"));
+        }
+        "container_profile" => {
+            add_container_profile_fields(document, record)?;
+            markers.push(json_string("profile_assessment_metadata"));
+        }
+        "location_profile" => {
+            add_location_profile_fields(document, record)?;
+            markers.push(json_string("profile_assessment_metadata"));
+        }
+        "assessment" => {
+            add_assessment_fields(document, record)?;
+            markers.push(json_string("profile_assessment_metadata"));
         }
         _ => return Ok(markers),
     }
@@ -2446,6 +2780,447 @@ mod tests {
     }
 
     #[test]
+    fn builds_container_and_location_profile_staff_index_fields() {
+        let container_profile = build_index_document(IndexDocumentInput {
+            uri: "/container_profiles/3".to_string(),
+            record_type: "container_profile".to_string(),
+            repository: Value::String("global".to_string()),
+            record: json!({
+                "uri": "/container_profiles/3",
+                "name": "Standard Hollinger",
+                "display_string": "<b>Standard-Hollinger</b> [10x12x15] (inches)",
+                "note": "Acid-free archival carton",
+                "notes": "Schema string notes field",
+                "width": "10",
+                "height": "12",
+                "depth": "15",
+                "dimension_units": "inches",
+                "external_ids": [{"external_id": "cp-3"}],
+                "ancestors": [],
+                "lang_materials": [{"language_and_script": {"language": "eng"}}]
+            }),
+            enrich: true,
+        })
+        .unwrap();
+
+        assert_eq!(
+            container_profile["title"],
+            "<b>Standard-Hollinger</b> [10x12x15] (inches)"
+        );
+        assert_eq!(
+            container_profile["title_sort"],
+            "Standard Hollinger 10x12x15 inches"
+        );
+        assert_eq!(
+            container_profile["display_string"],
+            "<b>Standard-Hollinger</b> [10x12x15] (inches)"
+        );
+        assert_eq!(container_profile["note"], "Acid-free archival carton");
+        assert_eq!(
+            container_profile["notes_published"],
+            "Schema string notes field"
+        );
+        assert_eq!(container_profile["notes"], "Schema string notes field");
+        assert_eq!(container_profile["container_profile_width_u_sstr"], "10");
+        assert_eq!(container_profile["container_profile_height_u_sstr"], "12");
+        assert_eq!(container_profile["container_profile_depth_u_sstr"], "15");
+        assert_eq!(
+            container_profile["container_profile_dimension_units_u_sstr"],
+            "inches"
+        );
+        assert_eq!(
+            container_profile["typeahead_sort_key_u_sort"],
+            "<b>Standard-Hollinger</b> [10x12x15] (inches)"
+        );
+        assert_eq!(container_profile["external_id"], json!(["cp-3"]));
+        assert_eq!(container_profile["ancestors"], json!([]));
+        assert_eq!(container_profile["langcode"], json!(["eng"]));
+        assert_eq!(
+            container_profile["_archivalist_rust_fields"],
+            json!([
+                "common_metadata",
+                "fullrecord",
+                "profile_assessment_metadata"
+            ])
+        );
+
+        let location_profile = build_index_document(IndexDocumentInput {
+            uri: "/location_profiles/4".to_string(),
+            record_type: "location_profile".to_string(),
+            repository: Value::String("global".to_string()),
+            record: json!({
+                "uri": "/location_profiles/4",
+                "name": "Deep Folio Shelf",
+                "display_string": "<i>Deep-Folio_Shelf</i> #4 (cm)",
+                "width": "120",
+                "height": "40",
+                "depth": "60",
+                "dimension_units": "centimeters",
+                "external_ids": [{"external_id": "lp-4"}],
+                "ancestors": []
+            }),
+            enrich: true,
+        })
+        .unwrap();
+
+        assert_eq!(location_profile["title"], "<i>Deep-Folio_Shelf</i> #4 (cm)");
+        assert_eq!(location_profile["title_sort"], "Deep Folio_Shelf 4 cm");
+        assert_eq!(
+            location_profile["display_string"],
+            "<i>Deep-Folio_Shelf</i> #4 (cm)"
+        );
+        assert!(location_profile.get("note").is_none());
+        assert_eq!(location_profile["location_profile_width_u_sstr"], "120");
+        assert_eq!(location_profile["location_profile_height_u_sstr"], "40");
+        assert_eq!(location_profile["location_profile_depth_u_sstr"], "60");
+        assert_eq!(
+            location_profile["location_profile_dimension_units_u_sstr"],
+            "centimeters"
+        );
+        assert_eq!(
+            location_profile["typeahead_sort_key_u_sort"],
+            "<i>Deep-Folio_Shelf</i> #4 (cm)"
+        );
+        assert_eq!(location_profile["external_id"], json!(["lp-4"]));
+        assert_eq!(location_profile["ancestors"], json!([]));
+        assert_eq!(location_profile["langcode"], json!([]));
+        assert_eq!(
+            location_profile["_archivalist_rust_fields"],
+            json!([
+                "common_metadata",
+                "fullrecord",
+                "profile_assessment_metadata"
+            ])
+        );
+    }
+
+    #[test]
+    fn builds_assessment_staff_index_fields_for_full_and_minimal_records() {
+        let full_assessment = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/assessments/42".to_string(),
+            record_type: "assessment".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/assessments/42",
+                "display_string": "Assessment 42 — Main Collection",
+                "publish": false,
+                "records": [
+                    {
+                        "ref": "/repositories/2/archival_objects/10",
+                        "_resolved": {
+                            "jsonmodel_type": "archival_object",
+                            "display_string": "Series I: Letters",
+                            "title": "Letters"
+                        }
+                    },
+                    {
+                        "ref": "/repositories/2/resources/7",
+                        "_resolved": {
+                            "jsonmodel_type": "resource",
+                            "display_string": Value::Null,
+                            "title": "Sánchez Papers"
+                        }
+                    },
+                    {
+                        "ref": "/repositories/2/accessions/3",
+                        "_resolved": {
+                            "jsonmodel_type": "accession",
+                            "title": "2026-003 Accession"
+                        }
+                    },
+                    {
+                        "ref": "/repositories/2/archival_objects/11",
+                        "_resolved": {
+                            "jsonmodel_type": "archival_object",
+                            "display_string": "Series II: Diaries"
+                        }
+                    }
+                ],
+                "surveyed_by": [
+                    {
+                        "ref": "/agents/people/1",
+                        "_resolved": {"title": "Surveyor One"}
+                    },
+                    {
+                        "ref": "/agents/people/2",
+                        "_resolved": {"title": "Surveyor Two"}
+                    }
+                ],
+                "survey_begin": "2024-03-15",
+                "survey_end": "2026-04-01",
+                "review_required": true,
+                "sensitive_material": true,
+                "inactive": true,
+                "reviewer": [
+                    {
+                        "ref": "/agents/people/9",
+                        "_resolved": {"title": "Reviewer Nine"}
+                    }
+                ],
+                "collections": [
+                    {
+                        "ref": "/repositories/2/resources/7",
+                        "_resolved": {
+                            "display_string": "Sánchez Display",
+                            "title": "Sánchez Title"
+                        }
+                    },
+                    {
+                        "ref": "/repositories/2/resources/8",
+                        "_resolved": {
+                            "title": "Fallback Collection Title"
+                        }
+                    }
+                ],
+                "formats": [
+                    {"label": "Architectural Drawings", "value": "true"},
+                    {"label": "Audio Materials", "note": "note without value"},
+                    {"label": "Photographs"}
+                ],
+                "ratings": [
+                    {"label": "Documentation Quality", "value": "4"},
+                    {"label": "Research Value", "note": "High research interest"},
+                    {"label": "Housing Quality"}
+                ],
+                "conservation_issues": [
+                    {"label": "Brittle Paper", "value": "true"},
+                    {"label": "Mold", "note": "note only must not match"},
+                    {"label": "Water Damage"}
+                ],
+                "external_ids": [{"external_id": "assess-42"}],
+                "ancestors": []
+            }),
+            enrich: true,
+        })
+        .unwrap();
+
+        assert_eq!(full_assessment["assessment_id"], 42);
+        assert_eq!(full_assessment["title"], "Assessment 42 — Main Collection");
+        assert_eq!(
+            full_assessment["display_string"],
+            "Assessment 42 — Main Collection"
+        );
+        assert_eq!(
+            full_assessment["assessment_record_uris"],
+            json!([
+                "/repositories/2/archival_objects/10",
+                "/repositories/2/resources/7",
+                "/repositories/2/accessions/3",
+                "/repositories/2/archival_objects/11"
+            ])
+        );
+        assert_eq!(
+            full_assessment["assessment_records"],
+            json!([
+                "Series I: Letters",
+                "Sánchez Papers",
+                "2026-003 Accession",
+                "Series II: Diaries"
+            ])
+        );
+        assert_eq!(
+            full_assessment["assessment_record_types"],
+            json!(["accession", "archival_object", "resource"])
+        );
+        assert_eq!(
+            full_assessment["assessment_surveyor_uris"],
+            json!(["/agents/people/1", "/agents/people/2"])
+        );
+        assert_eq!(
+            full_assessment["assessment_surveyors"],
+            json!(["Surveyor One", "Surveyor Two"])
+        );
+        assert_eq!(
+            full_assessment["assessment_survey_begin"],
+            "2024-03-15T00:00:00Z"
+        );
+        assert_eq!(
+            full_assessment["assessment_survey_end"],
+            "2026-04-01T00:00:00Z"
+        );
+        assert_eq!(full_assessment["assessment_review_required"], true);
+        assert_eq!(full_assessment["assessment_sensitive_material"], true);
+        assert_eq!(full_assessment["assessment_inactive"], true);
+        assert_eq!(
+            full_assessment["assessment_reviewer_uris"],
+            json!(["/agents/people/9"])
+        );
+        assert_eq!(
+            full_assessment["assessment_reviewers"],
+            json!(["Reviewer Nine"])
+        );
+        assert_eq!(
+            full_assessment["assessment_survey_year"],
+            json!(["2024", "2025", "2026"])
+        );
+        assert_eq!(
+            full_assessment["assessment_collection_uris"],
+            json!(["/repositories/2/resources/7", "/repositories/2/resources/8"])
+        );
+        assert_eq!(
+            full_assessment["assessment_collections"],
+            json!(["Sánchez Display", "Fallback Collection Title"])
+        );
+        assert_eq!(full_assessment["assessment_completed"], true);
+        assert_eq!(
+            full_assessment["assessment_formats"],
+            json!(["Architectural Drawings"])
+        );
+        assert_eq!(
+            full_assessment["assessment_ratings"],
+            json!(["Documentation Quality", "Research Value"])
+        );
+        assert_eq!(
+            full_assessment["assessment_conservation_issues"],
+            json!(["Brittle Paper"])
+        );
+        assert_eq!(full_assessment["title_sort"], "0000000042");
+        assert_eq!(full_assessment["external_id"], json!(["assess-42"]));
+        assert_eq!(
+            full_assessment["_archivalist_rust_fields"],
+            json!([
+                "common_metadata",
+                "fullrecord",
+                "profile_assessment_metadata"
+            ])
+        );
+
+        let minimal_assessment = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/assessments/7".to_string(),
+            record_type: "assessment".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/assessments/7",
+                "display_string": "Minimal Assessment",
+                "records": [{
+                    "ref": "/repositories/2/resources/1",
+                    "_resolved": {
+                        "jsonmodel_type": "resource",
+                        "title": "Resource One"
+                    }
+                }],
+                "surveyed_by": [{
+                    "ref": "/agents/people/1",
+                    "_resolved": {"title": "Surveyor One"}
+                }],
+                "survey_begin": "2025-11-01",
+                "survey_end": Value::Null,
+                "review_required": Value::Null,
+                "sensitive_material": false,
+                "reviewer": [],
+                "collections": [],
+                "formats": [],
+                "ratings": [],
+                "conservation_issues": []
+            }),
+            enrich: true,
+        })
+        .unwrap();
+
+        assert_eq!(minimal_assessment["assessment_id"], 7);
+        assert_eq!(minimal_assessment["title_sort"], "0000000007");
+        assert_eq!(
+            minimal_assessment["assessment_survey_begin"],
+            "2025-11-01T00:00:00Z"
+        );
+        assert!(minimal_assessment.get("assessment_survey_end").is_none());
+        assert_eq!(minimal_assessment["assessment_review_required"], false);
+        assert_eq!(minimal_assessment["assessment_sensitive_material"], false);
+        assert_eq!(minimal_assessment["assessment_inactive"], false);
+        assert!(minimal_assessment.get("assessment_reviewer_uris").is_none());
+        assert!(minimal_assessment.get("assessment_reviewers").is_none());
+        assert_eq!(
+            minimal_assessment["assessment_survey_year"],
+            json!(["2025"])
+        );
+        assert_eq!(minimal_assessment["assessment_completed"], false);
+        assert_eq!(minimal_assessment["assessment_formats"], json!([]));
+        assert_eq!(minimal_assessment["assessment_ratings"], json!([]));
+        assert_eq!(
+            minimal_assessment["assessment_conservation_issues"],
+            json!([])
+        );
+    }
+
+    #[test]
+    fn matches_native_generate_years_for_date_range_edge_cases() {
+        assert_eq!(
+            generate_years_for_date_range(None, Some(&json!("2025-01-01"))),
+            Vec::<Value>::new()
+        );
+        assert_eq!(
+            generate_years_for_date_range(Some(&Value::Null), Some(&json!("2025-01-01"))),
+            Vec::<Value>::new()
+        );
+        assert_eq!(
+            generate_years_for_date_range(Some(&json!("2025-01-01")), None),
+            vec![json!("2025")]
+        );
+        assert_eq!(
+            generate_years_for_date_range(Some(&json!("2025-01-01")), Some(&Value::Null)),
+            vec![json!("2025")]
+        );
+        assert_eq!(
+            generate_years_for_date_range(Some(&json!("2026-01-01")), Some(&json!("2024-01-01"))),
+            Vec::<Value>::new()
+        );
+        assert_eq!(
+            generate_years_for_date_range(Some(&json!("2025-01-01")), Some(&json!("unknown"))),
+            Vec::<Value>::new()
+        );
+        assert_eq!(
+            generate_years_for_date_range(Some(&json!("unknown")), Some(&json!("2025-01-01"))),
+            Vec::<Value>::new()
+        );
+        assert_eq!(
+            generate_years_for_date_range(Some(&json!("9")), Some(&json!("11"))),
+            vec![json!("9"), json!("10"), json!("11")]
+        );
+        assert_eq!(
+            generate_years_for_date_range(Some(&json!("09")), Some(&json!("11"))),
+            vec![json!("09"), json!("10"), json!("11")]
+        );
+    }
+
+    #[test]
+    fn keeps_unmigrated_types_and_unenriched_requests_free_of_profile_assessment_marker() {
+        let top_container = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/top_containers/5".to_string(),
+            record_type: "top_container".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/top_containers/5",
+                "title": "Box 5",
+                "display_string": "Box 5"
+            }),
+            enrich: true,
+        })
+        .unwrap();
+        assert_eq!(
+            top_container["_archivalist_rust_fields"],
+            json!(["common_metadata", "fullrecord"])
+        );
+
+        let unenriched_assessment = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/assessments/42".to_string(),
+            record_type: "assessment".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/assessments/42",
+                "title": "Envelope title",
+                "display_string": "Display title"
+            }),
+            enrich: false,
+        })
+        .unwrap();
+        assert_eq!(unenriched_assessment["title"], "Envelope title");
+        assert!(unenriched_assessment
+            .get("_archivalist_rust_fields")
+            .is_none());
+        assert!(unenriched_assessment.get("assessment_id").is_none());
+    }
+
+    #[test]
     fn applies_every_publish_suppression_rule() {
         for extra in [
             json!({"suppressed": true}),
@@ -2476,6 +3251,36 @@ mod tests {
             "uri": "/repositories/2/resources/7",
             "publish": "yes"
         })))
+        .is_err());
+        for bad_uri in [
+            "/assessments/42",
+            "/repositories//assessments/42",
+            "/repositories/2/assessments/not-a-number",
+            "/repositories/2/resources/42",
+        ] {
+            assert!(build_index_document(IndexDocumentInput {
+                uri: bad_uri.to_string(),
+                record_type: "assessment".to_string(),
+                repository: json!(2),
+                record: json!({
+                    "uri": bad_uri,
+                    "display_string": "Bad Assessment"
+                }),
+                enrich: true,
+            })
+            .is_err());
+        }
+        assert!(build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/assessments/42".to_string(),
+            record_type: "assessment".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/assessments/42",
+                "display_string": "Bad Formats Assessment",
+                "formats": "not-an-array"
+            }),
+            enrich: true,
+        })
         .is_err());
     }
 

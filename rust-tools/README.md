@@ -94,7 +94,8 @@ Endpoints:
 - `POST /index/documents`: bounded preparation of common Solr document fields and,
   when enrichment is requested, staff-index mappings for resources, archival
   objects, accessions, digital objects and components, subjects, classifications,
-  repositories, events, locations, and all agent authority types.
+  repositories, events, locations, container profiles, location profiles,
+  assessments, and all agent authority types.
 
 The example systemd unit in `deploy/` binds to loopback by default. Put authentication
 and transport security in front of the sidecar before exposing it beyond the local

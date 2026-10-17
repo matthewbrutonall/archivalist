@@ -699,7 +699,8 @@ class IndexerCommon
              rust_fields.include?('accession_digital_object_metadata') ||
              rust_fields.include?('agent_subject_metadata') ||
              rust_fields.include?('component_classification_metadata') ||
-             rust_fields.include?('repository_event_location_metadata')
+             rust_fields.include?('repository_event_location_metadata') ||
+             rust_fields.include?('profile_assessment_metadata')
         doc['external_id'] = Array(record['record']['external_ids']).map do |eid|
           eid['external_id']
         end
@@ -812,7 +813,8 @@ class IndexerCommon
              rust_fields.include?('accession_digital_object_metadata') ||
              rust_fields.include?('agent_subject_metadata') ||
              rust_fields.include?('component_classification_metadata') ||
-             rust_fields.include?('repository_event_location_metadata')
+             rust_fields.include?('repository_event_location_metadata') ||
+             rust_fields.include?('profile_assessment_metadata')
         four_part_id = (0..3).map {|n| record['record']["id_#{n}"]}.compact.join(" ")
 
         unless four_part_id.empty?
@@ -928,7 +930,9 @@ class IndexerCommon
 
 
     add_document_prepare_hook {|doc, record|
-      if doc['primary_type'] == 'container_profile'
+      rust_fields = Array(doc['_archivalist_rust_fields'])
+      if doc['primary_type'] == 'container_profile' &&
+         !rust_fields.include?('profile_assessment_metadata')
         doc['title'] = record['record']['display_string']
         doc['title_sort'] = clean_for_sort(record['record']['display_string'])
         doc['display_string'] = record['record']['display_string']
@@ -954,7 +958,9 @@ class IndexerCommon
     }
 
     add_document_prepare_hook {|doc, record|
-      if doc['primary_type'] == 'location_profile'
+      rust_fields = Array(doc['_archivalist_rust_fields'])
+      if doc['primary_type'] == 'location_profile' &&
+         !rust_fields.include?('profile_assessment_metadata')
         doc['title'] = record['record']['display_string']
         doc['title_sort'] = clean_for_sort(record['record']['display_string'])
         doc['display_string'] = record['record']['display_string']
@@ -968,7 +974,6 @@ class IndexerCommon
         doc['typeahead_sort_key_u_sort'] = record['record']['display_string']
       end
 
-      rust_fields = Array(doc['_archivalist_rust_fields'])
       if record['record']['location_profile'] &&
          !rust_fields.include?('repository_event_location_metadata')
         doc['location_profile_uri_u_sstr'] = record['record']['location_profile']['ref']
@@ -982,7 +987,8 @@ class IndexerCommon
              rust_fields.include?('accession_digital_object_metadata') ||
              rust_fields.include?('agent_subject_metadata') ||
              rust_fields.include?('component_classification_metadata') ||
-             rust_fields.include?('repository_event_location_metadata')
+             rust_fields.include?('repository_event_location_metadata') ||
+             rust_fields.include?('profile_assessment_metadata')
         doc['ancestors'] = ASUtils.wrap(record['record']['ancestors']).map {|ancestor|
           ancestor.fetch('ref')
         }
@@ -995,7 +1001,8 @@ class IndexerCommon
              rust_fields.include?('accession_digital_object_metadata') ||
              rust_fields.include?('agent_subject_metadata') ||
              rust_fields.include?('component_classification_metadata') ||
-             rust_fields.include?('repository_event_location_metadata')
+             rust_fields.include?('repository_event_location_metadata') ||
+             rust_fields.include?('profile_assessment_metadata')
         ASUtils.wrap(record['record']['rights_statements']).each do |rights_statement|
           ASUtils.wrap(rights_statement['linked_agents']).each do |agent_link|
             doc['rights_statement_agent_uris'] ||= []
@@ -1044,7 +1051,9 @@ class IndexerCommon
 
 
     add_document_prepare_hook {|doc, record|
-      if doc['primary_type'] == 'assessment'
+      rust_fields = Array(doc['_archivalist_rust_fields'])
+      if doc['primary_type'] == 'assessment' &&
+         !rust_fields.include?('profile_assessment_metadata')
         doc['assessment_id'] = JSONModel.parse_reference(record['record']['uri']).fetch(:id)
         doc['title'] = record['record']['display_string']
         doc['display_string'] = record['record']['display_string']
@@ -1086,7 +1095,8 @@ class IndexerCommon
              rust_fields.include?('accession_digital_object_metadata') ||
              rust_fields.include?('agent_subject_metadata') ||
              rust_fields.include?('component_classification_metadata') ||
-             rust_fields.include?('repository_event_location_metadata')
+             rust_fields.include?('repository_event_location_metadata') ||
+             rust_fields.include?('profile_assessment_metadata')
         doc['langcode'] ||= []
         if record['record'].has_key?('lang_materials') and record['record']['lang_materials'].is_a?(Array)
           record['record']['lang_materials'].each { |langmaterial|

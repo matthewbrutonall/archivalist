@@ -512,5 +512,150 @@ describe "periodic indexer" do
       expect(unresolved_doc['owner_repo_display_string_u_ssort']).to eq('NATIVE-FETCHED-3')
       expect(unresolved_doc).not_to have_key('_archivalist_rust_fields')
     end
+
+    it "retains Rust container_profile, location_profile, and assessment fields and removes handoff metadata" do
+      container_profile = build(:json_container_profile,
+                                'uri' => '/container_profiles/3',
+                                'name' => 'Native Carton',
+                                'display_string' => 'Native Carton [1x2x3]',
+                                'width' => '1',
+                                'height' => '2',
+                                'depth' => '3',
+                                'dimension_units' => 'inches')
+      location_profile = build(:json_location_profile,
+                               'uri' => '/location_profiles/4',
+                               'name' => 'Native Shelf',
+                               'display_string' => 'Native Shelf [4x5x6]',
+                               'width' => '4',
+                               'height' => '5',
+                               'depth' => '6',
+                               'dimension_units' => 'centimeters')
+      assessment = JSONModel(:assessment).from_hash(
+        'uri' => '/repositories/2/assessments/42',
+        'display_string' => 'Native Assessment 42',
+        'records' => [
+          {
+            'ref' => '/repositories/2/resources/7',
+            '_resolved' => {'jsonmodel_type' => 'resource', 'title' => 'Native Resource'},
+          },
+        ],
+        'surveyed_by' => [
+          {'ref' => '/agents/people/1', '_resolved' => {'title' => 'Native Surveyor'}},
+        ],
+        'survey_begin' => '2024-01-01',
+        'survey_end' => '2025-01-01',
+        'review_required' => false,
+        'sensitive_material' => false,
+        'inactive' => false,
+        'reviewer' => [],
+        'collections' => [],
+        'formats' => [{'label' => 'Native Format', 'value' => 'true'}],
+        'ratings' => [{'label' => 'Native Rating', 'note' => 'Native note'}],
+        'conservation_issues' => [{'label' => 'Native Issue', 'value' => 'true'}]
+      )
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prepared, documents|
+          doc = indexer.native_index_document(
+            prepared[:uri], prepared[:record_type], prepared[:values]
+          )
+          doc['fullrecord_published'] = []
+          doc['fullrecord'] = []
+          doc['external_id'] = ['rust-ext']
+          doc['ancestors'] = []
+          doc['langcode'] = []
+          case prepared[:record_type]
+          when 'container_profile'
+            doc['title'] = 'Rust Carton Display'
+            doc['title_sort'] = 'Rust Carton Sort'
+            doc['display_string'] = 'Rust Carton Display'
+            doc['note'] = 'Rust profile note'
+            doc['container_profile_width_u_sstr'] = '10'
+            doc['container_profile_height_u_sstr'] = '12'
+            doc['container_profile_depth_u_sstr'] = '15'
+            doc['container_profile_dimension_units_u_sstr'] = 'inches'
+            doc['typeahead_sort_key_u_sort'] = 'Rust Carton Display'
+          when 'location_profile'
+            doc['title'] = 'Rust Shelf Display'
+            doc['title_sort'] = 'Rust Shelf Sort'
+            doc['display_string'] = 'Rust Shelf Display'
+            doc['location_profile_width_u_sstr'] = '120'
+            doc['location_profile_height_u_sstr'] = '40'
+            doc['location_profile_depth_u_sstr'] = '60'
+            doc['location_profile_dimension_units_u_sstr'] = 'centimeters'
+            doc['typeahead_sort_key_u_sort'] = 'Rust Shelf Display'
+          when 'assessment'
+            doc['assessment_id'] = 42
+            doc['title'] = 'Rust Assessment 42'
+            doc['display_string'] = 'Rust Assessment 42'
+            doc['assessment_record_uris'] = ['/repositories/2/resources/77']
+            doc['assessment_records'] = ['Rust Resource']
+            doc['assessment_record_types'] = ['resource']
+            doc['assessment_surveyor_uris'] = ['/agents/people/9']
+            doc['assessment_surveyors'] = ['Rust Surveyor']
+            doc['assessment_survey_begin'] = '2026-01-01T00:00:00Z'
+            doc['assessment_survey_end'] = '2026-12-31T00:00:00Z'
+            doc['assessment_review_required'] = true
+            doc['assessment_sensitive_material'] = true
+            doc['assessment_inactive'] = false
+            doc['assessment_reviewer_uris'] = ['/agents/people/10']
+            doc['assessment_reviewers'] = ['Rust Reviewer']
+            doc['assessment_survey_year'] = ['2026']
+            doc['assessment_collection_uris'] = ['/repositories/2/resources/77']
+            doc['assessment_collections'] = ['Rust Collection']
+            doc['assessment_completed'] = true
+            doc['assessment_formats'] = ['Rust Format']
+            doc['assessment_ratings'] = ['Rust Rating']
+            doc['assessment_conservation_issues'] = ['Rust Issue']
+            doc['title_sort'] = '0000000042'
+          end
+          doc['_archivalist_rust_fields'] = [
+            'common_metadata',
+            'fullrecord',
+            'profile_assessment_metadata',
+          ]
+          documents[prepared[:uri]] = doc
+        end
+      end
+
+      indexer.prepare_docs([container_profile, location_profile, assessment])
+      cp_doc = indexer.records.find {|d| d['primary_type'] == 'container_profile'}
+      lp_doc = indexer.records.find {|d| d['primary_type'] == 'location_profile'}
+      assess_doc = indexer.records.find {|d| d['primary_type'] == 'assessment'}
+
+      expect(cp_doc['title']).to eq('Rust Carton Display')
+      expect(cp_doc['title_sort']).to eq('Rust Carton Sort')
+      expect(cp_doc['note']).to eq('Rust profile note')
+      expect(cp_doc['container_profile_width_u_sstr']).to eq('10')
+      expect(cp_doc['container_profile_height_u_sstr']).to eq('12')
+      expect(cp_doc['container_profile_depth_u_sstr']).to eq('15')
+      expect(cp_doc['container_profile_dimension_units_u_sstr']).to eq('inches')
+      expect(cp_doc['typeahead_sort_key_u_sort']).to eq('Rust Carton Display')
+      expect(cp_doc['external_id']).to eq(['rust-ext'])
+      expect(cp_doc).not_to have_key('_archivalist_rust_fields')
+
+      expect(lp_doc['title']).to eq('Rust Shelf Display')
+      expect(lp_doc['title_sort']).to eq('Rust Shelf Sort')
+      expect(lp_doc['location_profile_width_u_sstr']).to eq('120')
+      expect(lp_doc['location_profile_height_u_sstr']).to eq('40')
+      expect(lp_doc['location_profile_depth_u_sstr']).to eq('60')
+      expect(lp_doc['location_profile_dimension_units_u_sstr']).to eq('centimeters')
+      expect(lp_doc['typeahead_sort_key_u_sort']).to eq('Rust Shelf Display')
+      expect(lp_doc['external_id']).to eq(['rust-ext'])
+      expect(lp_doc).not_to have_key('_archivalist_rust_fields')
+
+      expect(assess_doc['assessment_id']).to eq(42)
+      expect(assess_doc['title']).to eq('Rust Assessment 42')
+      expect(assess_doc['assessment_records']).to eq(['Rust Resource'])
+      expect(assess_doc['assessment_surveyors']).to eq(['Rust Surveyor'])
+      expect(assess_doc['assessment_reviewers']).to eq(['Rust Reviewer'])
+      expect(assess_doc['assessment_survey_year']).to eq(['2026'])
+      expect(assess_doc['assessment_formats']).to eq(['Rust Format'])
+      expect(assess_doc['assessment_ratings']).to eq(['Rust Rating'])
+      expect(assess_doc['assessment_conservation_issues']).to eq(['Rust Issue'])
+      expect(assess_doc['title_sort']).to eq('0000000042')
+      expect(assess_doc['external_id']).to eq(['rust-ext'])
+      expect(assess_doc).not_to have_key('_archivalist_rust_fields')
+    end
   end
 end
