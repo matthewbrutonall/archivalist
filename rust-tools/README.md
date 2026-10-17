@@ -108,15 +108,23 @@ non-production rollout, parity gate, outage fallback test, and rollback procedur
 The search, resource-tree, and index-document gates are automated by
 `scripts/canary_shadow_search.sh`, `scripts/canary_resource_tree.sh`, and
 `scripts/canary_index_document_builder.sh`. Staff-index enrichment parity is
-checked separately by `scripts/canary_index_document_enrichment.sh`; PUI
-full-record preparation, publication decisions, internal-note privacy
-filtering, and job-specific dynamic I18n translation, local timestamps, and
-output-file discovery intentionally remain native because inheritance,
-localization, and external I/O are handled by Ruby.
+checked at the resource level by `scripts/canary_index_document_enrichment.sh`,
+and across complete disposable-repository reindexes by the full STAFF index
+parity comparator, `scripts/compare_staff_index_parity.py`. PUI full-record
+preparation, publication decisions, internal-note privacy filtering, and
+job-specific dynamic I18n translation, local timestamps, and output-file
+discovery intentionally remain native because inheritance, localization, and
+external I/O are handled by Ruby.
 
 ## Test and benchmark helpers
 
-Scripts under `scripts/` are code-only harnesses. Helpers that query records require
-the caller to provide test-specific values through environment variables such as
-`RESOURCE_URI` and `QUERY`. Generated benchmark output belongs in the ignored
-`benchmarks/` directory and must not be committed.
+Scripts under `scripts/` are code-only harnesses:
+
+- `compare_staff_index_parity.py`: read-only Staff Solr collection comparator that
+  verifies full document and field parity, array ordering, and absence of private
+  handoff markers between native baseline and candidate reindexes.
+- Helpers that query records require the caller to provide test-specific values
+  through environment variables such as `RESOURCE_URI` and `QUERY`.
+
+Generated benchmark output belongs in the ignored `benchmarks/` directory and
+must not be committed.

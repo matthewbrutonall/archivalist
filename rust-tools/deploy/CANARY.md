@@ -195,9 +195,114 @@ accessions, digital objects and components, subjects, agents, classifications,
 repositories, events, locations, container profiles, location profiles,
 assessments, top containers, and jobs are covered.
 
-## Rollback
+## 7. Full STAFF index parity gate
 
-Set all sidecar enable flags, including `rust_index_document_builder_enabled`, to
-`false` and restart Archivalist. The sidecar
+This gate validates complete, stored Solr document parity between a native indexer
+and a Rust-enriched indexer across all record types for an entire disposable repository.
+
+> **CRITICAL SAFETY RULE**: Never point this workflow, any reindex command, or either
+> comparator URL at the primary production Solr collection (`archivesspace`). All
+> runs must use dedicated non-production collections or separate non-production Solr
+> instances. The comparator is strictly read-only: it will never trigger a reindex,
+> alter configuration, write to Solr, or touch production data.
+
+### Step A: Produce native baseline index in disposable collection 1
+
+Point a non-production indexer at a dedicated disposable collection, e.g.
+`archivesspace_native_test`, with all Rust index acceleration flags disabled:
+
+```ruby
+AppConfig[:solr_url] = "http://127.0.0.1:8985/solr/archivesspace_native_test"
+AppConfig[:rust_index_document_builder_enabled] = false
+AppConfig[:rust_index_document_enrichment_enabled] = false
+```
+
+Run a clean reindex of the designated disposable repository (e.g. `REPO_ID=2`). Wait
+for indexing and Solr commits to complete.
+
+### Step B: Produce Rust-enriched candidate index in disposable collection 2
+
+Verify the sidecar is healthy (`curl --fail http://127.0.0.1:4570/ready`). Point the
+non-production indexer at a second separate disposable collection, e.g.
+`archivesspace_rust_test`, with builder and enrichment enabled:
+
+```ruby
+AppConfig[:solr_url] = "http://127.0.0.1:8985/solr/archivesspace_rust_test"
+AppConfig[:rust_index_document_builder_enabled] = true
+AppConfig[:rust_index_document_builder_url] = "http://127.0.0.1:4570"
+AppConfig[:rust_index_document_builder_timeout_seconds] = 2
+AppConfig[:rust_index_document_builder_max_batch] = 1000
+AppConfig[:rust_index_document_enrichment_enabled] = true
+```
+
+Run a clean reindex of the same disposable repository (`REPO_ID=2`). Wait for
+indexing and Solr commits to complete.
+
+### Step C: Run the parity comparator
+
+Execute the read-only parity comparator comparing the two completed collections:
+
+```bash
+python3 scripts/compare_staff_index_parity.py \
+  --baseline-url http://127.0.0.1:8985/solr/archivesspace_native_test \
+  --candidate-url http://127.0.0.1:8985/solr/archivesspace_rust_test \
+  --repository 2
+```
+
+For automated pipeline checks, supply `--json` to produce machine-readable output:
+
+```bash
+python3 scripts/compare_staff_index_parity.py \
+  --baseline-url http://127.0.0.1:8985/solr/archivesspace_native_test \
+  --candidate-url http://127.0.0.1:8985/solr/archivesspace_rust_test \
+  --repository 2 \
+  --json
+```
+
+Acceptance requires:
+1. Exit code `0` (`OVERALL RESULT: PASS`).
+2. Exact document count match and zero missing IDs on either side.
+3. Zero missing fields and zero scalar or type differences.
+4. Zero array ordering discrepancies (ordering is strictly verified, not normalized away).
+5. Zero occurrences of the internal handoff field `_archivalist_rust_fields` anywhere.
+
+### Step D: Prove sidecar-outage fallback separately
+
+To prove that a sidecar failure during indexing falls back to native Ruby preparation
+without corruption:
+
+1. Stop only the non-production sidecar:
+   ```bash
+   sudo systemctl stop aspace-shadow-sidecar
+   ```
+2. Keep `rust_index_document_builder_enabled` and `rust_index_document_enrichment_enabled`
+   set to `true`, but point `AppConfig[:solr_url]` to a third non-production collection,
+   `archivesspace_fallback_test`:
+   ```ruby
+   AppConfig[:solr_url] = "http://127.0.0.1:8985/solr/archivesspace_fallback_test"
+   AppConfig[:rust_index_document_builder_enabled] = true
+   AppConfig[:rust_index_document_enrichment_enabled] = true
+   ```
+3. Reindex the disposable repository (`REPO_ID=2`). Verify the indexer logs fallback
+   warnings for unreachable sidecar endpoints and successfully completes using native
+   Ruby preparation.
+4. Compare the fallback collection to the native baseline:
+   ```bash
+   python3 scripts/compare_staff_index_parity.py \
+     --baseline-url http://127.0.0.1:8985/solr/archivesspace_native_test \
+     --candidate-url http://127.0.0.1:8985/solr/archivesspace_fallback_test \
+     --repository 2
+   ```
+   Acceptance requires exit code `0`, confirming complete fidelity with the baseline.
+5. Restart the sidecar and confirm readiness:
+   ```bash
+   sudo systemctl start aspace-shadow-sidecar
+   curl --fail http://127.0.0.1:4570/ready
+   ```
+
+## 8. Rollback
+
+Set all sidecar enable flags, including `rust_index_document_builder_enabled` and
+`rust_index_document_enrichment_enabled`, to `false` and restart Archivalist. The sidecar
 can then be stopped independently. Do not point the service at the primary Solr
-collection and do not enable these paths by default until the canary gates pass.
+collection and do not enable these paths by default until all canary gates pass.
