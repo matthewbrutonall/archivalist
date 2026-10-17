@@ -888,6 +888,146 @@ fn add_agent_fields(
     Ok(())
 }
 
+fn add_digital_object_component_fields(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let digital_object = record
+        .get("digital_object")
+        .and_then(Value::as_object)
+        .ok_or_else(|| error("field 'digital_object' must be an object"))?;
+    document.insert(
+        "digital_object".to_string(),
+        digital_object.get("ref").cloned().unwrap_or(Value::Null),
+    );
+    let identifier = record.get("component_id").cloned().unwrap_or(Value::Null);
+    document.insert("digital_object_id".to_string(), identifier.clone());
+    document.insert("identifier".to_string(), identifier);
+    for (document_field, record_field) in [
+        ("title", "display_string"),
+        ("slug", "slug"),
+        ("is_slug_auto", "is_slug_auto"),
+    ] {
+        document.insert(
+            document_field.to_string(),
+            record.get(record_field).cloned().unwrap_or(Value::Null),
+        );
+    }
+    Ok(())
+}
+
+fn classification_identifier_sort(identifier: &str) -> String {
+    let mut digit_start = identifier.len();
+    let mut digit_end = identifier.len();
+    for (index, character) in identifier.char_indices() {
+        if character.is_ascii_digit() {
+            digit_start = index;
+            digit_end = index;
+            break;
+        }
+    }
+    if digit_start < identifier.len() {
+        for (offset, character) in identifier[digit_start..].char_indices() {
+            if !character.is_ascii_digit() {
+                digit_end = digit_start + offset;
+                break;
+            }
+            digit_end = digit_start + offset + character.len_utf8();
+        }
+    }
+
+    let letters = identifier[..digit_start].trim();
+    let numbers = identifier[digit_start..digit_end].trim();
+    let rest = identifier[digit_end..].trim();
+    let letters = format!("{letters:<255}").replace(' ', "#");
+    let numbers = format!("{numbers:0>255}");
+    let rest = format!("{rest:<255}");
+    format!("{letters}{numbers}{rest}")
+}
+
+fn add_classification_fields(
+    document: &mut Map<String, Value>,
+    record_type: &str,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let path = record.get("path_from_root").cloned().unwrap_or(Value::Null);
+    document.insert(
+        "classification_path".to_string(),
+        Value::String(serde_json::to_string(&path).map_err(|source| {
+            error(format!("failed to serialize classification path: {source}"))
+        })?),
+    );
+
+    let mut agent_uris = Vec::new();
+    let mut published_agent_uris = Vec::new();
+    let mut agents = Vec::new();
+    for creator in wrapped_values(record.get("creator")) {
+        let creator = creator
+            .as_object()
+            .ok_or_else(|| error("field 'creator' must contain objects"))?;
+        let reference = creator.get("ref").cloned().unwrap_or(Value::Null);
+        agent_uris.push(reference.clone());
+        let resolved = creator
+            .get("_resolved")
+            .and_then(Value::as_object)
+            .ok_or_else(|| error("creator entries must contain _resolved"))?;
+        let sort_name = required_string(
+            resolved
+                .get("display_name")
+                .and_then(Value::as_object)
+                .and_then(|display_name| display_name.get("sort_name")),
+            "creator._resolved.display_name.sort_name",
+        )?;
+        agents.push(Value::String(sort_name.to_string()));
+        if ruby_truthy(resolved.get("publish")) && !reference.is_null() {
+            published_agent_uris.push(reference);
+        }
+    }
+    document.insert("agent_uris".to_string(), Value::Array(agent_uris));
+    document.insert(
+        "published_agent_uris".to_string(),
+        Value::Array(published_agent_uris),
+    );
+    document.insert("agents".to_string(), Value::Array(agents));
+
+    let identifier = required_string(record.get("identifier"), "identifier")?;
+    document.insert(
+        "identifier_sort".to_string(),
+        Value::String(classification_identifier_sort(identifier)),
+    );
+    let repo_sort = record
+        .get("repository")
+        .and_then(Value::as_object)
+        .and_then(|repository| repository.get("_resolved"))
+        .and_then(Value::as_object)
+        .and_then(|resolved| resolved.get("display_string"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    document.insert("repo_sort".to_string(), repo_sort);
+    for field in [
+        "has_classification_terms",
+        "slug",
+        "is_slug_auto",
+        "identifier",
+    ] {
+        document.insert(
+            field.to_string(),
+            record.get(field).cloned().unwrap_or(Value::Null),
+        );
+    }
+    if record_type == "classification_term" {
+        let classification = record
+            .get("classification")
+            .and_then(Value::as_object)
+            .ok_or_else(|| error("field 'classification' must be an object"))?;
+        document.insert(
+            "classification".to_string(),
+            classification.get("ref").cloned().unwrap_or(Value::Null),
+        );
+    }
+    Ok(())
+}
+
 fn add_type_specific_fields(
     document: &mut Map<String, Value>,
     record_type: &str,
@@ -1015,6 +1155,14 @@ fn add_type_specific_fields(
         "agent_person" | "agent_family" | "agent_software" | "agent_corporate_entity" => {
             add_agent_fields(document, record)?;
             markers.push(json_string("agent_subject_metadata"));
+        }
+        "digital_object_component" => {
+            add_digital_object_component_fields(document, record)?;
+            markers.push(json_string("component_classification_metadata"));
+        }
+        "classification" | "classification_term" => {
+            add_classification_fields(document, record_type, record)?;
+            markers.push(json_string("component_classification_metadata"));
         }
         _ => return Ok(markers),
     }
@@ -1708,6 +1856,102 @@ mod tests {
         assert_eq!(
             document["_archivalist_rust_fields"],
             json!(["common_metadata", "fullrecord", "agent_subject_metadata"])
+        );
+    }
+
+    #[test]
+    fn builds_digital_object_component_specific_staff_index_fields() {
+        let document = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/digital_object_components/4".to_string(),
+            record_type: "digital_object_component".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/digital_object_components/4",
+                "title": "Original title",
+                "display_string": "Chapter one",
+                "publish": true,
+                "component_id": "DOC-4",
+                "digital_object": {"ref": "/repositories/2/digital_objects/1"},
+                "slug": "chapter-one",
+                "is_slug_auto": true,
+                "external_ids": [{"external_id": "component-4"}],
+                "ancestors": [{"ref": "/repositories/2/digital_objects/1"}]
+            }),
+            enrich: true,
+        })
+        .unwrap();
+
+        assert_eq!(document["title"], "Chapter one");
+        assert_eq!(
+            document["digital_object"],
+            "/repositories/2/digital_objects/1"
+        );
+        assert_eq!(document["digital_object_id"], "DOC-4");
+        assert_eq!(document["identifier"], "DOC-4");
+        assert_eq!(document["external_id"], json!(["component-4"]));
+        assert_eq!(
+            document["_archivalist_rust_fields"],
+            json!([
+                "common_metadata",
+                "fullrecord",
+                "component_classification_metadata"
+            ])
+        );
+    }
+
+    #[test]
+    fn builds_classification_term_specific_staff_index_fields() {
+        let document = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/classification_terms/8".to_string(),
+            record_type: "classification_term".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/classification_terms/8",
+                "title": "Annual reports",
+                "publish": true,
+                "identifier": "RG123A",
+                "path_from_root": [{"identifier": "RG", "title": "Records"}],
+                "creator": {
+                    "ref": "/agents/corporate_entities/3",
+                    "_resolved": {
+                        "publish": true,
+                        "display_name": {"sort_name": "Example Organisation"}
+                    }
+                },
+                "repository": {"_resolved": {"display_string": "Example Archives"}},
+                "has_classification_terms": false,
+                "slug": "annual-reports",
+                "is_slug_auto": true,
+                "classification": {"ref": "/repositories/2/classifications/1"},
+                "external_ids": [],
+                "ancestors": [{"ref": "/repositories/2/classifications/1"}]
+            }),
+            enrich: true,
+        })
+        .unwrap();
+
+        let expected_letters = format!("{:<255}", "RG").replace(' ', "#");
+        let expected_numbers = format!("{:0>255}", "123");
+        let expected_rest = format!("{:<255}", "A");
+        let expected_sort = format!("{expected_letters}{expected_numbers}{expected_rest}");
+        assert_eq!(document["identifier_sort"], expected_sort);
+        assert_eq!(document["agents"], json!(["Example Organisation"]));
+        assert_eq!(
+            document["published_agent_uris"],
+            json!(["/agents/corporate_entities/3"])
+        );
+        assert_eq!(
+            document["classification"],
+            "/repositories/2/classifications/1"
+        );
+        assert_eq!(document["repo_sort"], "Example Archives");
+        assert_eq!(
+            document["_archivalist_rust_fields"],
+            json!([
+                "common_metadata",
+                "fullrecord",
+                "component_classification_metadata"
+            ])
         );
     }
 

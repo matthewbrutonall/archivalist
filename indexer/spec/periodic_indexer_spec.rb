@@ -308,5 +308,58 @@ describe "periodic indexer" do
       expect(doc['used_within_repository']).to eq(['/repositories/9'])
       expect(doc).not_to have_key('_archivalist_rust_fields')
     end
+
+    it "retains Rust classification fields and removes handoff metadata" do
+      classification = build(:json_classification,
+                             'uri' => '/repositories/2/classifications/9',
+                             'title' => 'Records groups',
+                             'identifier' => 'NATIVE-9',
+                             'path_from_root' => [],
+                             'creator' => nil,
+                             'repository' => {
+                               'ref' => '/repositories/2',
+                               '_resolved' => {'display_string' => 'Example Archives'},
+                             },
+                             'has_classification_terms' => false,
+                             'slug' => 'records-groups',
+                             'is_slug_auto' => true)
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prepared, documents|
+          doc = indexer.native_index_document(
+            prepared[:uri], prepared[:record_type], prepared[:values]
+          )
+          doc['fullrecord_published'] = []
+          doc['fullrecord'] = []
+          doc['classification_path'] = '[{"identifier":"RUST"}]'
+          doc['agent_uris'] = []
+          doc['published_agent_uris'] = []
+          doc['agents'] = []
+          doc['identifier_sort'] = 'rust-sort'
+          doc['repo_sort'] = 'Rust repository'
+          doc['has_classification_terms'] = false
+          doc['slug'] = 'rust-records-groups'
+          doc['is_slug_auto'] = true
+          doc['identifier'] = 'RUST-9'
+          doc['external_id'] = []
+          doc['ancestors'] = []
+          doc['langcode'] = []
+          doc['_archivalist_rust_fields'] = [
+            'common_metadata',
+            'fullrecord',
+            'component_classification_metadata',
+          ]
+          documents[prepared[:uri]] = doc
+        end
+      end
+
+      indexer.prepare_docs([classification])
+      doc = indexer.records.first
+      expect(doc['classification_path']).to eq('[{"identifier":"RUST"}]')
+      expect(doc['identifier_sort']).to eq('rust-sort')
+      expect(doc['repo_sort']).to eq('Rust repository')
+      expect(doc['identifier']).to eq('RUST-9')
+      expect(doc).not_to have_key('_archivalist_rust_fields')
+    end
   end
 end

@@ -207,4 +207,115 @@ describe RustIndexDocumentBuilder do
 
     expect(builder.build([agent])).to eq(agent['uri'] => document)
   end
+
+  it 'accepts enrichment for digital object components' do
+    component = {
+      'uri' => '/repositories/2/digital_object_components/4',
+      'record_type' => 'digital_object_component',
+      'repository' => 2,
+      'enrich' => true,
+      'record' => {
+        'uri' => '/repositories/2/digital_object_components/4',
+        'title' => 'Original title',
+        'display_string' => 'Chapter one',
+        'publish' => true,
+        'component_id' => 'DOC-4',
+        'digital_object' => {'ref' => '/repositories/2/digital_objects/1'},
+        'slug' => 'chapter-one',
+        'is_slug_auto' => true,
+      },
+    }
+    document = {
+      'id' => component['uri'],
+      'uri' => component['uri'],
+      'title' => 'Chapter one',
+      'primary_type' => 'digital_object_component',
+      'types' => ['digital_object_component'],
+      'json' => ASUtils.to_json(component['record']),
+      'suppressed' => false,
+      'publish' => true,
+      'system_generated' => 'false',
+      'repository' => 2,
+      'fullrecord_published' => [],
+      'fullrecord' => [],
+      'digital_object' => '/repositories/2/digital_objects/1',
+      'digital_object_id' => 'DOC-4',
+      'identifier' => 'DOC-4',
+      'slug' => 'chapter-one',
+      'is_slug_auto' => true,
+      'external_id' => [],
+      'ancestors' => [],
+      'langcode' => [],
+      '_archivalist_rust_fields' => [
+        'common_metadata',
+        'fullrecord',
+        'component_classification_metadata',
+      ],
+    }
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [document])
+    )
+
+    expect(builder.build([component])).to eq(component['uri'] => document)
+  end
+
+  it 'accepts enrichment for classifications' do
+    classification = {
+      'uri' => '/repositories/2/classifications/9',
+      'record_type' => 'classification',
+      'repository' => 2,
+      'enrich' => true,
+      'record' => {
+        'uri' => '/repositories/2/classifications/9',
+        'title' => 'Records groups',
+        'publish' => true,
+        'identifier' => 'RG9',
+        'path_from_root' => [],
+        'creator' => nil,
+        'repository' => {'_resolved' => {'display_string' => 'Example Archives'}},
+        'has_classification_terms' => false,
+        'slug' => 'records-groups',
+        'is_slug_auto' => true,
+      },
+    }
+    document = {
+      'id' => classification['uri'],
+      'uri' => classification['uri'],
+      'title' => 'Records groups',
+      'primary_type' => 'classification',
+      'types' => ['classification'],
+      'json' => ASUtils.to_json(classification['record']),
+      'suppressed' => false,
+      'publish' => true,
+      'system_generated' => 'false',
+      'repository' => 2,
+      'fullrecord_published' => [],
+      'fullrecord' => [],
+      'classification_path' => '[]',
+      'agent_uris' => [],
+      'published_agent_uris' => [],
+      'agents' => [],
+      'identifier_sort' => 'rust-sort',
+      'repo_sort' => 'Example Archives',
+      'has_classification_terms' => false,
+      'slug' => 'records-groups',
+      'is_slug_auto' => true,
+      'identifier' => 'RG9',
+      'external_id' => [],
+      'ancestors' => [],
+      'langcode' => [],
+      '_archivalist_rust_fields' => [
+        'common_metadata',
+        'fullrecord',
+        'component_classification_metadata',
+      ],
+    }
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [document])
+    )
+
+    expect(builder.build([classification])).to eq(classification['uri'] => document)
+  end
 end

@@ -38,6 +38,8 @@ class RustIndexDocumentBuilder
       raise "response id mismatch for #{uri}" unless document['id'] == uri
       expected_title = if ['archival_object', 'accession'].include?(record_type)
                          record['display_string']
+                       elsif record_type == 'digital_object_component'
+                         record['display_string']
                        elsif agent_types.include?(record_type)
                          record.dig('display_name', 'sort_name')
                        else
@@ -66,6 +68,8 @@ class RustIndexDocumentBuilder
           expected_fields << 'accession_digital_object_metadata'
         elsif record_type == 'subject' || agent_types.include?(record_type)
           expected_fields << 'agent_subject_metadata'
+        elsif ['digital_object_component', 'classification', 'classification_term'].include?(record_type)
+          expected_fields << 'component_classification_metadata'
         end
         unless document['_archivalist_rust_fields'] == expected_fields
           raise "response enrichment marker mismatch for #{uri}"
@@ -135,6 +139,19 @@ class RustIndexDocumentBuilder
           required.concat(['authority_id', 'source']) if primary_identifier || authorized_name
           first_convention = Array(record['agent_conventions_declarations']).first
           required << 'rules' if first_convention&.[]('name_rule') || authorized_name
+        elsif record_type == 'digital_object_component'
+          required.concat([
+                            'digital_object', 'digital_object_id', 'identifier', 'title',
+                            'slug', 'is_slug_auto', 'external_id', 'ancestors', 'langcode'
+                          ])
+        elsif ['classification', 'classification_term'].include?(record_type)
+          required.concat([
+                            'classification_path', 'agent_uris', 'published_agent_uris',
+                            'agents', 'identifier_sort', 'repo_sort',
+                            'has_classification_terms', 'slug', 'is_slug_auto',
+                            'identifier', 'external_id', 'ancestors', 'langcode'
+                          ])
+          required << 'classification' if record_type == 'classification_term'
         end
         if record_type == 'subject' || agent_types.include?(record_type)
           if record.has_key?('used_within_repositories')
