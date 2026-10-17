@@ -34,17 +34,27 @@ class RustIndexDocumentBuilder
       input = expected[uri]
       record_type = input['record_type']
       record = input['record']
+      agent_types = ['agent_person', 'agent_family', 'agent_software', 'agent_corporate_entity']
       raise "response id mismatch for #{uri}" unless document['id'] == uri
-      expected_title = ['archival_object', 'accession'].include?(record_type) ? record['display_string'] : record['title']
+      expected_title = if ['archival_object', 'accession'].include?(record_type)
+                         record['display_string']
+                       elsif agent_types.include?(record_type)
+                         record.dig('display_name', 'sort_name')
+                       else
+                         record['title']
+                       end
       raise "response title mismatch for #{uri}" unless document['title'] == expected_title
       raise "response record type mismatch for #{uri}" unless document['primary_type'] == record_type
-      raise "response types mismatch for #{uri}" unless document['types'] == [record_type]
+      expected_types = [record_type]
+      expected_types << 'agent_with_user' if agent_types.include?(record_type) && record['is_user']
+      expected_types << 'agent' if agent_types.include?(record_type)
+      raise "response types mismatch for #{uri}" unless document['types'] == expected_types
       raise "response repository mismatch for #{uri}" unless document['repository'] == input['repository']
       raise "response JSON missing for #{uri}" unless document['json'].is_a?(String)
       raise "response JSON mismatch for #{uri}" unless ASUtils.json_parse(document['json']) == record
       expected_suppressed = record.has_key?('suppressed') && record['suppressed']
       raise "response suppression mismatch for #{uri}" unless document['suppressed'] == expected_suppressed
-      expected_publish = expected_publish(record, expected_suppressed)
+      expected_publish = expected_publish(record_type, record, expected_suppressed)
       raise "response publication mismatch for #{uri}" unless document['publish'] == expected_publish
       expected_generated = record.has_key?('system_generated') ? record['system_generated'].to_s : 'false'
       raise "response system-generated mismatch for #{uri}" unless document['system_generated'] == expected_generated
@@ -54,6 +64,8 @@ class RustIndexDocumentBuilder
           expected_fields << 'resource_archival_object_metadata'
         elsif ['accession', 'digital_object'].include?(record_type)
           expected_fields << 'accession_digital_object_metadata'
+        elsif record_type == 'subject' || agent_types.include?(record_type)
+          expected_fields << 'agent_subject_metadata'
         end
         unless document['_archivalist_rust_fields'] == expected_fields
           raise "response enrichment marker mismatch for #{uri}"
@@ -105,6 +117,29 @@ class RustIndexDocumentBuilder
                             'restrictions', 'slug', 'is_slug_auto', 'collection_uri_u_sstr',
                             'linked_instance_uris', 'external_id', 'ancestors', 'langcode'
                           ])
+        elsif record_type == 'subject'
+          required.concat([
+                            'source', 'first_term_type', 'slug', 'is_slug_auto',
+                            'external_id', 'ancestors', 'langcode'
+                          ])
+        elsif agent_types.include?(record_type)
+          required.concat([
+                            'title', 'linked_agent_roles', 'related_agent_uris', 'slug',
+                            'is_slug_auto', 'is_user', 'subjects', 'subject_uris',
+                            'external_id', 'ancestors', 'langcode'
+                          ])
+          authorized_name = Array(record['names']).find {|name| name['authorized'] }
+          primary_identifier = Array(record['agent_record_identifiers']).find do |identifier|
+            identifier['primary_identifier'] == true
+          end
+          required.concat(['authority_id', 'source']) if primary_identifier || authorized_name
+          first_convention = Array(record['agent_conventions_declarations']).first
+          required << 'rules' if first_convention&.[]('name_rule') || authorized_name
+        end
+        if record_type == 'subject' || agent_types.include?(record_type)
+          if record.has_key?('used_within_repositories')
+            required.concat(['used_within_repository', 'used_within_published_repository'])
+          end
         end
         if ['resource', 'archival_object', 'accession', 'digital_object'].include?(record_type)
           if ['resource', 'accession', 'digital_object'].include?(record_type) &&
@@ -143,7 +178,10 @@ class RustIndexDocumentBuilder
 
   private
 
-  def expected_publish(record, suppressed)
+  def expected_publish(record_type, record, suppressed)
+    if record_type == 'subject'
+      return !!record['publish'] && !!record['is_linked_to_published_record']
+    end
     return false if suppressed
     return false if record.dig('repository', '_resolved', 'publish') == false
     return false if record['has_unpublished_ancestor']

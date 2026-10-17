@@ -160,13 +160,15 @@ metadata, classifications, instances, containers, ancestors, linked rights agent
 and language codes now prepared by Rust. The private handoff marker includes
 `resource_archival_object_metadata` for resources and archival objects and is
 joined by `accession_digital_object_metadata` for accessions and digital objects.
-Accession date localization remains native. Both markers are removed before Solr
-and plugin hooks. It accounts for Solr's intentional copy-field
+Subject and agent authority mappings use `agent_subject_metadata`, including
+authority identifiers, rules, repository usage, related agents, and nested
+subject/place terms. Accession date localization remains native. All markers are
+removed before Solr and plugin hooks. It accounts for Solr's intentional copy-field
 merge of `notes_published` into `notes`. Only after this passes should
 `rust_index_document_enrichment_enabled` be set to `true`. The enrichment gate is
 staff-index only; PUI full-record extraction remains native after inheritance and
 privacy filtering. Before rollout, also require a complete native-versus-Rust
-reindex comparison so accession and digital-object documents are covered.
+reindex comparison so accessions, digital objects, subjects, and agents are covered.
 
 ## Rollback
 

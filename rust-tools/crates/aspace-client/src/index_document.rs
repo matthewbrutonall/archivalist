@@ -675,6 +675,219 @@ fn add_collection_management_fields(
     }
 }
 
+fn ruby_truthy(value: Option<&Value>) -> bool {
+    !matches!(value, None | Some(Value::Null) | Some(Value::Bool(false)))
+}
+
+fn add_used_within_fields(document: &mut Map<String, Value>, record: &Map<String, Value>) {
+    if record.contains_key("used_within_repositories") {
+        document.insert(
+            "used_within_repository".to_string(),
+            record
+                .get("used_within_repositories")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+        document.insert(
+            "used_within_published_repository".to_string(),
+            record
+                .get("used_within_published_repositories")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+    }
+}
+
+fn add_agent_subject_links(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let mut subjects = document
+        .remove("subjects")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+    let mut subject_uris = document
+        .remove("subject_uris")
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default();
+
+    for (subrecord_field, link_field) in [
+        ("agent_functions", "subjects"),
+        ("agent_occupations", "subjects"),
+        ("agent_places", "subjects"),
+        ("agent_topics", "subjects"),
+        ("agent_functions", "places"),
+        ("agent_occupations", "places"),
+        ("agent_resources", "places"),
+        ("agent_topics", "places"),
+    ] {
+        for subrecord in wrapped_values(record.get(subrecord_field)) {
+            let subrecord = subrecord
+                .as_object()
+                .ok_or_else(|| error(format!("{subrecord_field} entries must be objects")))?;
+            let Some(links) = subrecord.get(link_field) else {
+                continue;
+            };
+            let links = links
+                .as_array()
+                .ok_or_else(|| error(format!("{subrecord_field}.{link_field} must be an array")))?;
+            for link in links {
+                let link = link.as_object().ok_or_else(|| {
+                    error(format!(
+                        "{subrecord_field}.{link_field} entries must be objects"
+                    ))
+                })?;
+                if let Some(title) = link
+                    .get("_resolved")
+                    .and_then(Value::as_object)
+                    .and_then(|resolved| resolved.get("title"))
+                    .filter(|title| !title.is_null())
+                {
+                    subjects.push(title.clone());
+                }
+                subject_uris.push(link.get("ref").cloned().unwrap_or(Value::Null));
+            }
+        }
+    }
+
+    document.insert("subjects".to_string(), Value::Array(subjects));
+    document.insert("subject_uris".to_string(), Value::Array(subject_uris));
+    Ok(())
+}
+
+fn add_subject_fields(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let terms = record
+        .get("terms")
+        .and_then(Value::as_array)
+        .ok_or_else(|| error("field 'terms' must be an array"))?;
+    let first_term = terms
+        .first()
+        .and_then(Value::as_object)
+        .ok_or_else(|| error("field 'terms' must contain an object"))?;
+    for field in ["source", "slug", "is_slug_auto"] {
+        document.insert(
+            field.to_string(),
+            record.get(field).cloned().unwrap_or(Value::Null),
+        );
+    }
+    document.insert(
+        "first_term_type".to_string(),
+        first_term.get("term_type").cloned().unwrap_or(Value::Null),
+    );
+    document.insert(
+        "publish".to_string(),
+        Value::Bool(
+            ruby_truthy(record.get("publish"))
+                && ruby_truthy(record.get("is_linked_to_published_record")),
+        ),
+    );
+    add_used_within_fields(document, record);
+    Ok(())
+}
+
+fn add_agent_fields(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let display_name = record
+        .get("display_name")
+        .and_then(Value::as_object)
+        .ok_or_else(|| error("field 'display_name' must be an object"))?;
+    document.insert(
+        "title".to_string(),
+        Value::String(
+            required_string(display_name.get("sort_name"), "display_name.sort_name")?.to_string(),
+        ),
+    );
+
+    let names = record
+        .get("names")
+        .and_then(Value::as_array)
+        .ok_or_else(|| error("field 'names' must be an array"))?;
+    let authorized_name = names
+        .iter()
+        .filter_map(Value::as_object)
+        .find(|name| ruby_truthy(name.get("authorized")));
+    let record_identifiers = record
+        .get("agent_record_identifiers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| error("field 'agent_record_identifiers' must be an array"))?;
+    let primary_identifier = record_identifiers
+        .iter()
+        .filter_map(Value::as_object)
+        .find(|identifier| identifier.get("primary_identifier") == Some(&Value::Bool(true)));
+
+    if let Some(identifier) = primary_identifier {
+        document.insert(
+            "authority_id".to_string(),
+            identifier
+                .get("record_identifier")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+        document.insert(
+            "source".to_string(),
+            identifier.get("source").cloned().unwrap_or(Value::Null),
+        );
+    } else if let Some(name) = authorized_name {
+        document.insert(
+            "authority_id".to_string(),
+            name.get("authority_id").cloned().unwrap_or(Value::Null),
+        );
+        document.insert(
+            "source".to_string(),
+            name.get("source").cloned().unwrap_or(Value::Null),
+        );
+    }
+
+    let conventions = record
+        .get("agent_conventions_declarations")
+        .and_then(Value::as_array)
+        .ok_or_else(|| error("field 'agent_conventions_declarations' must be an array"))?;
+    if let Some(rule) = conventions
+        .first()
+        .and_then(Value::as_object)
+        .and_then(|declaration| declaration.get("name_rule"))
+        .filter(|rule| ruby_truthy(Some(rule)))
+    {
+        document.insert("rules".to_string(), rule.clone());
+    } else if let Some(name) = authorized_name {
+        document.insert(
+            "rules".to_string(),
+            name.get("rules").cloned().unwrap_or(Value::Null),
+        );
+    }
+
+    for field in ["linked_agent_roles", "slug", "is_slug_auto"] {
+        document.insert(
+            field.to_string(),
+            record.get(field).cloned().unwrap_or(Value::Null),
+        );
+    }
+    document.insert(
+        "related_agent_uris".to_string(),
+        Value::Array(related_uris(record, "related_agents", false, false)?),
+    );
+
+    let is_user = ruby_truthy(record.get("is_user"));
+    document.insert("is_user".to_string(), Value::Bool(is_user));
+    let types = document
+        .get_mut("types")
+        .and_then(Value::as_array_mut)
+        .expect("types is initialized as an array");
+    if is_user {
+        types.push(json_string("agent_with_user"));
+    }
+    types.push(json_string("agent"));
+
+    add_agent_subject_links(document, record)?;
+    add_used_within_fields(document, record);
+    Ok(())
+}
+
 fn add_type_specific_fields(
     document: &mut Map<String, Value>,
     record_type: &str,
@@ -794,6 +1007,14 @@ fn add_type_specific_fields(
                 Value::Array(related_uris(record, "linked_instances", true, true)?),
             );
             markers.push(json_string("accession_digital_object_metadata"));
+        }
+        "subject" => {
+            add_subject_fields(document, record)?;
+            markers.push(json_string("agent_subject_metadata"));
+        }
+        "agent_person" | "agent_family" | "agent_software" | "agent_corporate_entity" => {
+            add_agent_fields(document, record)?;
+            markers.push(json_string("agent_subject_metadata"));
         }
         _ => return Ok(markers),
     }
@@ -1376,6 +1597,117 @@ mod tests {
                 "fullrecord",
                 "accession_digital_object_metadata"
             ])
+        );
+    }
+
+    #[test]
+    fn builds_subject_specific_staff_index_fields() {
+        let document = build_index_document(IndexDocumentInput {
+            uri: "/subjects/12".to_string(),
+            record_type: "subject".to_string(),
+            repository: Value::Null,
+            record: json!({
+                "uri": "/subjects/12",
+                "title": "Monastic archives",
+                "publish": true,
+                "is_linked_to_published_record": true,
+                "source": "local",
+                "terms": [{"term": "Monastic archives", "term_type": "topical"}],
+                "slug": "monastic-archives",
+                "is_slug_auto": true,
+                "used_within_repositories": ["/repositories/2"],
+                "used_within_published_repositories": ["/repositories/2"],
+                "external_ids": [{"external_id": "subject-12"}]
+            }),
+            enrich: true,
+        })
+        .unwrap();
+
+        assert_eq!(document["source"], "local");
+        assert_eq!(document["first_term_type"], "topical");
+        assert_eq!(document["publish"], true);
+        assert_eq!(
+            document["used_within_repository"],
+            json!(["/repositories/2"])
+        );
+        assert_eq!(document["external_id"], json!(["subject-12"]));
+        assert_eq!(
+            document["_archivalist_rust_fields"],
+            json!(["common_metadata", "fullrecord", "agent_subject_metadata"])
+        );
+    }
+
+    #[test]
+    fn builds_agent_specific_staff_index_fields() {
+        let document = build_index_document(IndexDocumentInput {
+            uri: "/agents/people/9".to_string(),
+            record_type: "agent_person".to_string(),
+            repository: Value::Null,
+            record: json!({
+                "uri": "/agents/people/9",
+                "title": "Original agent title",
+                "publish": true,
+                "display_name": {"sort_name": "O'Connor, Maeve"},
+                "names": [{
+                    "authorized": true,
+                    "authority_id": "name-authority",
+                    "source": "local",
+                    "rules": "local"
+                }],
+                "agent_record_identifiers": [{
+                    "primary_identifier": true,
+                    "record_identifier": "IE-AUTH-9",
+                    "source": "naf"
+                }],
+                "agent_conventions_declarations": [{"name_rule": "rda"}],
+                "linked_agent_roles": ["creator", "subject"],
+                "related_agents": [{"ref": "/agents/families/3"}],
+                "slug": "oconnor-maeve",
+                "is_slug_auto": false,
+                "is_user": true,
+                "agent_functions": [{
+                    "subjects": [{
+                        "ref": "/subjects/1",
+                        "_resolved": {"title": "Archives"}
+                    }],
+                    "places": [{
+                        "ref": "/subjects/2",
+                        "_resolved": {"title": "Ireland"}
+                    }]
+                }],
+                "agent_occupations": [],
+                "agent_places": [],
+                "agent_topics": [],
+                "agent_resources": [],
+                "used_within_repositories": ["/repositories/2"],
+                "used_within_published_repositories": ["/repositories/2"],
+                "external_ids": []
+            }),
+            enrich: true,
+        })
+        .unwrap();
+
+        assert_eq!(document["title"], "O'Connor, Maeve");
+        assert_eq!(document["authority_id"], "IE-AUTH-9");
+        assert_eq!(document["source"], "naf");
+        assert_eq!(document["rules"], "rda");
+        assert_eq!(
+            document["related_agent_uris"],
+            json!(["/agents/families/3"])
+        );
+        assert_eq!(document["is_user"], true);
+        assert_eq!(
+            document["types"],
+            json!(["agent_person", "agent_with_user", "agent"])
+        );
+        assert_eq!(document["subjects"], json!(["Archives", "Ireland"]));
+        assert_eq!(
+            document["subject_uris"],
+            json!(["/subjects/1", "/subjects/2"])
+        );
+        assert_eq!(
+            document["_archivalist_rust_fields"],
+            json!(["common_metadata", "fullrecord", "agent_subject_metadata"])
         );
     }
 

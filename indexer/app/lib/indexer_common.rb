@@ -472,7 +472,8 @@ class IndexerCommon
     }
 
     add_document_prepare_hook {|doc, record|
-      if doc['primary_type'] == 'subject'
+      rust_fields = Array(doc['_archivalist_rust_fields'])
+      if doc['primary_type'] == 'subject' && !rust_fields.include?('agent_subject_metadata')
         doc['source'] = record['record']['source']
         doc['first_term_type'] = record['record']['terms'][0]['term_type']
         doc['publish'] = record['record']['publish'] && record['record']['is_linked_to_published_record']
@@ -482,7 +483,9 @@ class IndexerCommon
     }
 
     add_document_prepare_hook {|doc, record|
-      if record['record'].has_key?('used_within_repositories')
+      rust_fields = Array(doc['_archivalist_rust_fields'])
+      if record['record'].has_key?('used_within_repositories') &&
+         !rust_fields.include?('agent_subject_metadata')
         doc['used_within_repository'] = record['record']['used_within_repositories']
         doc['used_within_published_repository'] = record['record']['used_within_published_repositories']
       end
@@ -608,7 +611,9 @@ class IndexerCommon
     }
 
     add_document_prepare_hook {|doc, record|
-      if ['agent_person', 'agent_family', 'agent_software', 'agent_corporate_entity'].include?(doc['primary_type'])
+      rust_fields = Array(doc['_archivalist_rust_fields'])
+      if ['agent_person', 'agent_family', 'agent_software', 'agent_corporate_entity'].include?(doc['primary_type']) &&
+         !rust_fields.include?('agent_subject_metadata')
         record['record'].reject! { |rec| rec === 'agent_contacts' }
         doc['title'] = record['record']['display_name']['sort_name']
 
@@ -678,7 +683,8 @@ class IndexerCommon
     add_document_prepare_hook {|doc, record|
       rust_fields = Array(doc['_archivalist_rust_fields'])
       unless rust_fields.include?('resource_archival_object_metadata') ||
-             rust_fields.include?('accession_digital_object_metadata')
+             rust_fields.include?('accession_digital_object_metadata') ||
+             rust_fields.include?('agent_subject_metadata')
         doc['external_id'] = Array(record['record']['external_ids']).map do |eid|
           eid['external_id']
         end
@@ -784,7 +790,8 @@ class IndexerCommon
     add_document_prepare_hook {|doc, record|
       rust_fields = Array(doc['_archivalist_rust_fields'])
       unless rust_fields.include?('resource_archival_object_metadata') ||
-             rust_fields.include?('accession_digital_object_metadata')
+             rust_fields.include?('accession_digital_object_metadata') ||
+             rust_fields.include?('agent_subject_metadata')
         four_part_id = (0..3).map {|n| record['record']["id_#{n}"]}.compact.join(" ")
 
         unless four_part_id.empty?
@@ -949,7 +956,8 @@ class IndexerCommon
     add_document_prepare_hook {|doc, record|
       rust_fields = Array(doc['_archivalist_rust_fields'])
       unless rust_fields.include?('resource_archival_object_metadata') ||
-             rust_fields.include?('accession_digital_object_metadata')
+             rust_fields.include?('accession_digital_object_metadata') ||
+             rust_fields.include?('agent_subject_metadata')
         doc['ancestors'] = ASUtils.wrap(record['record']['ancestors']).map {|ancestor|
           ancestor.fetch('ref')
         }
@@ -959,7 +967,8 @@ class IndexerCommon
     add_document_prepare_hook {|doc, record|
       rust_fields = Array(doc['_archivalist_rust_fields'])
       unless rust_fields.include?('resource_archival_object_metadata') ||
-             rust_fields.include?('accession_digital_object_metadata')
+             rust_fields.include?('accession_digital_object_metadata') ||
+             rust_fields.include?('agent_subject_metadata')
         ASUtils.wrap(record['record']['rights_statements']).each do |rights_statement|
           ASUtils.wrap(rights_statement['linked_agents']).each do |agent_link|
             doc['rights_statement_agent_uris'] ||= []
@@ -1047,7 +1056,8 @@ class IndexerCommon
     add_document_prepare_hook {|doc, record|
       rust_fields = Array(doc['_archivalist_rust_fields'])
       unless rust_fields.include?('resource_archival_object_metadata') ||
-             rust_fields.include?('accession_digital_object_metadata')
+             rust_fields.include?('accession_digital_object_metadata') ||
+             rust_fields.include?('agent_subject_metadata')
         doc['langcode'] ||= []
         if record['record'].has_key?('lang_materials') and record['record']['lang_materials'].is_a?(Array)
           record['record']['lang_materials'].each { |langmaterial|

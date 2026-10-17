@@ -264,5 +264,49 @@ describe "periodic indexer" do
       expect(doc['accession_date_year']).to eq(2026)
       expect(doc).not_to have_key('_archivalist_rust_fields')
     end
+
+    it "retains Rust subject authority fields and removes handoff metadata" do
+      subject = build(:json_subject,
+                      'uri' => '/subjects/88',
+                      'title' => 'Monastic archives',
+                      'publish' => true,
+                      'is_linked_to_published_record' => true,
+                      'source' => 'local',
+                      'terms' => [{'term' => 'Monastic archives', 'term_type' => 'topical'}],
+                      'vocabulary' => '/vocabularies/1',
+                      'used_within_repositories' => ['/repositories/2'],
+                      'used_within_published_repositories' => ['/repositories/2'])
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prepared, documents|
+          doc = indexer.native_index_document(
+            prepared[:uri], prepared[:record_type], prepared[:values]
+          )
+          doc['fullrecord_published'] = []
+          doc['fullrecord'] = []
+          doc['source'] = 'rust-authority-source'
+          doc['first_term_type'] = 'rust-topical'
+          doc['publish'] = false
+          doc['used_within_repository'] = ['/repositories/9']
+          doc['external_id'] = []
+          doc['ancestors'] = []
+          doc['langcode'] = []
+          doc['_archivalist_rust_fields'] = [
+            'common_metadata',
+            'fullrecord',
+            'agent_subject_metadata',
+          ]
+          documents[prepared[:uri]] = doc
+        end
+      end
+
+      indexer.prepare_docs([subject])
+      doc = indexer.records.first
+      expect(doc['source']).to eq('rust-authority-source')
+      expect(doc['first_term_type']).to eq('rust-topical')
+      expect(doc['publish']).to be_falsey
+      expect(doc['used_within_repository']).to eq(['/repositories/9'])
+      expect(doc).not_to have_key('_archivalist_rust_fields')
+    end
   end
 end

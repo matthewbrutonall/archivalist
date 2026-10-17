@@ -149,4 +149,62 @@ describe RustIndexDocumentBuilder do
 
     expect(builder.build([accession])).to eq(accession['uri'] => document)
   end
+
+  it 'accepts authority enrichment for agents' do
+    agent = {
+      'uri' => '/agents/people/9',
+      'record_type' => 'agent_person',
+      'repository' => nil,
+      'enrich' => true,
+      'record' => {
+        'uri' => '/agents/people/9',
+        'title' => 'Original title',
+        'publish' => true,
+        'display_name' => {'sort_name' => "O'Connor, Maeve"},
+        'names' => [],
+        'agent_record_identifiers' => [],
+        'agent_conventions_declarations' => [],
+        'linked_agent_roles' => ['creator'],
+        'related_agents' => [],
+        'slug' => 'oconnor-maeve',
+        'is_slug_auto' => true,
+        'is_user' => false,
+      },
+    }
+    document = {
+      'id' => agent['uri'],
+      'uri' => agent['uri'],
+      'title' => "O'Connor, Maeve",
+      'primary_type' => 'agent_person',
+      'types' => ['agent_person', 'agent'],
+      'json' => ASUtils.to_json(agent['record']),
+      'suppressed' => false,
+      'publish' => true,
+      'system_generated' => 'false',
+      'repository' => nil,
+      'fullrecord_published' => [],
+      'fullrecord' => [],
+      'linked_agent_roles' => ['creator'],
+      'related_agent_uris' => [],
+      'slug' => 'oconnor-maeve',
+      'is_slug_auto' => true,
+      'is_user' => false,
+      'subjects' => [],
+      'subject_uris' => [],
+      'external_id' => [],
+      'ancestors' => [],
+      'langcode' => [],
+      '_archivalist_rust_fields' => [
+        'common_metadata',
+        'fullrecord',
+        'agent_subject_metadata',
+      ],
+    }
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [document])
+    )
+
+    expect(builder.build([agent])).to eq(agent['uri'] => document)
+  end
 end
