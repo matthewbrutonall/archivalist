@@ -48,6 +48,8 @@ class RustIndexDocumentBuilder
                          input['enrich'] ? record['event_type'] : record['title']
                        elsif ['container_profile', 'location_profile', 'assessment'].include?(record_type)
                          input['enrich'] ? record['display_string'] : record['title']
+                       elsif record_type == 'top_container'
+                         input['enrich'] ? record['long_display_string'] : record['title']
                        else
                          record['title']
                        end
@@ -81,6 +83,8 @@ class RustIndexDocumentBuilder
           expected_fields << 'repository_event_location_metadata'
         elsif ['container_profile', 'location_profile', 'assessment'].include?(record_type)
           expected_fields << 'profile_assessment_metadata'
+        elsif record_type == 'top_container'
+          expected_fields << 'top_container_metadata'
         end
         unless document['_archivalist_rust_fields'] == expected_fields
           raise "response enrichment marker mismatch for #{uri}"
@@ -236,6 +240,50 @@ class RustIndexDocumentBuilder
           unless reviewers.empty?
             required.concat(['assessment_reviewer_uris', 'assessment_reviewers'])
           end
+        elsif record_type == 'top_container'
+          required.concat([
+                            'title', 'display_string', 'type_u_ssort', 'notes',
+                            'has_location_u_sbool', 'exported_u_sbool', 'empty_u_sbool',
+                            'top_container_u_typeahead_utext', 'top_container_u_icusort',
+                            'barcode_u_sstr', 'barcode_u_icusort', 'ils_holding_id_u_sstr',
+                            'subcontainer_barcodes_u_sstr', 'created_for_collection_u_sstr',
+                            'external_id', 'ancestors', 'langcode'
+                          ])
+          if record['series']
+            required.concat([
+                              'series_uri_u_sstr', 'series_title_u_sstr',
+                              'series_level_u_sstr', 'series_identifier_stored_u_sstr',
+                              'series_identifier_u_stext'
+                            ])
+            if Array(record['series']).any? {|series| series.is_a?(Hash) && series['publish']}
+              required.concat([
+                                'published_series_uri_u_sstr',
+                                'published_series_title_u_sstr'
+                              ])
+            end
+          end
+          if record['collection']
+            required.concat([
+                              'collection_uri_u_sstr',
+                              'collection_display_string_u_sstr',
+                              'collection_identifier_stored_u_sstr',
+                              'collection_identifier_u_stext'
+                            ])
+          end
+          if record['container_profile']
+            required.concat([
+                              'container_profile_uri_u_sstr',
+                              'container_profile_display_string_u_sstr'
+                            ])
+          end
+          unless Array(record['container_locations']).empty?
+            required.concat([
+                              'location_uri_u_sstr', 'location_uris',
+                              'location_display_string_u_sstr',
+                              'location_profile_display_string_u_sstr'
+                            ])
+          end
+          required << 'indicator_u_icusort' if record['indicator']
         end
         if record_type == 'subject' || agent_types.include?(record_type)
           if record.has_key?('used_within_repositories')

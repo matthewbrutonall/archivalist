@@ -700,7 +700,8 @@ class IndexerCommon
              rust_fields.include?('agent_subject_metadata') ||
              rust_fields.include?('component_classification_metadata') ||
              rust_fields.include?('repository_event_location_metadata') ||
-             rust_fields.include?('profile_assessment_metadata')
+             rust_fields.include?('profile_assessment_metadata') ||
+             rust_fields.include?('top_container_metadata')
         doc['external_id'] = Array(record['record']['external_ids']).map do |eid|
           eid['external_id']
         end
@@ -814,7 +815,8 @@ class IndexerCommon
              rust_fields.include?('agent_subject_metadata') ||
              rust_fields.include?('component_classification_metadata') ||
              rust_fields.include?('repository_event_location_metadata') ||
-             rust_fields.include?('profile_assessment_metadata')
+             rust_fields.include?('profile_assessment_metadata') ||
+             rust_fields.include?('top_container_metadata')
         four_part_id = (0..3).map {|n| record['record']["id_#{n}"]}.compact.join(" ")
 
         unless four_part_id.empty?
@@ -825,7 +827,9 @@ class IndexerCommon
 
 
     add_document_prepare_hook {|doc, record|
-      if record['record']['jsonmodel_type'] == 'top_container'
+      rust_fields = Array(doc['_archivalist_rust_fields'])
+      if record['record']['jsonmodel_type'] == 'top_container' &&
+         !rust_fields.include?('top_container_metadata')
         doc['title'] = record['record']['long_display_string']
         doc['display_string'] = record['record']['display_string']
         doc['type_u_ssort'] = record['record']['type']
@@ -988,7 +992,8 @@ class IndexerCommon
              rust_fields.include?('agent_subject_metadata') ||
              rust_fields.include?('component_classification_metadata') ||
              rust_fields.include?('repository_event_location_metadata') ||
-             rust_fields.include?('profile_assessment_metadata')
+             rust_fields.include?('profile_assessment_metadata') ||
+             rust_fields.include?('top_container_metadata')
         doc['ancestors'] = ASUtils.wrap(record['record']['ancestors']).map {|ancestor|
           ancestor.fetch('ref')
         }
@@ -1002,7 +1007,8 @@ class IndexerCommon
              rust_fields.include?('agent_subject_metadata') ||
              rust_fields.include?('component_classification_metadata') ||
              rust_fields.include?('repository_event_location_metadata') ||
-             rust_fields.include?('profile_assessment_metadata')
+             rust_fields.include?('profile_assessment_metadata') ||
+             rust_fields.include?('top_container_metadata')
         ASUtils.wrap(record['record']['rights_statements']).each do |rights_statement|
           ASUtils.wrap(rights_statement['linked_agents']).each do |agent_link|
             doc['rights_statement_agent_uris'] ||= []
@@ -1096,7 +1102,8 @@ class IndexerCommon
              rust_fields.include?('agent_subject_metadata') ||
              rust_fields.include?('component_classification_metadata') ||
              rust_fields.include?('repository_event_location_metadata') ||
-             rust_fields.include?('profile_assessment_metadata')
+             rust_fields.include?('profile_assessment_metadata') ||
+             rust_fields.include?('top_container_metadata')
         doc['langcode'] ||= []
         if record['record'].has_key?('lang_materials') and record['record']['lang_materials'].is_a?(Array)
           record['record']['lang_materials'].each { |langmaterial|

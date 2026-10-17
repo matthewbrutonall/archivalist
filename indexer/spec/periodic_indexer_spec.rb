@@ -657,5 +657,265 @@ describe "periodic indexer" do
       expect(assess_doc['external_id']).to eq(['rust-ext'])
       expect(assess_doc).not_to have_key('_archivalist_rust_fields')
     end
+
+    it "retains Rust top_container fields, strips top_container_metadata before downstream hooks, and preserves PUI publication decisions" do
+      top_container = {
+        'uri' => '/repositories/2/top_containers/44',
+        'record' => {
+          'jsonmodel_type' => 'top_container',
+          'long_display_string' => 'Native Collection: Box 99 [NAT-BC]',
+          'display_string' => 'Box 99 [NAT-BC]',
+          'type' => 'box',
+          'indicator' => '99',
+          'barcode' => 'NAT-BC',
+          'ils_holding_id' => 'NAT-ILS',
+          'internal_note' => 'Native internal note',
+          'exported_to_ils' => '2026-01-01T00:00:00Z',
+          'subcontainer_barcodes' => ['NAT-SUB'],
+          'created_for_collection' => '/repositories/2/resources/1',
+          'is_linked_to_published_record' => true,
+          'id_0' => 'native-id-0',
+          'external_ids' => [{'external_id' => 'native-ext'}],
+          'ancestors' => [{'ref' => '/repositories/2/resources/1'}],
+          'rights_statements' => [
+            {'linked_agents' => [{'ref' => '/agents/people/99'}]},
+          ],
+          'lang_materials' => [
+            {'language_and_script' => {'language' => 'fre'}},
+          ],
+          'series' => [
+            {
+              'ref' => '/repositories/2/archival_objects/1',
+              'display_string' => 'Native Series',
+              'level_display_string' => 'Series',
+              'identifier' => 'NAT-1',
+              'publish' => true,
+            },
+          ],
+          'collection' => [
+            {
+              'ref' => '/repositories/2/resources/1',
+              'display_string' => 'Native Collection',
+              'identifier' => 'NAT-COLL',
+            },
+          ],
+          'container_profile' => {
+            'ref' => '/container_profiles/1',
+            '_resolved' => {'display_string' => 'Native Carton'},
+          },
+          'container_locations' => [
+            {
+              'ref' => '/locations/1',
+              'status' => 'current',
+              '_resolved' => {
+                'title' => 'Native Vault',
+                'location_profile' => {
+                  '_resolved' => {'display_string' => 'Native Shelf'},
+                },
+              },
+            },
+          ],
+        },
+      }
+
+      marker_seen_in_prepare_hook = :uncalled
+      indexer.add_document_prepare_hook do |doc, record|
+        if record['record']['jsonmodel_type'] == 'top_container'
+          marker_seen_in_prepare_hook = doc['_archivalist_rust_fields']&.dup
+        end
+      end
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prepared, documents|
+          doc = indexer.native_index_document(
+            prepared[:uri], prepared[:record_type], prepared[:values]
+          )
+          doc['fullrecord_published'] = []
+          doc['fullrecord'] = []
+          doc['external_id'] = ['rust-tc-ext']
+          doc['four_part_id'] = 'rust-tc-4p'
+          doc['ancestors'] = ['/repositories/2/resources/77']
+          doc['rights_statement_agent_uris'] = ['/agents/people/5']
+          doc['langcode'] = ['eng']
+          doc['title'] = 'Rust Long Display'
+          doc['display_string'] = 'Rust Box 44'
+          doc['type_u_ssort'] = 'rust-box'
+          doc['notes'] = 'Rust internal note'
+          doc['series_uri_u_sstr'] = ['/repositories/2/archival_objects/900']
+          doc['series_title_u_sstr'] = ['Rust Series']
+          doc['series_level_u_sstr'] = ['Series']
+          doc['series_identifier_stored_u_sstr'] = ['RS-1']
+          doc['series_identifier_u_stext'] = ['RS-1', 'RS 1', 'RS1', 'RS- 1']
+          doc['published_series_uri_u_sstr'] = ['/repositories/2/archival_objects/900']
+          doc['published_series_title_u_sstr'] = ['Rust Series']
+          doc['collection_uri_u_sstr'] = ['/repositories/2/resources/77']
+          doc['collection_display_string_u_sstr'] = ['Rust Collection']
+          doc['collection_identifier_stored_u_sstr'] = ['RC-1']
+          doc['collection_identifier_u_stext'] = ['RC-1', 'RC 1', 'RC1', 'RC- 1']
+          doc['container_profile_uri_u_sstr'] = '/container_profiles/9'
+          doc['container_profile_display_string_u_sstr'] = 'Rust Carton'
+          doc['has_location_u_sbool'] = true
+          doc['location_uri_u_sstr'] = ['/locations/9']
+          doc['location_uris'] = ['/locations/9']
+          doc['location_display_string_u_sstr'] = ['Rust Vault']
+          doc['location_profile_display_string_u_sstr'] = ['Rust Shelf']
+          doc['exported_u_sbool'] = true
+          doc['empty_u_sbool'] = false
+          doc['indicator_u_icusort'] = '44A'
+          doc['top_container_u_typeahead_utext'] = 'rustbox44'
+          doc['top_container_u_icusort'] = 'Rust Box 44'
+          doc['barcode_u_sstr'] = 'RUST-BC'
+          doc['barcode_u_icusort'] = 'RUST-BC'
+          doc['ils_holding_id_u_sstr'] = 'RUST-ILS'
+          doc['subcontainer_barcodes_u_sstr'] = ['RUST-SUB']
+          doc['created_for_collection_u_sstr'] = '/repositories/2/resources/77'
+          doc['_archivalist_rust_fields'] = [
+            'common_metadata',
+            'fullrecord',
+            'top_container_metadata',
+          ]
+          documents[prepared[:uri]] = doc
+        end
+      end
+
+      indexer.index_records([top_container])
+      tc_doc = indexer.records.first
+
+      expect(marker_seen_in_prepare_hook).to be_nil
+      expect(tc_doc['title']).to eq('Rust Long Display')
+      expect(tc_doc['display_string']).to eq('Rust Box 44')
+      expect(tc_doc['type_u_ssort']).to eq('rust-box')
+      expect(tc_doc['notes']).to eq('Rust internal note')
+      expect(tc_doc['series_identifier_u_stext']).to eq(['RS-1', 'RS 1', 'RS1', 'RS- 1'])
+      expect(tc_doc['published_series_uri_u_sstr']).to eq(['/repositories/2/archival_objects/900'])
+      expect(tc_doc['collection_identifier_u_stext']).to eq(['RC-1', 'RC 1', 'RC1', 'RC- 1'])
+      expect(tc_doc['container_profile_display_string_u_sstr']).to eq('Rust Carton')
+      expect(tc_doc['location_display_string_u_sstr']).to eq(['Rust Vault'])
+      expect(tc_doc['location_profile_display_string_u_sstr']).to eq(['Rust Shelf'])
+      expect(tc_doc['indicator_u_icusort']).to eq('44A')
+      expect(tc_doc['top_container_u_typeahead_utext']).to eq('rustbox44')
+      expect(tc_doc['top_container_u_icusort']).to eq('Rust Box 44')
+      expect(tc_doc['barcode_u_sstr']).to eq('RUST-BC')
+      expect(tc_doc['external_id']).to eq(['rust-tc-ext'])
+      expect(tc_doc['four_part_id']).to eq('rust-tc-4p')
+      expect(tc_doc['ancestors']).to eq(['/repositories/2/resources/77'])
+      expect(tc_doc['rights_statement_agent_uris']).to eq(['/agents/people/5'])
+      expect(tc_doc['langcode']).to eq(['eng'])
+      expect(tc_doc['publish']).to eq(true)
+      expect(tc_doc['types']).to include('top_container', 'pui_container', 'pui')
+      expect(tc_doc).not_to have_key('_archivalist_rust_fields')
+    end
+
+    it "falls back to the native top_container hook when the sidecar returns nil and keeps jobs and instance container links native" do
+      top_container = {
+        'uri' => '/repositories/2/top_containers/45',
+        'record' => {
+          'jsonmodel_type' => 'top_container',
+          'long_display_string' => 'Fallback Collection: Box 5 [FB-1]',
+          'display_string' => 'Box 5 [FB-1]',
+          'type' => 'box',
+          'indicator' => '5',
+          'barcode' => 'FB-1',
+          'ils_holding_id' => 'ILS-FB',
+          'internal_note' => 'Fallback note',
+          'exported_to_ils' => false,
+          'subcontainer_barcodes' => ['FB-SUB'],
+          'created_for_collection' => '/repositories/2/resources/9',
+          'is_linked_to_published_record' => false,
+          'series' => [
+            {
+              'ref' => '/repositories/2/archival_objects/50',
+              'display_string' => 'Fallback Series',
+              'level_display_string' => 'Series',
+              'identifier' => 'FB-01',
+              'publish' => false,
+            },
+          ],
+          'collection' => [],
+          'container_profile' => {
+            'ref' => '/container_profiles/2',
+            '_resolved' => {'display_string' => 'Fallback Carton'},
+          },
+          'container_locations' => [
+            {
+              'ref' => '/locations/50',
+              'status' => 'previous',
+              '_resolved' => {'title' => 'Old Vault'},
+            },
+          ],
+        },
+      }
+      archival_object = {
+        'uri' => '/repositories/2/archival_objects/88',
+        'record' => {
+          'jsonmodel_type' => 'archival_object',
+          'title' => 'Foldered item',
+          'display_string' => 'Foldered item',
+          'component_id' => 'AO-88',
+          'ref_id' => 'ref-88',
+          'resource' => {'ref' => '/repositories/2/resources/9'},
+          'instances' => [
+            {
+              'sub_container' => {
+                'top_container' => {
+                  'ref' => '/repositories/2/top_containers/45',
+                  '_resolved' => {
+                    'container_locations' => [{'ref' => '/locations/50'}],
+                  },
+                },
+                'type_2' => 'folder',
+                'indicator_2' => '3',
+                'barcode_2' => 'FOLD-3',
+                'type_3' => 'item',
+                'indicator_3' => '1',
+              },
+            },
+          ],
+        },
+      }
+
+      allow(indexer).to receive(:rust_index_documents).and_return(nil)
+
+      indexer.index_records([top_container, archival_object])
+      tc_doc = indexer.records.find {|d| d['primary_type'] == 'top_container'}
+      ao_doc = indexer.records.find {|d| d['primary_type'] == 'archival_object'}
+
+      expect(tc_doc['title']).to eq('Fallback Collection: Box 5 [FB-1]')
+      expect(tc_doc['display_string']).to eq('Box 5 [FB-1]')
+      expect(tc_doc['type_u_ssort']).to eq('box')
+      expect(tc_doc['notes']).to eq('Fallback note')
+      expect(tc_doc['series_identifier_u_stext']).to eq(['FB-01', 'FB 01', 'FB01', 'FB- 01'])
+      expect(tc_doc).not_to have_key('published_series_uri_u_sstr')
+      expect(tc_doc).not_to have_key('published_series_title_u_sstr')
+      expect(tc_doc['collection_uri_u_sstr']).to eq([])
+      expect(tc_doc['collection_display_string_u_sstr']).to eq([])
+      expect(tc_doc['collection_identifier_stored_u_sstr']).to eq([])
+      expect(tc_doc['collection_identifier_u_stext']).to eq([])
+      expect(tc_doc['container_profile_uri_u_sstr']).to eq('/container_profiles/2')
+      expect(tc_doc['container_profile_display_string_u_sstr']).to eq('Fallback Carton')
+      expect(tc_doc['has_location_u_sbool']).to eq(true)
+      expect(tc_doc['location_uri_u_sstr']).to eq([])
+      expect(tc_doc['location_uris']).to eq([])
+      expect(tc_doc['location_display_string_u_sstr']).to eq([])
+      expect(tc_doc['location_profile_display_string_u_sstr']).to eq([])
+      expect(tc_doc['exported_u_sbool']).to eq(true)
+      expect(tc_doc['empty_u_sbool']).to eq(true)
+      expect(tc_doc['indicator_u_icusort']).to eq('5')
+      expect(tc_doc['top_container_u_typeahead_utext']).to eq('box5fb1')
+      expect(tc_doc['top_container_u_icusort']).to eq('Box 5 [FB-1]')
+      expect(tc_doc['barcode_u_sstr']).to eq('FB-1')
+      expect(tc_doc['barcode_u_icusort']).to eq('FB-1')
+      expect(tc_doc['ils_holding_id_u_sstr']).to eq('ILS-FB')
+      expect(tc_doc['subcontainer_barcodes_u_sstr']).to eq(['FB-SUB'])
+      expect(tc_doc['created_for_collection_u_sstr']).to eq('/repositories/2/resources/9')
+      expect(tc_doc['publish']).to eq(false)
+      expect(tc_doc['types']).to eq(['top_container'])
+      expect(tc_doc).not_to have_key('_archivalist_rust_fields')
+
+      expect(ao_doc['top_container_uri_u_sstr']).to eq(['/repositories/2/top_containers/45'])
+      expect(ao_doc['child_container_u_sstr']).to eq(['folder 3 FOLD-3'])
+      expect(ao_doc['grand_child_container_u_sstr']).to eq(['item 1'])
+      expect(ao_doc).not_to have_key('location_uris')
+    end
   end
 end

@@ -1547,6 +1547,399 @@ fn add_assessment_fields(
     Ok(())
 }
 
+fn is_ruby_punctuation(character: char) -> bool {
+    character.is_ascii_punctuation()
+        || matches!(
+            character as u32,
+            0xa1 | 0xa7 | 0xab | 0xb6..=0xb7 | 0xbb
+                | 0xbf | 0x37e | 0x387 | 0x55a..=0x55f | 0x589..=0x58a
+                | 0x5be | 0x5c0 | 0x5c3 | 0x5c6 | 0x5f3..=0x5f4
+                | 0x609..=0x60a | 0x60c..=0x60d | 0x61b | 0x61d..=0x61f | 0x66a..=0x66d
+                | 0x6d4 | 0x700..=0x70d | 0x7f7..=0x7f9 | 0x830..=0x83e | 0x85e
+                | 0x964..=0x965 | 0x970 | 0x9fd | 0xa76 | 0xaf0
+                | 0xc77 | 0xc84 | 0xdf4 | 0xe4f | 0xe5a..=0xe5b
+                | 0xf04..=0xf12 | 0xf14 | 0xf3a..=0xf3d | 0xf85 | 0xfd0..=0xfd4
+                | 0xfd9..=0xfda | 0x104a..=0x104f | 0x10fb | 0x1360..=0x1368 | 0x1400
+                | 0x166e | 0x169b..=0x169c | 0x16eb..=0x16ed | 0x1735..=0x1736 | 0x17d4..=0x17d6
+                | 0x17d8..=0x17da | 0x1800..=0x180a | 0x1944..=0x1945 | 0x1a1e..=0x1a1f | 0x1aa0..=0x1aa6
+                | 0x1aa8..=0x1aad | 0x1b5a..=0x1b60 | 0x1b7d..=0x1b7e | 0x1bfc..=0x1bff | 0x1c3b..=0x1c3f
+                | 0x1c7e..=0x1c7f | 0x1cc0..=0x1cc7 | 0x1cd3 | 0x2010..=0x2027 | 0x2030..=0x2043
+                | 0x2045..=0x2051 | 0x2053..=0x205e | 0x207d..=0x207e | 0x208d..=0x208e | 0x2308..=0x230b
+                | 0x2329..=0x232a | 0x2768..=0x2775 | 0x27c5..=0x27c6 | 0x27e6..=0x27ef | 0x2983..=0x2998
+                | 0x29d8..=0x29db | 0x29fc..=0x29fd | 0x2cf9..=0x2cfc | 0x2cfe..=0x2cff | 0x2d70
+                | 0x2e00..=0x2e2e | 0x2e30..=0x2e4f | 0x2e52..=0x2e5d | 0x3001..=0x3003 | 0x3008..=0x3011
+                | 0x3014..=0x301f | 0x3030 | 0x303d | 0x30a0 | 0x30fb
+                | 0xa4fe..=0xa4ff | 0xa60d..=0xa60f | 0xa673 | 0xa67e | 0xa6f2..=0xa6f7
+                | 0xa874..=0xa877 | 0xa8ce..=0xa8cf | 0xa8f8..=0xa8fa | 0xa8fc | 0xa92e..=0xa92f
+                | 0xa95f | 0xa9c1..=0xa9cd | 0xa9de..=0xa9df | 0xaa5c..=0xaa5f | 0xaade..=0xaadf
+                | 0xaaf0..=0xaaf1 | 0xabeb | 0xfd3e..=0xfd3f | 0xfe10..=0xfe19 | 0xfe30..=0xfe52
+                | 0xfe54..=0xfe61 | 0xfe63 | 0xfe68 | 0xfe6a..=0xfe6b | 0xff01..=0xff03
+                | 0xff05..=0xff0a | 0xff0c..=0xff0f | 0xff1a..=0xff1b | 0xff1f..=0xff20 | 0xff3b..=0xff3d
+                | 0xff3f | 0xff5b | 0xff5d | 0xff5f..=0xff65 | 0x10100..=0x10102
+                | 0x1039f | 0x103d0 | 0x1056f | 0x10857 | 0x1091f
+                | 0x1093f | 0x10a50..=0x10a58 | 0x10a7f | 0x10af0..=0x10af6 | 0x10b39..=0x10b3f
+                | 0x10b99..=0x10b9c | 0x10ead | 0x10f55..=0x10f59 | 0x10f86..=0x10f89 | 0x11047..=0x1104d
+                | 0x110bb..=0x110bc | 0x110be..=0x110c1 | 0x11140..=0x11143 | 0x11174..=0x11175 | 0x111c5..=0x111c8
+                | 0x111cd | 0x111db | 0x111dd..=0x111df | 0x11238..=0x1123d | 0x112a9
+                | 0x1144b..=0x1144f | 0x1145a..=0x1145b | 0x1145d | 0x114c6 | 0x115c1..=0x115d7
+                | 0x11641..=0x11643 | 0x11660..=0x1166c | 0x116b9 | 0x1173c..=0x1173e | 0x1183b
+                | 0x11944..=0x11946 | 0x119e2 | 0x11a3f..=0x11a46 | 0x11a9a..=0x11a9c | 0x11a9e..=0x11aa2
+                | 0x11b00..=0x11b09 | 0x11c41..=0x11c45 | 0x11c70..=0x11c71 | 0x11ef7..=0x11ef8 | 0x11f43..=0x11f4f
+                | 0x11fff | 0x12470..=0x12474 | 0x12ff1..=0x12ff2 | 0x16a6e..=0x16a6f | 0x16af5
+                | 0x16b37..=0x16b3b | 0x16b44 | 0x16e97..=0x16e9a | 0x16fe2 | 0x1bc9f
+                | 0x1da87..=0x1da8b | 0x1e95e..=0x1e95f
+        )
+}
+
+fn generate_permutations_for_identifier(
+    identifier: Option<&Value>,
+    path: &str,
+) -> Result<Vec<Value>, IndexDocumentError> {
+    let identifier = match identifier {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::String(value)) => value.as_str(),
+        Some(_) => return Err(error(format!("field '{path}' must be a string"))),
+    };
+
+    let mut punct_to_space = String::with_capacity(identifier.len());
+    let mut previous_was_punct = false;
+    for character in identifier.chars() {
+        if is_ruby_punctuation(character) {
+            if !previous_was_punct {
+                punct_to_space.push(' ');
+                previous_was_punct = true;
+            }
+        } else {
+            punct_to_space.push(character);
+            previous_was_punct = false;
+        }
+    }
+
+    let without_punct_or_space: String = identifier
+        .chars()
+        .filter(|character| !is_ruby_punctuation(*character) && *character != ' ')
+        .collect();
+
+    let mut digit_split = String::with_capacity(identifier.len());
+    let mut previous_was_digit: Option<bool> = None;
+    for character in identifier.chars() {
+        let is_digit = character.is_ascii_digit();
+        if let Some(previous) = previous_was_digit {
+            if previous != is_digit {
+                digit_split.push(' ');
+            }
+        }
+        digit_split.push(character);
+        previous_was_digit = Some(is_digit);
+    }
+
+    let mut permutations = Vec::with_capacity(4);
+    for candidate in [
+        identifier.to_string(),
+        punct_to_space,
+        without_punct_or_space,
+        digit_split,
+    ] {
+        push_unique(&mut permutations, Value::String(candidate));
+    }
+    Ok(permutations)
+}
+
+fn add_top_container_fields(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let display_string =
+        required_string(record.get("display_string"), "display_string")?.to_string();
+    let typeahead: String = display_string
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|character| character.to_ascii_lowercase())
+        .collect();
+
+    document.insert(
+        "title".to_string(),
+        record
+            .get("long_display_string")
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    document.insert(
+        "display_string".to_string(),
+        Value::String(display_string.clone()),
+    );
+    document.insert(
+        "type_u_ssort".to_string(),
+        record.get("type").cloned().unwrap_or(Value::Null),
+    );
+    document.insert(
+        "notes".to_string(),
+        record.get("internal_note").cloned().unwrap_or(Value::Null),
+    );
+
+    if let Some(series_value) = record
+        .get("series")
+        .filter(|value| ruby_truthy(Some(value)))
+    {
+        let series_list = series_value
+            .as_array()
+            .ok_or_else(|| error("field 'series' must be an array"))?;
+        let mut series_uris = Vec::with_capacity(series_list.len());
+        let mut series_titles = Vec::with_capacity(series_list.len());
+        let mut series_levels = Vec::with_capacity(series_list.len());
+        let mut series_identifiers_stored = Vec::with_capacity(series_list.len());
+        let mut series_identifiers_text = Vec::new();
+        let mut published_series_uris = Vec::new();
+        let mut published_series_titles = Vec::new();
+
+        for series in series_list {
+            let series = series
+                .as_object()
+                .ok_or_else(|| error("series entries must be objects"))?;
+            let uri = series.get("ref").cloned().unwrap_or(Value::Null);
+            let title = series.get("display_string").cloned().unwrap_or(Value::Null);
+            series_uris.push(uri.clone());
+            series_titles.push(title.clone());
+            series_levels.push(
+                series
+                    .get("level_display_string")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+            series_identifiers_stored
+                .push(series.get("identifier").cloned().unwrap_or(Value::Null));
+            series_identifiers_text.extend(generate_permutations_for_identifier(
+                series.get("identifier"),
+                "series.identifier",
+            )?);
+            if ruby_truthy(series.get("publish")) {
+                published_series_uris.push(uri);
+                published_series_titles.push(title);
+            }
+        }
+
+        document.insert("series_uri_u_sstr".to_string(), Value::Array(series_uris));
+        document.insert(
+            "series_title_u_sstr".to_string(),
+            Value::Array(series_titles),
+        );
+        document.insert(
+            "series_level_u_sstr".to_string(),
+            Value::Array(series_levels),
+        );
+        document.insert(
+            "series_identifier_stored_u_sstr".to_string(),
+            Value::Array(series_identifiers_stored),
+        );
+        document.insert(
+            "series_identifier_u_stext".to_string(),
+            Value::Array(series_identifiers_text),
+        );
+        if !published_series_uris.is_empty() {
+            document.insert(
+                "published_series_uri_u_sstr".to_string(),
+                Value::Array(published_series_uris),
+            );
+            document.insert(
+                "published_series_title_u_sstr".to_string(),
+                Value::Array(published_series_titles),
+            );
+        }
+    }
+
+    let collection_is_empty = if let Some(collection_value) = record
+        .get("collection")
+        .filter(|value| ruby_truthy(Some(value)))
+    {
+        let collections = collection_value
+            .as_array()
+            .ok_or_else(|| error("field 'collection' must be an array"))?;
+        let mut collection_uris = Vec::with_capacity(collections.len());
+        let mut collection_displays = Vec::with_capacity(collections.len());
+        let mut collection_identifiers_stored = Vec::with_capacity(collections.len());
+        let mut collection_identifiers_text = Vec::new();
+
+        for collection in collections {
+            let collection = collection
+                .as_object()
+                .ok_or_else(|| error("collection entries must be objects"))?;
+            collection_uris.push(collection.get("ref").cloned().unwrap_or(Value::Null));
+            collection_displays.push(
+                collection
+                    .get("display_string")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            );
+            collection_identifiers_stored
+                .push(collection.get("identifier").cloned().unwrap_or(Value::Null));
+            collection_identifiers_text.extend(generate_permutations_for_identifier(
+                collection.get("identifier"),
+                "collection.identifier",
+            )?);
+        }
+
+        document.insert(
+            "collection_uri_u_sstr".to_string(),
+            Value::Array(collection_uris),
+        );
+        document.insert(
+            "collection_display_string_u_sstr".to_string(),
+            Value::Array(collection_displays),
+        );
+        document.insert(
+            "collection_identifier_stored_u_sstr".to_string(),
+            Value::Array(collection_identifiers_stored),
+        );
+        document.insert(
+            "collection_identifier_u_stext".to_string(),
+            Value::Array(collection_identifiers_text),
+        );
+        collections.is_empty()
+    } else {
+        true
+    };
+
+    if let Some(container_profile) = record
+        .get("container_profile")
+        .filter(|value| ruby_truthy(Some(value)))
+    {
+        let container_profile = container_profile
+            .as_object()
+            .ok_or_else(|| error("field 'container_profile' must be an object"))?;
+        document.insert(
+            "container_profile_uri_u_sstr".to_string(),
+            container_profile.get("ref").cloned().unwrap_or(Value::Null),
+        );
+        let resolved = container_profile
+            .get("_resolved")
+            .and_then(Value::as_object)
+            .ok_or_else(|| error("container_profile must contain _resolved"))?;
+        document.insert(
+            "container_profile_display_string_u_sstr".to_string(),
+            resolved
+                .get("display_string")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+    }
+
+    let container_locations = match record.get("container_locations") {
+        None | Some(Value::Null) => &[][..],
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| error("field 'container_locations' must be an array"))?,
+    };
+    if !container_locations.is_empty() {
+        let mut location_uri_u_sstr = Vec::new();
+        let mut location_uris = Vec::new();
+        let mut location_display_strings = Vec::new();
+        let mut location_profile_display_strings = Vec::new();
+
+        for container_location in container_locations {
+            let container_location = container_location
+                .as_object()
+                .ok_or_else(|| error("container_locations entries must be objects"))?;
+            if container_location.get("status").and_then(Value::as_str) == Some("current") {
+                let reference = container_location
+                    .get("ref")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                location_uri_u_sstr.push(reference.clone());
+                location_uris.push(reference);
+                let resolved = container_location
+                    .get("_resolved")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        error("container_locations current entries must contain _resolved")
+                    })?;
+                location_display_strings
+                    .push(resolved.get("title").cloned().unwrap_or(Value::Null));
+                if let Some(location_profile) = resolved
+                    .get("location_profile")
+                    .filter(|value| ruby_truthy(Some(value)))
+                {
+                    let location_profile = location_profile.as_object().ok_or_else(|| {
+                        error("container_locations._resolved.location_profile must be an object")
+                    })?;
+                    if let Some(lp_resolved) = location_profile
+                        .get("_resolved")
+                        .filter(|value| ruby_truthy(Some(value)))
+                    {
+                        let lp_resolved = lp_resolved.as_object().ok_or_else(|| {
+                            error(
+                                "container_locations._resolved.location_profile._resolved must be an object",
+                            )
+                        })?;
+                        push_unique(
+                            &mut location_profile_display_strings,
+                            lp_resolved
+                                .get("display_string")
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                        );
+                    }
+                }
+            }
+        }
+
+        document.insert("has_location_u_sbool".to_string(), Value::Bool(true));
+        document.insert(
+            "location_uri_u_sstr".to_string(),
+            Value::Array(location_uri_u_sstr),
+        );
+        document.insert("location_uris".to_string(), Value::Array(location_uris));
+        document.insert(
+            "location_display_string_u_sstr".to_string(),
+            Value::Array(location_display_strings),
+        );
+        document.insert(
+            "location_profile_display_string_u_sstr".to_string(),
+            Value::Array(location_profile_display_strings),
+        );
+    } else {
+        document.insert("has_location_u_sbool".to_string(), Value::Bool(false));
+    }
+
+    document.insert(
+        "exported_u_sbool".to_string(),
+        Value::Bool(record.contains_key("exported_to_ils")),
+    );
+    document.insert(
+        "empty_u_sbool".to_string(),
+        Value::Bool(collection_is_empty),
+    );
+
+    if let Some(indicator) = record
+        .get("indicator")
+        .filter(|value| ruby_truthy(Some(value)))
+    {
+        document.insert("indicator_u_icusort".to_string(), indicator.clone());
+    }
+
+    document.insert(
+        "top_container_u_typeahead_utext".to_string(),
+        Value::String(typeahead),
+    );
+    document.insert(
+        "top_container_u_icusort".to_string(),
+        Value::String(display_string),
+    );
+    let barcode = record.get("barcode").cloned().unwrap_or(Value::Null);
+    document.insert("barcode_u_sstr".to_string(), barcode.clone());
+    document.insert("barcode_u_icusort".to_string(), barcode);
+    for (document_field, record_field) in [
+        ("ils_holding_id_u_sstr", "ils_holding_id"),
+        ("subcontainer_barcodes_u_sstr", "subcontainer_barcodes"),
+        ("created_for_collection_u_sstr", "created_for_collection"),
+    ] {
+        document.insert(
+            document_field.to_string(),
+            record.get(record_field).cloned().unwrap_or(Value::Null),
+        );
+    }
+    Ok(())
+}
+
 fn add_type_specific_fields(
     document: &mut Map<String, Value>,
     record_type: &str,
@@ -1706,6 +2099,10 @@ fn add_type_specific_fields(
         "assessment" => {
             add_assessment_fields(document, record)?;
             markers.push(json_string("profile_assessment_metadata"));
+        }
+        "top_container" => {
+            add_top_container_fields(document, record)?;
+            markers.push(json_string("top_container_metadata"));
         }
         _ => return Ok(markers),
     }
@@ -3183,23 +3580,529 @@ mod tests {
     }
 
     #[test]
-    fn keeps_unmigrated_types_and_unenriched_requests_free_of_profile_assessment_marker() {
-        let top_container = build_index_document(IndexDocumentInput {
-            uri: "/repositories/2/top_containers/5".to_string(),
+    fn builds_top_container_staff_index_fields_for_full_and_minimal_records() {
+        let full_top_container = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/top_containers/55".to_string(),
             record_type: "top_container".to_string(),
             repository: json!(2),
             record: json!({
-                "uri": "/repositories/2/top_containers/5",
-                "title": "Box 5",
-                "display_string": "Box 5"
+                "uri": "/repositories/2/top_containers/55",
+                "title": "Envelope Title",
+                "display_string": "Box 12-A: Sánchez & Co. (Éire) #3",
+                "long_display_string": "Collection MS-7, Series I, Box 12-A [BC-55]",
+                "type": "box",
+                "indicator": "12-A",
+                "barcode": "BC-00055",
+                "ils_holding_id": "ILS-HOLD-55",
+                "subcontainer_barcodes": "SUB-BC-1, SUB-BC-2",
+                "created_for_collection": "/repositories/2/resources/7",
+                "internal_note": "Fragile clasp; keep flat",
+                "exported_to_ils": "2026-02-01T12:00:00Z",
+                "is_linked_to_published_record": true,
+                "series": [
+                    {
+                        "ref": "/repositories/2/archival_objects/101",
+                        "display_string": "Series I: Correspondence",
+                        "level_display_string": "Series",
+                        "identifier": "MS-123.45/a_b",
+                        "publish": true
+                    },
+                    {
+                        "ref": "/repositories/2/archival_objects/102",
+                        "display_string": "Series II: Restricted Drafts",
+                        "level_display_string": "Subseries",
+                        "identifier": "MS 123",
+                        "publish": false
+                    },
+                    {
+                        "ref": "/repositories/2/archival_objects/103",
+                        "display_string": "Series III: Photographs",
+                        "level_display_string": "Series",
+                        "identifier": "123",
+                        "publish": true
+                    },
+                    {
+                        "ref": "/repositories/2/archival_objects/104",
+                        "display_string": "Series IV: Unnumbered",
+                        "level_display_string": "Series",
+                        "identifier": Value::Null
+                    }
+                ],
+                "collection": [
+                    {
+                        "ref": "/repositories/2/resources/7",
+                        "display_string": "Sánchez Papers",
+                        "identifier": "A - 12..34_B"
+                    },
+                    {
+                        "ref": "/repositories/2/accessions/9",
+                        "display_string": "2026-009 Accession",
+                        "identifier": "2026–009"
+                    }
+                ],
+                "container_profile": {
+                    "ref": "/container_profiles/3",
+                    "_resolved": {
+                        "display_string": "Standard Hollinger [10x12x15]"
+                    }
+                },
+                "container_locations": [
+                    {
+                        "status": "previous",
+                        "ref": "/locations/10",
+                        "_resolved": {
+                            "title": "Old Annex, Shelf 1",
+                            "location_profile": {
+                                "ref": "/location_profiles/1",
+                                "_resolved": {"display_string": "Old Shelf Profile"}
+                            }
+                        }
+                    },
+                    {
+                        "status": "current",
+                        "ref": "/locations/20",
+                        "_resolved": {
+                            "title": "Main Vault, Bay 1",
+                            "location_profile": {
+                                "ref": "/location_profiles/4",
+                                "_resolved": {"display_string": "Standard Folio Shelf"}
+                            }
+                        }
+                    },
+                    {
+                        "status": "current",
+                        "ref": "/locations/20",
+                        "_resolved": {
+                            "title": "Main Vault, Bay 1",
+                            "location_profile": {
+                                "ref": "/location_profiles/4",
+                                "_resolved": {"display_string": "Standard Folio Shelf"}
+                            }
+                        }
+                    },
+                    {
+                        "status": "current",
+                        "ref": "/locations/21",
+                        "_resolved": {
+                            "title": "Main Vault, Bay 2",
+                            "location_profile": {
+                                "ref": "/location_profiles/5",
+                                "_resolved": {"display_string": "Deep Oversize Shelf"}
+                            }
+                        }
+                    },
+                    {
+                        "status": "current",
+                        "ref": "/locations/22",
+                        "_resolved": {
+                            "title": "Main Vault, Bay 3"
+                        }
+                    }
+                ],
+                "external_ids": [{"external_id": "tc-ext-55"}],
+                "ancestors": [],
+                "lang_materials": [{"language_and_script": {"language": "eng"}}]
+            }),
+            enrich: true,
+        })
+        .unwrap();
+
+        assert_eq!(
+            full_top_container["title"],
+            "Collection MS-7, Series I, Box 12-A [BC-55]"
+        );
+        assert_eq!(
+            full_top_container["display_string"],
+            "Box 12-A: Sánchez & Co. (Éire) #3"
+        );
+        assert_eq!(full_top_container["type_u_ssort"], "box");
+        assert_eq!(full_top_container["notes"], "Fragile clasp; keep flat");
+        assert_eq!(
+            full_top_container["series_uri_u_sstr"],
+            json!([
+                "/repositories/2/archival_objects/101",
+                "/repositories/2/archival_objects/102",
+                "/repositories/2/archival_objects/103",
+                "/repositories/2/archival_objects/104"
+            ])
+        );
+        assert_eq!(
+            full_top_container["series_title_u_sstr"],
+            json!([
+                "Series I: Correspondence",
+                "Series II: Restricted Drafts",
+                "Series III: Photographs",
+                "Series IV: Unnumbered"
+            ])
+        );
+        assert_eq!(
+            full_top_container["series_level_u_sstr"],
+            json!(["Series", "Subseries", "Series", "Series"])
+        );
+        assert_eq!(
+            full_top_container["series_identifier_stored_u_sstr"],
+            json!(["MS-123.45/a_b", "MS 123", "123", Value::Null])
+        );
+        assert_eq!(
+            full_top_container["series_identifier_u_stext"],
+            json!([
+                "MS-123.45/a_b",
+                "MS 123 45 a b",
+                "MS12345ab",
+                "MS- 123 . 45 /a_b",
+                "MS 123",
+                "MS123",
+                "MS  123",
+                "123"
+            ])
+        );
+        assert_eq!(
+            full_top_container["published_series_uri_u_sstr"],
+            json!([
+                "/repositories/2/archival_objects/101",
+                "/repositories/2/archival_objects/103"
+            ])
+        );
+        assert_eq!(
+            full_top_container["published_series_title_u_sstr"],
+            json!(["Series I: Correspondence", "Series III: Photographs"])
+        );
+        assert_eq!(
+            full_top_container["collection_uri_u_sstr"],
+            json!([
+                "/repositories/2/resources/7",
+                "/repositories/2/accessions/9"
+            ])
+        );
+        assert_eq!(
+            full_top_container["collection_display_string_u_sstr"],
+            json!(["Sánchez Papers", "2026-009 Accession"])
+        );
+        assert_eq!(
+            full_top_container["collection_identifier_stored_u_sstr"],
+            json!(["A - 12..34_B", "2026–009"])
+        );
+        assert_eq!(
+            full_top_container["collection_identifier_u_stext"],
+            json!([
+                "A - 12..34_B",
+                "A   12 34 B",
+                "A1234B",
+                "A -  12 .. 34 _B",
+                "2026–009",
+                "2026 009",
+                "2026009",
+                "2026 – 009"
+            ])
+        );
+        assert_eq!(
+            full_top_container["container_profile_uri_u_sstr"],
+            "/container_profiles/3"
+        );
+        assert_eq!(
+            full_top_container["container_profile_display_string_u_sstr"],
+            "Standard Hollinger [10x12x15]"
+        );
+        assert_eq!(full_top_container["has_location_u_sbool"], true);
+        assert_eq!(
+            full_top_container["location_uri_u_sstr"],
+            json!([
+                "/locations/20",
+                "/locations/20",
+                "/locations/21",
+                "/locations/22"
+            ])
+        );
+        assert_eq!(
+            full_top_container["location_uris"],
+            json!([
+                "/locations/20",
+                "/locations/20",
+                "/locations/21",
+                "/locations/22"
+            ])
+        );
+        assert_eq!(
+            full_top_container["location_display_string_u_sstr"],
+            json!([
+                "Main Vault, Bay 1",
+                "Main Vault, Bay 1",
+                "Main Vault, Bay 2",
+                "Main Vault, Bay 3"
+            ])
+        );
+        assert_eq!(
+            full_top_container["location_profile_display_string_u_sstr"],
+            json!(["Standard Folio Shelf", "Deep Oversize Shelf"])
+        );
+        assert_eq!(full_top_container["exported_u_sbool"], true);
+        assert_eq!(full_top_container["empty_u_sbool"], false);
+        assert_eq!(full_top_container["indicator_u_icusort"], "12-A");
+        assert_eq!(
+            full_top_container["top_container_u_typeahead_utext"],
+            "box12asnchezcoire3"
+        );
+        assert_eq!(
+            full_top_container["top_container_u_icusort"],
+            "Box 12-A: Sánchez & Co. (Éire) #3"
+        );
+        assert_eq!(full_top_container["barcode_u_sstr"], "BC-00055");
+        assert_eq!(full_top_container["barcode_u_icusort"], "BC-00055");
+        assert_eq!(full_top_container["ils_holding_id_u_sstr"], "ILS-HOLD-55");
+        assert_eq!(
+            full_top_container["subcontainer_barcodes_u_sstr"],
+            "SUB-BC-1, SUB-BC-2"
+        );
+        assert_eq!(
+            full_top_container["created_for_collection_u_sstr"],
+            "/repositories/2/resources/7"
+        );
+        assert_eq!(full_top_container["external_id"], json!(["tc-ext-55"]));
+        assert_eq!(full_top_container["ancestors"], json!([]));
+        assert_eq!(full_top_container["langcode"], json!(["eng"]));
+        assert_eq!(full_top_container["types"], json!(["top_container"]));
+        assert_eq!(full_top_container["publish"], false);
+        assert_eq!(
+            full_top_container["_archivalist_rust_fields"],
+            json!(["common_metadata", "fullrecord", "top_container_metadata"])
+        );
+
+        let minimal_top_container = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/top_containers/56".to_string(),
+            record_type: "top_container".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/top_containers/56",
+                "display_string": "Folder 1",
+                "collection": [],
+                "container_locations": []
+            }),
+            enrich: true,
+        })
+        .unwrap();
+
+        assert_eq!(minimal_top_container["title"], Value::Null);
+        assert_eq!(minimal_top_container["display_string"], "Folder 1");
+        assert_eq!(minimal_top_container["type_u_ssort"], Value::Null);
+        assert_eq!(minimal_top_container["notes"], Value::Null);
+        assert!(minimal_top_container.get("series_uri_u_sstr").is_none());
+        assert!(minimal_top_container.get("series_title_u_sstr").is_none());
+        assert!(minimal_top_container.get("series_level_u_sstr").is_none());
+        assert!(minimal_top_container
+            .get("series_identifier_stored_u_sstr")
+            .is_none());
+        assert!(minimal_top_container
+            .get("series_identifier_u_stext")
+            .is_none());
+        assert!(minimal_top_container
+            .get("published_series_uri_u_sstr")
+            .is_none());
+        assert!(minimal_top_container
+            .get("published_series_title_u_sstr")
+            .is_none());
+        assert_eq!(minimal_top_container["collection_uri_u_sstr"], json!([]));
+        assert_eq!(
+            minimal_top_container["collection_display_string_u_sstr"],
+            json!([])
+        );
+        assert_eq!(
+            minimal_top_container["collection_identifier_stored_u_sstr"],
+            json!([])
+        );
+        assert_eq!(
+            minimal_top_container["collection_identifier_u_stext"],
+            json!([])
+        );
+        assert!(minimal_top_container
+            .get("container_profile_uri_u_sstr")
+            .is_none());
+        assert!(minimal_top_container
+            .get("container_profile_display_string_u_sstr")
+            .is_none());
+        assert_eq!(minimal_top_container["has_location_u_sbool"], false);
+        assert!(minimal_top_container.get("location_uri_u_sstr").is_none());
+        assert!(minimal_top_container.get("location_uris").is_none());
+        assert!(minimal_top_container
+            .get("location_display_string_u_sstr")
+            .is_none());
+        assert!(minimal_top_container
+            .get("location_profile_display_string_u_sstr")
+            .is_none());
+        assert_eq!(minimal_top_container["exported_u_sbool"], false);
+        assert_eq!(minimal_top_container["empty_u_sbool"], true);
+        assert!(minimal_top_container.get("indicator_u_icusort").is_none());
+        assert_eq!(
+            minimal_top_container["top_container_u_typeahead_utext"],
+            "folder1"
+        );
+        assert_eq!(minimal_top_container["top_container_u_icusort"], "Folder 1");
+        assert_eq!(minimal_top_container["barcode_u_sstr"], Value::Null);
+        assert_eq!(minimal_top_container["barcode_u_icusort"], Value::Null);
+        assert_eq!(minimal_top_container["ils_holding_id_u_sstr"], Value::Null);
+        assert_eq!(
+            minimal_top_container["subcontainer_barcodes_u_sstr"],
+            Value::Null
+        );
+        assert_eq!(
+            minimal_top_container["created_for_collection_u_sstr"],
+            Value::Null
+        );
+        assert_eq!(
+            minimal_top_container["_archivalist_rust_fields"],
+            json!(["common_metadata", "fullrecord", "top_container_metadata"])
+        );
+    }
+
+    #[test]
+    fn matches_top_container_edge_cases_for_series_locations_exported_and_identifiers() {
+        let unpublished_and_previous_only = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/top_containers/57".to_string(),
+            record_type: "top_container".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/top_containers/57",
+                "display_string": "Carton 99",
+                "indicator": false,
+                "exported_to_ils": false,
+                "series": [
+                    {
+                        "ref": "/repositories/2/archival_objects/201",
+                        "display_string": "Unpublished Series One",
+                        "level_display_string": "Series",
+                        "identifier": "S1",
+                        "publish": false
+                    },
+                    {
+                        "ref": "/repositories/2/archival_objects/202",
+                        "display_string": "Unpublished Series Two",
+                        "level_display_string": "Series",
+                        "identifier": "S1",
+                        "publish": Value::Null
+                    }
+                ],
+                "container_locations": [
+                    {
+                        "status": "previous",
+                        "ref": "/locations/99",
+                        "_resolved": {
+                            "title": "Former Staging Room"
+                        }
+                    }
+                ]
+            }),
+            enrich: true,
+        })
+        .unwrap();
+
+        assert_eq!(
+            unpublished_and_previous_only["series_identifier_u_stext"],
+            json!(["S1", "S 1", "S1", "S 1"])
+        );
+        assert!(unpublished_and_previous_only
+            .get("published_series_uri_u_sstr")
+            .is_none());
+        assert!(unpublished_and_previous_only
+            .get("published_series_title_u_sstr")
+            .is_none());
+        assert!(unpublished_and_previous_only
+            .get("collection_uri_u_sstr")
+            .is_none());
+        assert_eq!(unpublished_and_previous_only["empty_u_sbool"], true);
+        assert_eq!(unpublished_and_previous_only["exported_u_sbool"], true);
+        assert!(unpublished_and_previous_only
+            .get("indicator_u_icusort")
+            .is_none());
+        assert_eq!(unpublished_and_previous_only["has_location_u_sbool"], true);
+        assert_eq!(
+            unpublished_and_previous_only["location_uri_u_sstr"],
+            json!([])
+        );
+        assert_eq!(unpublished_and_previous_only["location_uris"], json!([]));
+        assert_eq!(
+            unpublished_and_previous_only["location_display_string_u_sstr"],
+            json!([])
+        );
+        assert_eq!(
+            unpublished_and_previous_only["location_profile_display_string_u_sstr"],
+            json!([])
+        );
+
+        let exported_null = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/top_containers/58".to_string(),
+            record_type: "top_container".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/top_containers/58",
+                "display_string": "Box 58",
+                "indicator": Value::Null,
+                "exported_to_ils": Value::Null
+            }),
+            enrich: true,
+        })
+        .unwrap();
+        assert_eq!(exported_null["exported_u_sbool"], true);
+        assert!(exported_null.get("indicator_u_icusort").is_none());
+
+        assert_eq!(
+            generate_permutations_for_identifier(None, "id").unwrap(),
+            Vec::<Value>::new()
+        );
+        assert_eq!(
+            generate_permutations_for_identifier(Some(&Value::Null), "id").unwrap(),
+            Vec::<Value>::new()
+        );
+        assert_eq!(
+            generate_permutations_for_identifier(Some(&json!("123")), "id").unwrap(),
+            vec![json!("123")]
+        );
+        assert_eq!(
+            generate_permutations_for_identifier(Some(&json!("ABC")), "id").unwrap(),
+            vec![json!("ABC")]
+        );
+        assert_eq!(
+            generate_permutations_for_identifier(Some(&json!("---")), "id").unwrap(),
+            vec![json!("---"), json!(" "), json!("")]
+        );
+    }
+
+    #[test]
+    fn keeps_unmigrated_types_and_unenriched_requests_free_of_type_specific_markers() {
+        let job = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/jobs/5".to_string(),
+            record_type: "job".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/jobs/5",
+                "title": "Job 5"
             }),
             enrich: true,
         })
         .unwrap();
         assert_eq!(
-            top_container["_archivalist_rust_fields"],
+            job["_archivalist_rust_fields"],
             json!(["common_metadata", "fullrecord"])
         );
+
+        let unenriched_top_container = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/top_containers/55".to_string(),
+            record_type: "top_container".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/top_containers/55",
+                "title": "Envelope title",
+                "display_string": "Box 55",
+                "long_display_string": "Long Box 55"
+            }),
+            enrich: false,
+        })
+        .unwrap();
+        assert_eq!(unenriched_top_container["title"], "Envelope title");
+        assert!(unenriched_top_container
+            .get("_archivalist_rust_fields")
+            .is_none());
+        assert!(unenriched_top_container
+            .get("top_container_u_icusort")
+            .is_none());
 
         let unenriched_assessment = build_index_document(IndexDocumentInput {
             uri: "/repositories/2/assessments/42".to_string(),
@@ -3278,6 +4181,28 @@ mod tests {
                 "uri": "/repositories/2/assessments/42",
                 "display_string": "Bad Formats Assessment",
                 "formats": "not-an-array"
+            }),
+            enrich: true,
+        })
+        .is_err());
+        assert!(build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/top_containers/55".to_string(),
+            record_type: "top_container".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/top_containers/55"
+            }),
+            enrich: true,
+        })
+        .is_err());
+        assert!(build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/top_containers/55".to_string(),
+            record_type: "top_container".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/top_containers/55",
+                "display_string": "Box 55",
+                "container_locations": [{"status": "current", "ref": "/locations/1"}]
             }),
             enrich: true,
         })

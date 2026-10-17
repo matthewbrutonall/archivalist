@@ -796,4 +796,248 @@ describe RustIndexDocumentBuilder do
       /enrichment fields missing.*assessment_reviewers/
     )
   end
+
+  it 'validates top_container enrichment fields' do
+    full_top_container = {
+      'uri' => '/repositories/2/top_containers/10',
+      'record_type' => 'top_container',
+      'repository' => 2,
+      'enrich' => true,
+      'record' => {
+        'uri' => '/repositories/2/top_containers/10',
+        'jsonmodel_type' => 'top_container',
+        'long_display_string' => 'Collection 1: Box 12A [BC-1]',
+        'display_string' => 'Box 12A [BC-1]',
+        'type' => 'box',
+        'indicator' => '12A',
+        'barcode' => 'BC-1',
+        'ils_holding_id' => 'ILS-10',
+        'internal_note' => 'Top container note',
+        'exported_to_ils' => '2026-01-01T00:00:00Z',
+        'subcontainer_barcodes' => ['SUB-1'],
+        'created_for_collection' => '/repositories/2/resources/77',
+        'series' => [
+          {
+            'ref' => '/repositories/2/archival_objects/100',
+            'display_string' => 'Published Series',
+            'level_display_string' => 'Series',
+            'identifier' => 'S-01.A',
+            'publish' => true,
+          },
+          {
+            'ref' => '/repositories/2/archival_objects/101',
+            'display_string' => 'Unpublished Series',
+            'level_display_string' => 'Subseries',
+            'identifier' => 'S-02',
+            'publish' => false,
+          },
+        ],
+        'collection' => [
+          {
+            'ref' => '/repositories/2/resources/77',
+            'display_string' => 'Collection 1',
+            'identifier' => 'MS-100',
+          },
+        ],
+        'container_profile' => {
+          'ref' => '/container_profiles/1',
+          '_resolved' => {'display_string' => 'Standard Carton'},
+        },
+        'container_locations' => [
+          {
+            'ref' => '/locations/10',
+            'status' => 'current',
+            '_resolved' => {
+              'title' => 'Vault A',
+              'location_profile' => {
+                '_resolved' => {'display_string' => 'Deep Shelf'},
+              },
+            },
+          },
+          {
+            'ref' => '/locations/11',
+            'status' => 'previous',
+            '_resolved' => {
+              'title' => 'Old Room',
+              'location_profile' => {
+                '_resolved' => {'display_string' => 'Old Shelf'},
+              },
+            },
+          },
+        ],
+      },
+    }
+    full_document = {
+      'id' => full_top_container['uri'],
+      'uri' => full_top_container['uri'],
+      'title' => 'Collection 1: Box 12A [BC-1]',
+      'display_string' => 'Box 12A [BC-1]',
+      'type_u_ssort' => 'box',
+      'notes' => 'Top container note',
+      'series_uri_u_sstr' => [
+        '/repositories/2/archival_objects/100',
+        '/repositories/2/archival_objects/101',
+      ],
+      'series_title_u_sstr' => ['Published Series', 'Unpublished Series'],
+      'series_level_u_sstr' => ['Series', 'Subseries'],
+      'series_identifier_stored_u_sstr' => ['S-01.A', 'S-02'],
+      'series_identifier_u_stext' => [
+        'S-01.A',
+        'S 01 A',
+        'S01A',
+        'S- 01 .A',
+        'S-02',
+        'S 02',
+        'S02',
+        'S- 02',
+      ],
+      'published_series_uri_u_sstr' => ['/repositories/2/archival_objects/100'],
+      'published_series_title_u_sstr' => ['Published Series'],
+      'collection_uri_u_sstr' => ['/repositories/2/resources/77'],
+      'collection_display_string_u_sstr' => ['Collection 1'],
+      'collection_identifier_stored_u_sstr' => ['MS-100'],
+      'collection_identifier_u_stext' => ['MS-100', 'MS 100', 'MS100', 'MS- 100'],
+      'container_profile_uri_u_sstr' => '/container_profiles/1',
+      'container_profile_display_string_u_sstr' => 'Standard Carton',
+      'has_location_u_sbool' => true,
+      'location_uri_u_sstr' => ['/locations/10'],
+      'location_uris' => ['/locations/10'],
+      'location_display_string_u_sstr' => ['Vault A'],
+      'location_profile_display_string_u_sstr' => ['Deep Shelf'],
+      'exported_u_sbool' => true,
+      'empty_u_sbool' => false,
+      'indicator_u_icusort' => '12A',
+      'top_container_u_typeahead_utext' => 'box12abc1',
+      'top_container_u_icusort' => 'Box 12A [BC-1]',
+      'barcode_u_sstr' => 'BC-1',
+      'barcode_u_icusort' => 'BC-1',
+      'ils_holding_id_u_sstr' => 'ILS-10',
+      'subcontainer_barcodes_u_sstr' => ['SUB-1'],
+      'created_for_collection_u_sstr' => '/repositories/2/resources/77',
+      'primary_type' => 'top_container',
+      'types' => ['top_container'],
+      'json' => ASUtils.to_json(full_top_container['record']),
+      'suppressed' => false,
+      'publish' => false,
+      'system_generated' => 'false',
+      'repository' => 2,
+      'fullrecord_published' => [],
+      'fullrecord' => [],
+      'external_id' => [],
+      'ancestors' => [],
+      'langcode' => [],
+      '_archivalist_rust_fields' => [
+        'common_metadata',
+        'fullrecord',
+        'top_container_metadata',
+      ],
+    }
+
+    minimal_top_container = {
+      'uri' => '/repositories/2/top_containers/11',
+      'record_type' => 'top_container',
+      'repository' => 2,
+      'enrich' => true,
+      'record' => {
+        'uri' => '/repositories/2/top_containers/11',
+        'jsonmodel_type' => 'top_container',
+        'long_display_string' => 'Empty Box',
+        'display_string' => 'Empty Box',
+        'series' => [
+          {
+            'ref' => '/repositories/2/archival_objects/200',
+            'display_string' => 'Hidden Series',
+            'level_display_string' => 'Series',
+            'identifier' => 'HS-1',
+            'publish' => false,
+          },
+        ],
+        'collection' => [],
+        'container_locations' => [
+          {
+            'ref' => '/locations/20',
+            'status' => 'previous',
+            '_resolved' => {'title' => 'Old Room'},
+          },
+        ],
+        'exported_to_ils' => false,
+      },
+    }
+    minimal_document = {
+      'id' => minimal_top_container['uri'],
+      'uri' => minimal_top_container['uri'],
+      'title' => 'Empty Box',
+      'display_string' => 'Empty Box',
+      'type_u_ssort' => nil,
+      'notes' => nil,
+      'series_uri_u_sstr' => ['/repositories/2/archival_objects/200'],
+      'series_title_u_sstr' => ['Hidden Series'],
+      'series_level_u_sstr' => ['Series'],
+      'series_identifier_stored_u_sstr' => ['HS-1'],
+      'series_identifier_u_stext' => ['HS-1', 'HS 1', 'HS1', 'HS- 1'],
+      'collection_uri_u_sstr' => [],
+      'collection_display_string_u_sstr' => [],
+      'collection_identifier_stored_u_sstr' => [],
+      'collection_identifier_u_stext' => [],
+      'has_location_u_sbool' => true,
+      'location_uri_u_sstr' => [],
+      'location_uris' => [],
+      'location_display_string_u_sstr' => [],
+      'location_profile_display_string_u_sstr' => [],
+      'exported_u_sbool' => true,
+      'empty_u_sbool' => true,
+      'top_container_u_typeahead_utext' => 'emptybox',
+      'top_container_u_icusort' => 'Empty Box',
+      'barcode_u_sstr' => nil,
+      'barcode_u_icusort' => nil,
+      'ils_holding_id_u_sstr' => nil,
+      'subcontainer_barcodes_u_sstr' => nil,
+      'created_for_collection_u_sstr' => nil,
+      'primary_type' => 'top_container',
+      'types' => ['top_container'],
+      'json' => ASUtils.to_json(minimal_top_container['record']),
+      'suppressed' => false,
+      'publish' => false,
+      'system_generated' => 'false',
+      'repository' => 2,
+      'fullrecord_published' => [],
+      'fullrecord' => [],
+      'external_id' => [],
+      'ancestors' => [],
+      'langcode' => [],
+      '_archivalist_rust_fields' => [
+        'common_metadata',
+        'fullrecord',
+        'top_container_metadata',
+      ],
+    }
+
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [full_document, minimal_document])
+    )
+
+    expect(builder.build([full_top_container, minimal_top_container])).to eq(
+      full_top_container['uri'] => full_document,
+      minimal_top_container['uri'] => minimal_document
+    )
+
+    [
+      'series_identifier_u_stext',
+      'published_series_uri_u_sstr',
+      'collection_identifier_u_stext',
+      'container_profile_display_string_u_sstr',
+      'location_profile_display_string_u_sstr',
+      'indicator_u_icusort',
+    ].each do |required_field|
+      missing_doc = full_document.reject {|k, _| k == required_field}
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [missing_doc])
+      )
+      expect { builder.build([full_top_container]) }.to raise_error(
+        /enrichment fields missing.*#{Regexp.escape(required_field)}/
+      )
+    end
+  end
 end

@@ -95,7 +95,7 @@ Endpoints:
   when enrichment is requested, staff-index mappings for resources, archival
   objects, accessions, digital objects and components, subjects, classifications,
   repositories, events, locations, container profiles, location profiles,
-  assessments, and all agent authority types.
+  assessments, top containers, and all agent authority types.
 
 The example systemd unit in `deploy/` binds to loopback by default. Put authentication
 and transport security in front of the sidecar before exposing it beyond the local
@@ -108,8 +108,9 @@ The search, resource-tree, and index-document gates are automated by
 `scripts/canary_shadow_search.sh`, `scripts/canary_resource_tree.sh`, and
 `scripts/canary_index_document_builder.sh`. Staff-index enrichment parity is
 checked separately by `scripts/canary_index_document_enrichment.sh`; PUI
-full-record preparation intentionally remains native because inheritance is applied
-later in its pipeline.
+full-record preparation, publication decisions, and internal-note privacy
+filtering intentionally remain native because inheritance and PUI-specific rules
+are applied later in its pipeline.
 
 ## Test and benchmark helpers
 

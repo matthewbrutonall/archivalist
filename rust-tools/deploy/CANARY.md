@@ -170,15 +170,23 @@ fields. Container profiles, location profiles, and assessments use
 `profile_assessment_metadata`, including profile dimensions, units, notes, and
 typeahead sort keys, plus assessment linked records, collections, surveyors,
 reviewers, survey year ranges, booleans, formats, ratings, and conservation issues.
+Top containers use `top_container_metadata`, including series and collection
+URIs, titles, levels, and identifier permutations, published-series URIs and
+titles, resolved container-profile display strings, current container-location
+fields and deduplicated location-profile display strings, exported/empty booleans,
+indicator and barcode sort keys, ASCII typeahead text, ILS holding IDs,
+subcontainer barcodes, and created-for-collection URIs.
 Accession date localization and unresolved location owner-repository HTTP lookups
 remain native. All markers are removed before Solr and plugin hooks. It accounts
 for Solr's intentional copy-field merge of `notes_published` into `notes`. Only
 after this passes should `rust_index_document_enrichment_enabled` be set to `true`.
-The enrichment gate is staff-index only; PUI full-record extraction remains native
-after inheritance and privacy filtering. Before rollout, also require a complete
+The enrichment gate is staff-index only; PUI full-record extraction, top-container
+publication decisions (`is_linked_to_published_record` / `pui_container`), and PUI
+removal of `internal_note` and container-profile notes remain native after
+inheritance and privacy filtering. Before rollout, also require a complete
 native-versus-Rust reindex comparison so accessions, digital objects and
 components, subjects, agents, classifications, repositories, events, locations,
-container profiles, location profiles, and assessments are covered.
+container profiles, location profiles, assessments, and top containers are covered.
 
 ## Rollback
 
