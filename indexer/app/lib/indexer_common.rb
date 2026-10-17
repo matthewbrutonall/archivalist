@@ -492,7 +492,9 @@ class IndexerCommon
     }
 
     add_document_prepare_hook {|doc, record|
-      if doc['primary_type'] == 'repository'
+      rust_fields = Array(doc['_archivalist_rust_fields'])
+      if doc['primary_type'] == 'repository' &&
+         !rust_fields.include?('repository_event_location_metadata')
         doc['repository'] = doc["id"]
         doc['title'] = record['record']['repo_code']
         doc['title_sort'] = clean_for_sort(record['record']['display_string'])
@@ -505,14 +507,19 @@ class IndexerCommon
 
     add_document_prepare_hook {|doc, record|
       if doc['primary_type'] == 'location'
-        if record['record'].has_key? 'temporary'
-          doc['temporary'] = record['record']['temporary']
+        rust_fields = Array(doc['_archivalist_rust_fields'])
+        unless rust_fields.include?('repository_event_location_metadata')
+          if record['record'].has_key? 'temporary'
+            doc['temporary'] = record['record']['temporary']
+          end
+          doc['building'] = record['record']['building']
+          doc['floor'] = record['record']['floor']
+          doc['room'] = record['record']['room']
+          doc['area'] = record['record']['area']
         end
-        doc['building'] = record['record']['building']
-        doc['floor'] = record['record']['floor']
-        doc['room'] = record['record']['room']
-        doc['area'] = record['record']['area']
-        if record['record']['owner_repo']
+        if record['record']['owner_repo'] &&
+           (!rust_fields.include?('repository_event_location_metadata') ||
+            !doc.has_key?('owner_repo_display_string_u_ssort'))
           repo = JSONModel::HTTP.get_json(record['record']['owner_repo']['ref'])
           doc['owner_repo_uri_u_sstr'] = record['record']['owner_repo']['ref']
           doc['owner_repo_display_string_u_ssort'] = repo["repo_code"]
@@ -573,13 +580,17 @@ class IndexerCommon
     }
 
     add_document_prepare_hook {|doc, record|
-      if doc['primary_type'] == 'repository'
+      rust_fields = Array(doc['_archivalist_rust_fields'])
+      if doc['primary_type'] == 'repository' &&
+         !rust_fields.include?('repository_event_location_metadata')
         doc['repository'] = doc["id"]
       end
     }
 
     add_document_prepare_hook {|doc, record|
-      if doc['primary_type'] == 'event'
+      rust_fields = Array(doc['_archivalist_rust_fields'])
+      if doc['primary_type'] == 'event' &&
+         !rust_fields.include?('repository_event_location_metadata')
         doc['event_type'] = record['record']['event_type']
         doc['title'] = record['record']['event_type'] # adding this for emedded searches
         doc['outcome'] = record['record']['outcome']
@@ -687,7 +698,8 @@ class IndexerCommon
       unless rust_fields.include?('resource_archival_object_metadata') ||
              rust_fields.include?('accession_digital_object_metadata') ||
              rust_fields.include?('agent_subject_metadata') ||
-             rust_fields.include?('component_classification_metadata')
+             rust_fields.include?('component_classification_metadata') ||
+             rust_fields.include?('repository_event_location_metadata')
         doc['external_id'] = Array(record['record']['external_ids']).map do |eid|
           eid['external_id']
         end
@@ -799,7 +811,8 @@ class IndexerCommon
       unless rust_fields.include?('resource_archival_object_metadata') ||
              rust_fields.include?('accession_digital_object_metadata') ||
              rust_fields.include?('agent_subject_metadata') ||
-             rust_fields.include?('component_classification_metadata')
+             rust_fields.include?('component_classification_metadata') ||
+             rust_fields.include?('repository_event_location_metadata')
         four_part_id = (0..3).map {|n| record['record']["id_#{n}"]}.compact.join(" ")
 
         unless four_part_id.empty?
@@ -955,7 +968,9 @@ class IndexerCommon
         doc['typeahead_sort_key_u_sort'] = record['record']['display_string']
       end
 
-      if record['record']['location_profile']
+      rust_fields = Array(doc['_archivalist_rust_fields'])
+      if record['record']['location_profile'] &&
+         !rust_fields.include?('repository_event_location_metadata')
         doc['location_profile_uri_u_sstr'] = record['record']['location_profile']['ref']
         doc['location_profile_display_string_u_ssort'] = record['record']['location_profile']['_resolved']['display_string']
       end
@@ -966,7 +981,8 @@ class IndexerCommon
       unless rust_fields.include?('resource_archival_object_metadata') ||
              rust_fields.include?('accession_digital_object_metadata') ||
              rust_fields.include?('agent_subject_metadata') ||
-             rust_fields.include?('component_classification_metadata')
+             rust_fields.include?('component_classification_metadata') ||
+             rust_fields.include?('repository_event_location_metadata')
         doc['ancestors'] = ASUtils.wrap(record['record']['ancestors']).map {|ancestor|
           ancestor.fetch('ref')
         }
@@ -978,7 +994,8 @@ class IndexerCommon
       unless rust_fields.include?('resource_archival_object_metadata') ||
              rust_fields.include?('accession_digital_object_metadata') ||
              rust_fields.include?('agent_subject_metadata') ||
-             rust_fields.include?('component_classification_metadata')
+             rust_fields.include?('component_classification_metadata') ||
+             rust_fields.include?('repository_event_location_metadata')
         ASUtils.wrap(record['record']['rights_statements']).each do |rights_statement|
           ASUtils.wrap(rights_statement['linked_agents']).each do |agent_link|
             doc['rights_statement_agent_uris'] ||= []
@@ -1068,7 +1085,8 @@ class IndexerCommon
       unless rust_fields.include?('resource_archival_object_metadata') ||
              rust_fields.include?('accession_digital_object_metadata') ||
              rust_fields.include?('agent_subject_metadata') ||
-             rust_fields.include?('component_classification_metadata')
+             rust_fields.include?('component_classification_metadata') ||
+             rust_fields.include?('repository_event_location_metadata')
         doc['langcode'] ||= []
         if record['record'].has_key?('lang_materials') and record['record']['lang_materials'].is_a?(Array)
           record['record']['lang_materials'].each { |langmaterial|

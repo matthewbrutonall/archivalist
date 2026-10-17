@@ -42,6 +42,10 @@ class RustIndexDocumentBuilder
                          record['display_string']
                        elsif agent_types.include?(record_type)
                          record.dig('display_name', 'sort_name')
+                       elsif record_type == 'repository'
+                         input['enrich'] ? record['repo_code'] : record['title']
+                       elsif record_type == 'event'
+                         input['enrich'] ? record['event_type'] : record['title']
                        else
                          record['title']
                        end
@@ -51,7 +55,8 @@ class RustIndexDocumentBuilder
       expected_types << 'agent_with_user' if agent_types.include?(record_type) && record['is_user']
       expected_types << 'agent' if agent_types.include?(record_type)
       raise "response types mismatch for #{uri}" unless document['types'] == expected_types
-      raise "response repository mismatch for #{uri}" unless document['repository'] == input['repository']
+      expected_repository = record_type == 'repository' && input['enrich'] ? uri : input['repository']
+      raise "response repository mismatch for #{uri}" unless document['repository'] == expected_repository
       raise "response JSON missing for #{uri}" unless document['json'].is_a?(String)
       raise "response JSON mismatch for #{uri}" unless ASUtils.json_parse(document['json']) == record
       expected_suppressed = record.has_key?('suppressed') && record['suppressed']
@@ -70,6 +75,8 @@ class RustIndexDocumentBuilder
           expected_fields << 'agent_subject_metadata'
         elsif ['digital_object_component', 'classification', 'classification_term'].include?(record_type)
           expected_fields << 'component_classification_metadata'
+        elsif ['repository', 'event', 'location'].include?(record_type)
+          expected_fields << 'repository_event_location_metadata'
         end
         unless document['_archivalist_rust_fields'] == expected_fields
           raise "response enrichment marker mismatch for #{uri}"
@@ -152,6 +159,36 @@ class RustIndexDocumentBuilder
                             'identifier', 'external_id', 'ancestors', 'langcode'
                           ])
           required << 'classification' if record_type == 'classification_term'
+        elsif record_type == 'repository'
+          required.concat([
+                            'repository', 'title', 'title_sort', 'repo_sort',
+                            'slug', 'is_slug_auto', 'position_int_sort',
+                            'external_id', 'ancestors', 'langcode'
+                          ])
+        elsif record_type == 'event'
+          required.concat([
+                            'event_type', 'title', 'outcome',
+                            'linked_record_uris', 'linked_record_titles',
+                            'external_id', 'ancestors', 'langcode'
+                          ])
+        elsif record_type == 'location'
+          required.concat([
+                            'building', 'floor', 'room', 'area',
+                            'external_id', 'ancestors', 'langcode'
+                          ])
+          required << 'temporary' if record.has_key?('temporary')
+          if record['owner_repo'].is_a?(Hash)
+            required << 'owner_repo_uri_u_sstr'
+            if record.dig('owner_repo', '_resolved', 'repo_code') || record.dig('owner_repo', 'repo_code')
+              required << 'owner_repo_display_string_u_ssort'
+            end
+          end
+          if record['location_profile'].is_a?(Hash)
+            required.concat([
+                              'location_profile_uri_u_sstr',
+                              'location_profile_display_string_u_ssort'
+                            ])
+          end
         end
         if record_type == 'subject' || agent_types.include?(record_type)
           if record.has_key?('used_within_repositories')

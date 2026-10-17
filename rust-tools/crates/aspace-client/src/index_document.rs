@@ -1028,6 +1028,203 @@ fn add_classification_fields(
     Ok(())
 }
 
+fn strip_angle_tags(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(open) = rest.find('<') {
+        output.push_str(&rest[..open]);
+        let after_open = &rest[open + 1..];
+        match after_open.find('>') {
+            Some(0) => {
+                output.push('<');
+                rest = after_open;
+            }
+            Some(close) => {
+                rest = &after_open[close + 1..];
+            }
+            None => {
+                output.push_str(&rest[open..]);
+                return output;
+            }
+        }
+    }
+    output.push_str(rest);
+    output
+}
+
+fn clean_for_sort(value: &str) -> String {
+    let without_tags = strip_angle_tags(value);
+    let filtered: String = without_tags
+        .chars()
+        .map(|character| if character == '-' { ' ' } else { character })
+        .filter(|character| {
+            character.is_alphabetic()
+                || character.is_ascii_digit()
+                || character.is_whitespace()
+                || *character == '_'
+        })
+        .collect();
+    filtered.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn add_repository_fields(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let id = document.get("id").cloned().unwrap_or(Value::Null);
+    document.insert("repository".to_string(), id);
+    document.insert(
+        "title".to_string(),
+        record.get("repo_code").cloned().unwrap_or(Value::Null),
+    );
+    let title_sort = match record.get("display_string") {
+        None | Some(Value::Null) => Value::Null,
+        Some(Value::String(value)) => Value::String(clean_for_sort(value)),
+        Some(_) => return Err(error("field 'display_string' must be a string")),
+    };
+    document.insert("title_sort".to_string(), title_sort);
+    document.insert(
+        "repo_sort".to_string(),
+        record.get("display_string").cloned().unwrap_or(Value::Null),
+    );
+    for (document_field, record_field) in [
+        ("slug", "slug"),
+        ("is_slug_auto", "is_slug_auto"),
+        ("position_int_sort", "position"),
+    ] {
+        document.insert(
+            document_field.to_string(),
+            record.get(record_field).cloned().unwrap_or(Value::Null),
+        );
+    }
+    Ok(())
+}
+
+fn add_event_fields(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let event_type = record.get("event_type").cloned().unwrap_or(Value::Null);
+    document.insert("event_type".to_string(), event_type.clone());
+    document.insert("title".to_string(), event_type);
+    document.insert(
+        "outcome".to_string(),
+        record.get("outcome").cloned().unwrap_or(Value::Null),
+    );
+
+    let linked_records = record
+        .get("linked_records")
+        .and_then(Value::as_array)
+        .ok_or_else(|| error("field 'linked_records' must be an array"))?;
+    let mut linked_record_uris = Vec::new();
+    let mut linked_record_titles = Vec::new();
+    for linked_record in linked_records {
+        let linked_record = linked_record
+            .as_object()
+            .ok_or_else(|| error("linked_records entries must be objects"))?;
+        linked_record_uris.push(linked_record.get("ref").cloned().unwrap_or(Value::Null));
+        let resolved = linked_record
+            .get("_resolved")
+            .and_then(Value::as_object)
+            .ok_or_else(|| error("linked_records entries must contain _resolved"))?;
+        let title = match resolved.get("jsonmodel_type").and_then(Value::as_str) {
+            Some("agent_person" | "agent_family" | "agent_corporate_entity" | "agent_software") => {
+                let display_name = resolved
+                    .get("display_name")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        error("linked_records agent entries must contain _resolved.display_name")
+                    })?;
+                display_name
+                    .get("sort_name")
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            }
+            Some("accession" | "resource" | "digital_object" | "digital_object_component") => {
+                resolved.get("title").cloned().unwrap_or(Value::Null)
+            }
+            Some("archival_object") => resolved
+                .get("display_string")
+                .cloned()
+                .unwrap_or(Value::Null),
+            _ => Value::String("not_found".to_string()),
+        };
+        linked_record_titles.push(title);
+    }
+    document.insert(
+        "linked_record_uris".to_string(),
+        Value::Array(linked_record_uris),
+    );
+    document.insert(
+        "linked_record_titles".to_string(),
+        Value::Array(linked_record_titles),
+    );
+    Ok(())
+}
+
+fn add_location_fields(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    if let Some(temporary) = record.get("temporary") {
+        document.insert("temporary".to_string(), temporary.clone());
+    }
+    for field in ["building", "floor", "room", "area"] {
+        document.insert(
+            field.to_string(),
+            record.get(field).cloned().unwrap_or(Value::Null),
+        );
+    }
+    if let Some(owner_repo) = record
+        .get("owner_repo")
+        .filter(|value| ruby_truthy(Some(value)))
+    {
+        let owner_repo = owner_repo
+            .as_object()
+            .ok_or_else(|| error("field 'owner_repo' must be an object"))?;
+        document.insert(
+            "owner_repo_uri_u_sstr".to_string(),
+            owner_repo.get("ref").cloned().unwrap_or(Value::Null),
+        );
+        if let Some(repo_code) = owner_repo
+            .get("_resolved")
+            .and_then(Value::as_object)
+            .and_then(|resolved| resolved.get("repo_code"))
+            .or_else(|| owner_repo.get("repo_code"))
+            .filter(|value| !value.is_null())
+        {
+            document.insert(
+                "owner_repo_display_string_u_ssort".to_string(),
+                repo_code.clone(),
+            );
+        }
+    }
+    if let Some(location_profile) = record
+        .get("location_profile")
+        .filter(|value| ruby_truthy(Some(value)))
+    {
+        let location_profile = location_profile
+            .as_object()
+            .ok_or_else(|| error("field 'location_profile' must be an object"))?;
+        document.insert(
+            "location_profile_uri_u_sstr".to_string(),
+            location_profile.get("ref").cloned().unwrap_or(Value::Null),
+        );
+        let resolved = location_profile
+            .get("_resolved")
+            .and_then(Value::as_object)
+            .ok_or_else(|| error("location_profile must contain _resolved"))?;
+        document.insert(
+            "location_profile_display_string_u_ssort".to_string(),
+            resolved
+                .get("display_string")
+                .cloned()
+                .unwrap_or(Value::Null),
+        );
+    }
+    Ok(())
+}
+
 fn add_type_specific_fields(
     document: &mut Map<String, Value>,
     record_type: &str,
@@ -1163,6 +1360,18 @@ fn add_type_specific_fields(
         "classification" | "classification_term" => {
             add_classification_fields(document, record_type, record)?;
             markers.push(json_string("component_classification_metadata"));
+        }
+        "repository" => {
+            add_repository_fields(document, record)?;
+            markers.push(json_string("repository_event_location_metadata"));
+        }
+        "event" => {
+            add_event_fields(document, record)?;
+            markers.push(json_string("repository_event_location_metadata"));
+        }
+        "location" => {
+            add_location_fields(document, record)?;
+            markers.push(json_string("repository_event_location_metadata"));
         }
         _ => return Ok(markers),
     }
@@ -1953,6 +2162,287 @@ mod tests {
                 "component_classification_metadata"
             ])
         );
+    }
+
+    #[test]
+    fn builds_repository_specific_staff_index_fields() {
+        let document = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2".to_string(),
+            record_type: "repository".to_string(),
+            repository: Value::String("global".to_string()),
+            record: json!({
+                "uri": "/repositories/2",
+                "repo_code": "ARCH-2",
+                "display_string": "<em>St. Mary's</em> — Diocesan-Archives!",
+                "publish": true,
+                "slug": "st-marys-diocesan-archives",
+                "is_slug_auto": false,
+                "position": 4,
+                "external_ids": [{"external_id": "repo-ext-2"}],
+                "ancestors": [],
+                "lang_materials": [{"language_and_script": {"language": "eng"}}]
+            }),
+            enrich: true,
+        })
+        .unwrap();
+
+        assert_eq!(document["id"], "/repositories/2");
+        assert_eq!(document["repository"], "/repositories/2");
+        assert_eq!(document["title"], "ARCH-2");
+        assert_eq!(document["title_sort"], "St Marys Diocesan Archives");
+        assert_eq!(
+            document["repo_sort"],
+            "<em>St. Mary's</em> — Diocesan-Archives!"
+        );
+        assert_eq!(document["slug"], "st-marys-diocesan-archives");
+        assert_eq!(document["is_slug_auto"], false);
+        assert_eq!(document["position_int_sort"], 4);
+        assert_eq!(document["external_id"], json!(["repo-ext-2"]));
+        assert_eq!(document["ancestors"], json!([]));
+        assert_eq!(document["langcode"], json!(["eng"]));
+        assert_eq!(
+            document["_archivalist_rust_fields"],
+            json!([
+                "common_metadata",
+                "fullrecord",
+                "repository_event_location_metadata"
+            ])
+        );
+    }
+
+    #[test]
+    fn builds_event_specific_staff_index_fields_for_all_linked_record_types() {
+        let document = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/events/11".to_string(),
+            record_type: "event".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/events/11",
+                "event_type": "custody_transfer",
+                "outcome": "pass",
+                "publish": false,
+                "linked_records": [
+                    {
+                        "ref": "/agents/people/1",
+                        "_resolved": {
+                            "jsonmodel_type": "agent_person",
+                            "display_name": {"sort_name": "Person, One"}
+                        }
+                    },
+                    {
+                        "ref": "/agents/families/2",
+                        "_resolved": {
+                            "jsonmodel_type": "agent_family",
+                            "display_name": {"sort_name": "Family, Two"}
+                        }
+                    },
+                    {
+                        "ref": "/agents/corporate_entities/3",
+                        "_resolved": {
+                            "jsonmodel_type": "agent_corporate_entity",
+                            "display_name": {"sort_name": "Corporation, Three"}
+                        }
+                    },
+                    {
+                        "ref": "/agents/software/4",
+                        "_resolved": {
+                            "jsonmodel_type": "agent_software",
+                            "display_name": {"sort_name": "Software, Four"}
+                        }
+                    },
+                    {
+                        "ref": "/repositories/2/accessions/5",
+                        "_resolved": {
+                            "jsonmodel_type": "accession",
+                            "title": "Accession Five"
+                        }
+                    },
+                    {
+                        "ref": "/repositories/2/resources/6",
+                        "_resolved": {
+                            "jsonmodel_type": "resource",
+                            "title": "Resource Six"
+                        }
+                    },
+                    {
+                        "ref": "/repositories/2/digital_objects/7",
+                        "_resolved": {
+                            "jsonmodel_type": "digital_object",
+                            "title": "Digital Object Seven"
+                        }
+                    },
+                    {
+                        "ref": "/repositories/2/digital_object_components/8",
+                        "_resolved": {
+                            "jsonmodel_type": "digital_object_component",
+                            "title": "Component Eight"
+                        }
+                    },
+                    {
+                        "ref": "/repositories/2/archival_objects/9",
+                        "_resolved": {
+                            "jsonmodel_type": "archival_object",
+                            "display_string": "Archival Object Nine"
+                        }
+                    },
+                    {
+                        "ref": "/repositories/2/top_containers/10",
+                        "_resolved": {
+                            "jsonmodel_type": "top_container",
+                            "display_string": "Box 10"
+                        }
+                    }
+                ],
+                "external_ids": [{"external_id": "event-11"}],
+                "ancestors": []
+            }),
+            enrich: true,
+        })
+        .unwrap();
+
+        assert_eq!(document["event_type"], "custody_transfer");
+        assert_eq!(document["title"], "custody_transfer");
+        assert_eq!(document["outcome"], "pass");
+        assert_eq!(
+            document["linked_record_uris"],
+            json!([
+                "/agents/people/1",
+                "/agents/families/2",
+                "/agents/corporate_entities/3",
+                "/agents/software/4",
+                "/repositories/2/accessions/5",
+                "/repositories/2/resources/6",
+                "/repositories/2/digital_objects/7",
+                "/repositories/2/digital_object_components/8",
+                "/repositories/2/archival_objects/9",
+                "/repositories/2/top_containers/10"
+            ])
+        );
+        assert_eq!(
+            document["linked_record_titles"],
+            json!([
+                "Person, One",
+                "Family, Two",
+                "Corporation, Three",
+                "Software, Four",
+                "Accession Five",
+                "Resource Six",
+                "Digital Object Seven",
+                "Component Eight",
+                "Archival Object Nine",
+                "not_found"
+            ])
+        );
+        assert_eq!(document["external_id"], json!(["event-11"]));
+        assert_eq!(document["ancestors"], json!([]));
+        assert_eq!(document["langcode"], json!([]));
+        assert_eq!(
+            document["_archivalist_rust_fields"],
+            json!([
+                "common_metadata",
+                "fullrecord",
+                "repository_event_location_metadata"
+            ])
+        );
+    }
+
+    #[test]
+    fn builds_location_specific_staff_index_fields_with_and_without_resolved_relations() {
+        let resolved_location = build_index_document(IndexDocumentInput {
+            uri: "/locations/15".to_string(),
+            record_type: "location".to_string(),
+            repository: Value::String("global".to_string()),
+            record: json!({
+                "uri": "/locations/15",
+                "title": "Main Vault, Bay 3",
+                "publish": false,
+                "temporary": "conservation",
+                "building": "Main Vault",
+                "floor": "1",
+                "room": "A",
+                "area": "Bay 3",
+                "owner_repo": {
+                    "ref": "/repositories/2",
+                    "_resolved": {"repo_code": "ARCH-2"}
+                },
+                "location_profile": {
+                    "ref": "/location_profiles/4",
+                    "_resolved": {"display_string": "Standard folio shelf"}
+                },
+                "external_ids": [{"external_id": "loc-15"}],
+                "ancestors": []
+            }),
+            enrich: true,
+        })
+        .unwrap();
+
+        assert_eq!(resolved_location["temporary"], "conservation");
+        assert_eq!(resolved_location["building"], "Main Vault");
+        assert_eq!(resolved_location["floor"], "1");
+        assert_eq!(resolved_location["room"], "A");
+        assert_eq!(resolved_location["area"], "Bay 3");
+        assert_eq!(
+            resolved_location["owner_repo_uri_u_sstr"],
+            "/repositories/2"
+        );
+        assert_eq!(
+            resolved_location["owner_repo_display_string_u_ssort"],
+            "ARCH-2"
+        );
+        assert_eq!(
+            resolved_location["location_profile_uri_u_sstr"],
+            "/location_profiles/4"
+        );
+        assert_eq!(
+            resolved_location["location_profile_display_string_u_ssort"],
+            "Standard folio shelf"
+        );
+        assert_eq!(resolved_location["external_id"], json!(["loc-15"]));
+        assert_eq!(
+            resolved_location["_archivalist_rust_fields"],
+            json!([
+                "common_metadata",
+                "fullrecord",
+                "repository_event_location_metadata"
+            ])
+        );
+
+        let unresolved_owner_repo = build_index_document(IndexDocumentInput {
+            uri: "/locations/16".to_string(),
+            record_type: "location".to_string(),
+            repository: Value::String("global".to_string()),
+            record: json!({
+                "uri": "/locations/16",
+                "title": "Annex, Room 2",
+                "publish": false,
+                "building": "Annex",
+                "floor": Value::Null,
+                "room": "2",
+                "area": Value::Null,
+                "owner_repo": {"ref": "/repositories/2"}
+            }),
+            enrich: true,
+        })
+        .unwrap();
+
+        assert!(unresolved_owner_repo.get("temporary").is_none());
+        assert_eq!(unresolved_owner_repo["building"], "Annex");
+        assert_eq!(unresolved_owner_repo["floor"], Value::Null);
+        assert_eq!(unresolved_owner_repo["room"], "2");
+        assert_eq!(unresolved_owner_repo["area"], Value::Null);
+        assert_eq!(
+            unresolved_owner_repo["owner_repo_uri_u_sstr"],
+            "/repositories/2"
+        );
+        assert!(unresolved_owner_repo
+            .get("owner_repo_display_string_u_ssort")
+            .is_none());
+        assert!(unresolved_owner_repo
+            .get("location_profile_uri_u_sstr")
+            .is_none());
+        assert!(unresolved_owner_repo
+            .get("location_profile_display_string_u_ssort")
+            .is_none());
     }
 
     #[test]

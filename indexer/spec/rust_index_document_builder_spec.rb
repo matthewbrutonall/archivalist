@@ -318,4 +318,216 @@ describe RustIndexDocumentBuilder do
 
     expect(builder.build([classification])).to eq(classification['uri'] => document)
   end
+
+  it 'accepts enrichment for repositories and events' do
+    repository = {
+      'uri' => '/repositories/2',
+      'record_type' => 'repository',
+      'repository' => 'global',
+      'enrich' => true,
+      'record' => {
+        'uri' => '/repositories/2',
+        'repo_code' => 'ARCH-2',
+        'display_string' => 'Example Archives',
+        'publish' => true,
+        'slug' => 'example-archives',
+        'is_slug_auto' => true,
+        'position' => 1,
+      },
+    }
+    repository_document = {
+      'id' => repository['uri'],
+      'uri' => repository['uri'],
+      'title' => 'ARCH-2',
+      'title_sort' => 'Example Archives',
+      'repo_sort' => 'Example Archives',
+      'primary_type' => 'repository',
+      'types' => ['repository'],
+      'json' => ASUtils.to_json(repository['record']),
+      'suppressed' => false,
+      'publish' => true,
+      'system_generated' => 'false',
+      'repository' => '/repositories/2',
+      'fullrecord_published' => [],
+      'fullrecord' => [],
+      'slug' => 'example-archives',
+      'is_slug_auto' => true,
+      'position_int_sort' => 1,
+      'external_id' => [],
+      'ancestors' => [],
+      'langcode' => [],
+      '_archivalist_rust_fields' => [
+        'common_metadata',
+        'fullrecord',
+        'repository_event_location_metadata',
+      ],
+    }
+
+    event = {
+      'uri' => '/repositories/2/events/11',
+      'record_type' => 'event',
+      'repository' => 2,
+      'enrich' => true,
+      'record' => {
+        'uri' => '/repositories/2/events/11',
+        'event_type' => 'custody_transfer',
+        'outcome' => 'pass',
+        'publish' => false,
+        'linked_records' => [
+          {
+            'ref' => '/repositories/2/resources/7',
+            '_resolved' => {'jsonmodel_type' => 'resource', 'title' => 'Sánchez papers'},
+          },
+        ],
+      },
+    }
+    event_document = {
+      'id' => event['uri'],
+      'uri' => event['uri'],
+      'title' => 'custody_transfer',
+      'event_type' => 'custody_transfer',
+      'outcome' => 'pass',
+      'primary_type' => 'event',
+      'types' => ['event'],
+      'json' => ASUtils.to_json(event['record']),
+      'suppressed' => false,
+      'publish' => false,
+      'system_generated' => 'false',
+      'repository' => 2,
+      'fullrecord_published' => [],
+      'fullrecord' => [],
+      'linked_record_uris' => ['/repositories/2/resources/7'],
+      'linked_record_titles' => ['Sánchez papers'],
+      'external_id' => [],
+      'ancestors' => [],
+      'langcode' => [],
+      '_archivalist_rust_fields' => [
+        'common_metadata',
+        'fullrecord',
+        'repository_event_location_metadata',
+      ],
+    }
+
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [repository_document, event_document])
+    )
+
+    expect(builder.build([repository, event])).to eq(
+      repository['uri'] => repository_document,
+      event['uri'] => event_document
+    )
+  end
+
+  it 'accepts location enrichment with resolved or unresolved owner_repo and location_profile' do
+    resolved_location = {
+      'uri' => '/locations/15',
+      'record_type' => 'location',
+      'repository' => 'global',
+      'enrich' => true,
+      'record' => {
+        'uri' => '/locations/15',
+        'title' => 'Main Vault, Bay 3',
+        'publish' => false,
+        'temporary' => 'conservation',
+        'building' => 'Main Vault',
+        'floor' => '1',
+        'room' => 'A',
+        'area' => 'Bay 3',
+        'owner_repo' => {
+          'ref' => '/repositories/2',
+          '_resolved' => {'repo_code' => 'ARCH-2'},
+        },
+        'location_profile' => {
+          'ref' => '/location_profiles/4',
+          '_resolved' => {'display_string' => 'Standard folio shelf'},
+        },
+      },
+    }
+    resolved_document = {
+      'id' => resolved_location['uri'],
+      'uri' => resolved_location['uri'],
+      'title' => 'Main Vault, Bay 3',
+      'primary_type' => 'location',
+      'types' => ['location'],
+      'json' => ASUtils.to_json(resolved_location['record']),
+      'suppressed' => false,
+      'publish' => false,
+      'system_generated' => 'false',
+      'repository' => 'global',
+      'fullrecord_published' => [],
+      'fullrecord' => [],
+      'temporary' => 'conservation',
+      'building' => 'Main Vault',
+      'floor' => '1',
+      'room' => 'A',
+      'area' => 'Bay 3',
+      'owner_repo_uri_u_sstr' => '/repositories/2',
+      'owner_repo_display_string_u_ssort' => 'ARCH-2',
+      'location_profile_uri_u_sstr' => '/location_profiles/4',
+      'location_profile_display_string_u_ssort' => 'Standard folio shelf',
+      'external_id' => [],
+      'ancestors' => [],
+      'langcode' => [],
+      '_archivalist_rust_fields' => [
+        'common_metadata',
+        'fullrecord',
+        'repository_event_location_metadata',
+      ],
+    }
+
+    unresolved_location = {
+      'uri' => '/locations/16',
+      'record_type' => 'location',
+      'repository' => 'global',
+      'enrich' => true,
+      'record' => {
+        'uri' => '/locations/16',
+        'title' => 'Annex, Room 2',
+        'publish' => false,
+        'building' => 'Annex',
+        'floor' => nil,
+        'room' => '2',
+        'area' => nil,
+        'owner_repo' => {'ref' => '/repositories/2'},
+      },
+    }
+    unresolved_document = {
+      'id' => unresolved_location['uri'],
+      'uri' => unresolved_location['uri'],
+      'title' => 'Annex, Room 2',
+      'primary_type' => 'location',
+      'types' => ['location'],
+      'json' => ASUtils.to_json(unresolved_location['record']),
+      'suppressed' => false,
+      'publish' => false,
+      'system_generated' => 'false',
+      'repository' => 'global',
+      'fullrecord_published' => [],
+      'fullrecord' => [],
+      'building' => 'Annex',
+      'floor' => nil,
+      'room' => '2',
+      'area' => nil,
+      'owner_repo_uri_u_sstr' => '/repositories/2',
+      'external_id' => [],
+      'ancestors' => [],
+      'langcode' => [],
+      '_archivalist_rust_fields' => [
+        'common_metadata',
+        'fullrecord',
+        'repository_event_location_metadata',
+      ],
+    }
+
+    allow(builder).to receive(:perform_request).and_return(
+      response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                      'documents' => [resolved_document, unresolved_document])
+    )
+
+    expect(builder.build([resolved_location, unresolved_location])).to eq(
+      resolved_location['uri'] => resolved_document,
+      unresolved_location['uri'] => unresolved_document
+    )
+  end
 end

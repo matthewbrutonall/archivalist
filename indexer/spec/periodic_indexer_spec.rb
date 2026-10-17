@@ -361,5 +361,156 @@ describe "periodic indexer" do
       expect(doc['identifier']).to eq('RUST-9')
       expect(doc).not_to have_key('_archivalist_rust_fields')
     end
+
+    it "retains Rust repository and event fields and removes handoff metadata" do
+      repository = JSONModel(:repository).from_hash(
+        'uri' => '/repositories/2',
+        'repo_code' => 'NATIVE-REPO',
+        'name' => 'Native Repository',
+        'display_string' => 'Native Repository',
+        'slug' => 'native-repo',
+        'is_slug_auto' => true,
+        'position' => 2
+      )
+      event = build(:json_event,
+                    'uri' => '/repositories/2/events/11',
+                    'event_type' => 'ingestion',
+                    'outcome' => 'pass',
+                    'linked_records' => [
+                      {
+                        'ref' => '/repositories/2/resources/1',
+                        'role' => 'outcome',
+                        '_resolved' => {
+                          'jsonmodel_type' => 'resource',
+                          'title' => 'Native Resource',
+                        },
+                      },
+                    ])
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prepared, documents|
+          doc = indexer.native_index_document(
+            prepared[:uri], prepared[:record_type], prepared[:values]
+          )
+          doc['fullrecord_published'] = []
+          doc['fullrecord'] = []
+          doc['external_id'] = []
+          doc['ancestors'] = []
+          doc['langcode'] = []
+          if prepared[:record_type] == 'repository'
+            doc['repository'] = prepared[:uri]
+            doc['title'] = 'RUST-REPO'
+            doc['title_sort'] = 'Rust Repository Sort'
+            doc['repo_sort'] = 'Rust Repository'
+            doc['slug'] = 'rust-repo'
+            doc['is_slug_auto'] = false
+            doc['position_int_sort'] = 9
+          else
+            doc['event_type'] = 'custody_transfer'
+            doc['title'] = 'custody_transfer'
+            doc['outcome'] = 'fail'
+            doc['linked_record_uris'] = ['/repositories/2/resources/99']
+            doc['linked_record_titles'] = ['Rust Resource']
+          end
+          doc['_archivalist_rust_fields'] = [
+            'common_metadata',
+            'fullrecord',
+            'repository_event_location_metadata',
+          ]
+          documents[prepared[:uri]] = doc
+        end
+      end
+
+      indexer.prepare_docs([repository, event])
+      repo_doc = indexer.records.find {|d| d['primary_type'] == 'repository'}
+      event_doc = indexer.records.find {|d| d['primary_type'] == 'event'}
+
+      expect(repo_doc['repository']).to eq('/repositories/2')
+      expect(repo_doc['title']).to eq('RUST-REPO')
+      expect(repo_doc['title_sort']).to eq('Rust Repository Sort')
+      expect(repo_doc['repo_sort']).to eq('Rust Repository')
+      expect(repo_doc['slug']).to eq('rust-repo')
+      expect(repo_doc['position_int_sort']).to eq(9)
+      expect(repo_doc).not_to have_key('_archivalist_rust_fields')
+
+      expect(event_doc['event_type']).to eq('custody_transfer')
+      expect(event_doc['title']).to eq('custody_transfer')
+      expect(event_doc['outcome']).to eq('fail')
+      expect(event_doc['linked_record_uris']).to eq(['/repositories/2/resources/99'])
+      expect(event_doc['linked_record_titles']).to eq(['Rust Resource'])
+      expect(event_doc).not_to have_key('_archivalist_rust_fields')
+    end
+
+    it "retains Rust location fields while keeping unresolved owner_repo lookup native" do
+      resolved_location = build(:json_location,
+                                'uri' => '/locations/15',
+                                'title' => 'Main Vault',
+                                'building' => 'Native Building',
+                                'floor' => '1',
+                                'room' => 'A',
+                                'area' => 'Bay 3',
+                                'owner_repo' => {'ref' => '/repositories/2'},
+                                'location_profile' => {
+                                  'ref' => '/location_profiles/4',
+                                  '_resolved' => {'display_string' => 'Native Shelf'},
+                                })
+      unresolved_location = build(:json_location,
+                                  'uri' => '/locations/16',
+                                  'title' => 'Annex Vault',
+                                  'building' => 'Native Annex',
+                                  'owner_repo' => {'ref' => '/repositories/3'})
+
+      allow(JSONModel::HTTP).to receive(:get_json).with('/repositories/3').and_return(
+        'repo_code' => 'NATIVE-FETCHED-3'
+      )
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prepared, documents|
+          doc = indexer.native_index_document(
+            prepared[:uri], prepared[:record_type], prepared[:values]
+          )
+          doc['fullrecord_published'] = []
+          doc['fullrecord'] = []
+          doc['building'] = 'Rust Building'
+          doc['floor'] = '9'
+          doc['room'] = 'R'
+          doc['area'] = 'Rust Area'
+          doc['external_id'] = []
+          doc['ancestors'] = []
+          doc['langcode'] = []
+          if prepared[:uri] == '/locations/15'
+            doc['owner_repo_uri_u_sstr'] = '/repositories/2'
+            doc['owner_repo_display_string_u_ssort'] = 'RUST-REPO-2'
+            doc['location_profile_uri_u_sstr'] = '/location_profiles/4'
+            doc['location_profile_display_string_u_ssort'] = 'Rust Shelf'
+          else
+            doc['owner_repo_uri_u_sstr'] = '/repositories/3'
+          end
+          doc['_archivalist_rust_fields'] = [
+            'common_metadata',
+            'fullrecord',
+            'repository_event_location_metadata',
+          ]
+          documents[prepared[:uri]] = doc
+        end
+      end
+
+      indexer.prepare_docs([resolved_location, unresolved_location])
+      resolved_doc = indexer.records.find {|d| d['id'] == '/locations/15'}
+      unresolved_doc = indexer.records.find {|d| d['id'] == '/locations/16'}
+
+      expect(JSONModel::HTTP).not_to have_received(:get_json).with('/repositories/2')
+      expect(JSONModel::HTTP).to have_received(:get_json).with('/repositories/3')
+
+      expect(resolved_doc['building']).to eq('Rust Building')
+      expect(resolved_doc['owner_repo_display_string_u_ssort']).to eq('RUST-REPO-2')
+      expect(resolved_doc['location_profile_display_string_u_ssort']).to eq('Rust Shelf')
+      expect(resolved_doc).not_to have_key('_archivalist_rust_fields')
+
+      expect(unresolved_doc['building']).to eq('Rust Building')
+      expect(unresolved_doc['owner_repo_uri_u_sstr']).to eq('/repositories/3')
+      expect(unresolved_doc['owner_repo_display_string_u_ssort']).to eq('NATIVE-FETCHED-3')
+      expect(unresolved_doc).not_to have_key('_archivalist_rust_fields')
+    end
   end
 end

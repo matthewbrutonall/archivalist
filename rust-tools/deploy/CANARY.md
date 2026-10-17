@@ -163,14 +163,18 @@ joined by `accession_digital_object_metadata` for accessions and digital objects
 Subject and agent authority mappings use `agent_subject_metadata`, including
 authority identifiers, rules, repository usage, related agents, and nested
 subject/place terms. Digital-object components and classifications use
-`component_classification_metadata`. Accession date localization remains native.
-All markers are removed before Solr and plugin hooks. It accounts for Solr's
-intentional copy-field merge of `notes_published` into `notes`. Only after this passes should
-`rust_index_document_enrichment_enabled` be set to `true`. The enrichment gate is
-staff-index only; PUI full-record extraction remains native after inheritance and
-privacy filtering. Before rollout, also require a complete native-versus-Rust
-reindex comparison so accessions, digital objects and components, subjects, agents,
-and classifications are covered.
+`component_classification_metadata`. Repositories, events, and locations use
+`repository_event_location_metadata`, including repository sort fields, event
+linked-record titles and URIs, and location profile and resolved owner-repository
+fields. Accession date localization and unresolved location owner-repository HTTP
+lookups remain native. All markers are removed before Solr and plugin hooks. It
+accounts for Solr's intentional copy-field merge of `notes_published` into `notes`.
+Only after this passes should `rust_index_document_enrichment_enabled` be set to
+`true`. The enrichment gate is staff-index only; PUI full-record extraction remains
+native after inheritance and privacy filtering. Before rollout, also require a
+complete native-versus-Rust reindex comparison so accessions, digital objects and
+components, subjects, agents, classifications, repositories, events, and locations
+are covered.
 
 ## Rollback
 
