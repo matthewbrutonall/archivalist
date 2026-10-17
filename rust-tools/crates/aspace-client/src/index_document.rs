@@ -16,6 +16,10 @@ pub struct IndexDocumentInput {
     pub dynamic_enum_fields: Vec<String>,
     #[serde(default)]
     pub arks_enabled: bool,
+    #[serde(default, alias = "accession_date_unknown")]
+    pub accession_date_unknown_label: Option<String>,
+    #[serde(default)]
+    pub parsed_accession_date_year: Option<Value>,
 }
 
 impl Default for IndexDocumentInput {
@@ -28,6 +32,8 @@ impl Default for IndexDocumentInput {
             enrich: false,
             dynamic_enum_fields: Vec::new(),
             arks_enabled: false,
+            accession_date_unknown_label: None,
+            parsed_accession_date_year: None,
         }
     }
 }
@@ -2195,10 +2201,82 @@ fn add_job_fields(
     Ok(())
 }
 
+fn add_accession_date_fields(
+    document: &mut Map<String, Value>,
+    record: &Map<String, Value>,
+    unknown_label: Option<&str>,
+    parsed_year_val: Option<&Value>,
+    markers: &mut Vec<Value>,
+) -> Result<(), IndexDocumentError> {
+    let raw_val = record
+        .get("accession_date")
+        .ok_or_else(|| error("field 'accession_date' is required for accession record"))?;
+    let raw_str = match raw_val {
+        Value::String(s) => s,
+        _ => return Err(error("field 'accession_date' must be a string")),
+    };
+
+    let year_value = parsed_year_val.ok_or_else(|| {
+        error("field 'parsed_accession_date_year' is required for accession record")
+    })?;
+    let year_num = match year_value {
+        Value::Number(n) => n,
+        _ => {
+            return Err(error(
+                "field 'parsed_accession_date_year' must be an integer",
+            ))
+        }
+    };
+    let year_i64 = year_num
+        .as_i64()
+        .ok_or_else(|| error("field 'parsed_accession_date_year' must be an integer"))?;
+    if year_i64 < (i32::MIN as i64) || year_i64 > (i32::MAX as i64) {
+        return Err(error(format!(
+            "field 'parsed_accession_date_year' {year_i64} is out of valid signed 32-bit integer range"
+        )));
+    }
+    let year = year_i64 as i32;
+
+    if raw_str == "9999-12-31" {
+        let label = unknown_label.filter(|l| !l.is_empty()).ok_or_else(|| {
+            error(
+                "accession_date_unknown_label is required for sentinel accession_date '9999-12-31'",
+            )
+        })?;
+        document.insert(
+            "accession_date".to_string(),
+            Value::String(label.to_string()),
+        );
+        document.insert(
+            "accession_date_year".to_string(),
+            Value::Number(year.into()),
+        );
+        let fullrecord = document
+            .get_mut("fullrecord")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| error("field 'fullrecord' must be an array in document"))?;
+        fullrecord.push(Value::String(format!("{label} ")));
+    } else {
+        document.insert(
+            "accession_date".to_string(),
+            Value::String(raw_str.to_string()),
+        );
+        document.insert(
+            "accession_date_year".to_string(),
+            Value::Number(year.into()),
+        );
+    }
+
+    markers.push(json_string("accession_date_metadata"));
+    Ok(())
+}
+
 fn add_type_specific_fields(
     document: &mut Map<String, Value>,
     record_type: &str,
     record: &Map<String, Value>,
+    unknown_label: Option<&str>,
+    parsed_accession_date_year: Option<&Value>,
 ) -> Result<Vec<Value>, IndexDocumentError> {
     let mut markers = Vec::new();
     match record_type {
@@ -2285,6 +2363,13 @@ fn add_type_specific_fields(
             );
             add_collection_management_fields(document, record);
             markers.push(json_string("accession_digital_object_metadata"));
+            add_accession_date_fields(
+                document,
+                record,
+                unknown_label,
+                parsed_accession_date_year,
+                &mut markers,
+            )?;
         }
         "digital_object" => {
             for field in [
@@ -2387,9 +2472,17 @@ fn add_record_type_markers(
     document: &mut Map<String, Value>,
     record_type: &str,
     record: &Map<String, Value>,
+    unknown_label: Option<&str>,
+    parsed_accession_date_year: Option<&Value>,
     rust_fields: &mut Vec<Value>,
 ) -> Result<(), IndexDocumentError> {
-    for marker in add_type_specific_fields(document, record_type, record)? {
+    for marker in add_type_specific_fields(
+        document,
+        record_type,
+        record,
+        unknown_label,
+        parsed_accession_date_year,
+    )? {
         if !rust_fields.contains(&marker) {
             rust_fields.push(marker);
         }
@@ -2550,11 +2643,8 @@ fn add_arks(
 
 fn add_enriched_fields(
     document: &mut Map<String, Value>,
-    record_type: &str,
+    input: &IndexDocumentInput,
     record: &Map<String, Value>,
-    full_record: &Value,
-    dynamic_enum_fields: &[String],
-    arks_enabled: bool,
 ) -> Result<(), IndexDocumentError> {
     add_subjects(document, record)?;
     add_agents(document, record)?;
@@ -2621,7 +2711,7 @@ fn add_enriched_fields(
             .collect();
         document.insert("extents".to_string(), Value::Array(values));
     }
-    let (published, unpublished) = extract_string_values(full_record);
+    let (published, unpublished) = extract_string_values(&input.record);
     document.insert(
         "fullrecord_published".to_string(),
         Value::Array(published.into_iter().map(Value::String).collect()),
@@ -2631,9 +2721,16 @@ fn add_enriched_fields(
         Value::Array(unpublished.into_iter().map(Value::String).collect()),
     );
     let mut rust_fields = vec![json_string("common_metadata"), json_string("fullrecord")];
-    add_record_type_markers(document, record_type, record, &mut rust_fields)?;
-    add_dynamic_enums(document, full_record, dynamic_enum_fields);
-    if arks_enabled {
+    add_record_type_markers(
+        document,
+        &input.record_type,
+        record,
+        input.accession_date_unknown_label.as_deref(),
+        input.parsed_accession_date_year.as_ref(),
+        &mut rust_fields,
+    )?;
+    add_dynamic_enums(document, &input.record, &input.dynamic_enum_fields);
+    if input.arks_enabled {
         add_arks(document, record)?;
     }
     rust_fields.push(json_string("dynamic_enum_and_ark_metadata"));
@@ -2690,7 +2787,7 @@ pub fn build_index_document(input: IndexDocumentInput) -> Result<Value, IndexDoc
 
     let mut document = Map::new();
     document.insert("id".to_string(), Value::String(input.uri.clone()));
-    document.insert("uri".to_string(), Value::String(input.uri));
+    document.insert("uri".to_string(), Value::String(input.uri.clone()));
     document.insert("title".to_string(), title);
     document.insert(
         "primary_type".to_string(),
@@ -2713,17 +2810,10 @@ pub fn build_index_document(input: IndexDocumentInput) -> Result<Value, IndexDoc
         "system_generated".to_string(),
         Value::String(system_generated(record)?),
     );
-    document.insert("repository".to_string(), input.repository);
+    document.insert("repository".to_string(), input.repository.clone());
 
     if input.enrich {
-        add_enriched_fields(
-            &mut document,
-            &input.record_type,
-            record,
-            &input.record,
-            &input.dynamic_enum_fields,
-            input.arks_enabled,
-        )?;
+        add_enriched_fields(&mut document, &input, record)?;
     }
 
     if let Some(child) = collection_management {
@@ -3041,9 +3131,11 @@ mod tests {
                     }
                 }],
                 "ancestors": [],
-                "lang_materials": [{"language_and_script": {"language": "gle"}}]
+                "lang_materials": [{"language_and_script": {"language": "gle"}}],
+                "accession_date": "2026-10-17"
             }),
             enrich: true,
+            parsed_accession_date_year: Some(json!(2026)),
             ..Default::default()
         })
         .unwrap();
@@ -3067,12 +3159,15 @@ mod tests {
             json!(["/repositories/2/top_containers/6"])
         );
         assert_eq!(document["langcode"], json!(["gle"]));
+        assert_eq!(document["accession_date"], "2026-10-17");
+        assert_eq!(document["accession_date_year"], 2026);
         assert_eq!(
             document["_archivalist_rust_fields"],
             json!([
                 "common_metadata",
                 "fullrecord",
                 "accession_digital_object_metadata",
+                "accession_date_metadata",
                 "dynamic_enum_and_ark_metadata"
             ])
         );
@@ -5109,9 +5204,11 @@ mod tests {
                 "uri": "/repositories/2/accessions/2",
                 "display_string": "Accession 2026-01",
                 "title": Value::Null,
-                "collection_management": minimal_cm
+                "collection_management": minimal_cm,
+                "accession_date": "2026-01-01"
             }),
             enrich: true,
+            parsed_accession_date_year: Some(json!(2026)),
             ..Default::default()
         };
         let acc_doc = build_index_document(minimal_accession).unwrap();
@@ -5572,6 +5669,7 @@ mod tests {
             enrich: true,
             dynamic_enum_fields: vec!["genre".to_string()],
             arks_enabled: true,
+            ..Default::default()
         };
 
         let doc = build_index_document(input_doc).unwrap();
@@ -5724,6 +5822,7 @@ mod tests {
             enrich: false,
             dynamic_enum_fields: vec!["rights_type".to_string()],
             arks_enabled: true,
+            ..Default::default()
         };
 
         let doc = build_index_document(unenriched).unwrap();
@@ -5808,5 +5907,374 @@ mod tests {
                 json!("ark:/two\nark:/three"),
             ]
         );
+    }
+
+    #[test]
+    fn accession_date_ordinary_and_year_parity() {
+        let input = IndexDocumentInput {
+            uri: "/repositories/2/accessions/10".to_string(),
+            record_type: "accession".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/accessions/10",
+                "display_string": "Accession 2026-10",
+                "accession_date": "2026-10-17",
+                "title": "Accession 10",
+                "id_0": "ACC-10"
+            }),
+            enrich: true,
+            parsed_accession_date_year: Some(json!(2026)),
+            ..Default::default()
+        };
+        let doc = build_index_document(input).unwrap();
+        assert_eq!(doc["accession_date"], "2026-10-17");
+        assert_eq!(doc["accession_date_year"], 2026);
+        assert!(matches!(doc["accession_date_year"], Value::Number(_)));
+        let fullrecord = doc["fullrecord"].as_array().unwrap();
+        assert!(!fullrecord
+            .iter()
+            .any(|v| v.as_str().unwrap_or("").contains("unknown")));
+        let rust_fields = doc["_archivalist_rust_fields"].as_array().unwrap();
+        assert!(rust_fields.contains(&json!("accession_date_metadata")));
+    }
+
+    #[test]
+    fn accession_date_sentinel_with_unicode_localized_unknown() {
+        // Ukrainian "незнаний"
+        let input_uk = IndexDocumentInput {
+            uri: "/repositories/2/accessions/11".to_string(),
+            record_type: "accession".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/accessions/11",
+                "display_string": "Accession Sentinel UK",
+                "accession_date": "9999-12-31",
+                "title": "Accession 11",
+                "id_0": "ACC-11"
+            }),
+            enrich: true,
+            accession_date_unknown_label: Some("незнаний".to_string()),
+            parsed_accession_date_year: Some(json!(9999)),
+            ..Default::default()
+        };
+        let doc_uk = build_index_document(input_uk).unwrap();
+        assert_eq!(doc_uk["accession_date"], "незнаний");
+        assert_eq!(doc_uk["accession_date_year"], 9999);
+        let fullrecord_uk = doc_uk["fullrecord"].as_array().unwrap();
+        assert_eq!(fullrecord_uk.last(), Some(&json!("незнаний "))); // Exact trailing space
+
+        // Japanese "道の"
+        let input_ja = IndexDocumentInput {
+            uri: "/repositories/2/accessions/12".to_string(),
+            record_type: "accession".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/accessions/12",
+                "display_string": "Accession Sentinel JA",
+                "accession_date": "9999-12-31",
+                "title": "Accession 12",
+                "id_0": "ACC-12"
+            }),
+            enrich: true,
+            accession_date_unknown_label: Some("道の".to_string()),
+            parsed_accession_date_year: Some(json!(9999)),
+            ..Default::default()
+        };
+        let doc_ja = build_index_document(input_ja).unwrap();
+        assert_eq!(doc_ja["accession_date"], "道の");
+        assert_eq!(doc_ja["accession_date_year"], 9999);
+        let fullrecord_ja = doc_ja["fullrecord"].as_array().unwrap();
+        assert_eq!(fullrecord_ja.last(), Some(&json!("道の "))); // Exact trailing space
+
+        // German "unbekannt"
+        let input_de = IndexDocumentInput {
+            uri: "/repositories/2/accessions/13".to_string(),
+            record_type: "accession".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/accessions/13",
+                "display_string": "Accession Sentinel DE",
+                "accession_date": "9999-12-31",
+                "title": "Accession 13",
+                "id_0": "ACC-13"
+            }),
+            enrich: true,
+            accession_date_unknown_label: Some("unbekannt".to_string()),
+            parsed_accession_date_year: Some(json!(9999)),
+            ..Default::default()
+        };
+        let doc_de = build_index_document(input_de).unwrap();
+        assert_eq!(doc_de["accession_date"], "unbekannt");
+        assert_eq!(doc_de["accession_date_year"], 9999);
+        let fullrecord_de = doc_de["fullrecord"].as_array().unwrap();
+        assert_eq!(fullrecord_de.last(), Some(&json!("unbekannt ")));
+
+        // Unicode label with intentional surrounding whitespace: preserved byte-for-byte
+        let input_ws_label = IndexDocumentInput {
+            uri: "/repositories/2/accessions/13b".to_string(),
+            record_type: "accession".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/accessions/13b",
+                "display_string": "Accession Sentinel WS Label",
+                "accession_date": "9999-12-31",
+                "title": "Accession 13b",
+                "id_0": "ACC-13b"
+            }),
+            enrich: true,
+            accession_date_unknown_label: Some("  незнаний  ".to_string()),
+            parsed_accession_date_year: Some(json!(9999)),
+            ..Default::default()
+        };
+        let doc_ws_label = build_index_document(input_ws_label).unwrap();
+        assert_eq!(doc_ws_label["accession_date"], "  незнаний  ");
+        assert_eq!(doc_ws_label["accession_date_year"], 9999);
+        let fullrecord_ws = doc_ws_label["fullrecord"].as_array().unwrap();
+        assert_eq!(fullrecord_ws.last(), Some(&json!("  незнаний   ")));
+    }
+
+    #[test]
+    fn accession_date_non_canonical_schema_valid_examples() {
+        let make_input = |date_str: &str, year: i32| IndexDocumentInput {
+            uri: "/repositories/2/accessions/15".to_string(),
+            record_type: "accession".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/accessions/15",
+                "display_string": "Accession Non-canonical",
+                "accession_date": date_str,
+                "title": "Accession 15",
+                "id_0": "ACC-15"
+            }),
+            enrich: true,
+            parsed_accession_date_year: Some(json!(year)),
+            ..Default::default()
+        };
+
+        // 1. Year 0000: "0000-01-01" -> year 0
+        let doc_zero = build_index_document(make_input("0000-01-01", 0)).unwrap();
+        assert_eq!(doc_zero["accession_date"], "0000-01-01");
+        assert_eq!(doc_zero["accession_date_year"], 0);
+
+        // 2. Single-digit month: "2026-2-03" -> year 2026
+        let doc_single_digit = build_index_document(make_input("2026-2-03", 2026)).unwrap();
+        assert_eq!(doc_single_digit["accession_date"], "2026-2-03");
+        assert_eq!(doc_single_digit["accession_date_year"], 2026);
+
+        // 3. Surrounding whitespace: "  2026-10-17  " -> preserved exactly, year 2026
+        let doc_ws = build_index_document(make_input("  2026-10-17  ", 2026)).unwrap();
+        assert_eq!(doc_ws["accession_date"], "  2026-10-17  ");
+        assert_eq!(doc_ws["accession_date_year"], 2026);
+
+        // 4. Surrounding whitespace on sentinel: " 9999-12-31 " is NOT sentinel
+        let doc_ws_sentinel = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/accessions/15b".to_string(),
+            record_type: "accession".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/accessions/15b",
+                "display_string": "Accession Untrimmed Sentinel",
+                "accession_date": " 9999-12-31 ",
+                "title": "Accession 15b",
+                "id_0": "ACC-15b"
+            }),
+            enrich: true,
+            accession_date_unknown_label: Some("Date Unknown".to_string()),
+            parsed_accession_date_year: Some(json!(9999)),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(doc_ws_sentinel["accession_date"], " 9999-12-31 ");
+        assert_eq!(doc_ws_sentinel["accession_date_year"], 9999);
+        let fullrecord = doc_ws_sentinel["fullrecord"].as_array().unwrap();
+        assert!(!fullrecord
+            .iter()
+            .any(|v| v.as_str().unwrap_or("").contains("Unknown")));
+    }
+
+    #[test]
+    fn accession_date_missing_null_and_wrong_type_rejected() {
+        let base_record = json!({
+            "uri": "/repositories/2/accessions/14",
+            "display_string": "Accession Error",
+            "title": "Accession 14",
+            "id_0": "ACC-14"
+        });
+
+        // 1. Missing accession_date
+        let missing = IndexDocumentInput {
+            uri: "/repositories/2/accessions/14".to_string(),
+            record_type: "accession".to_string(),
+            repository: json!(2),
+            record: base_record.clone(),
+            enrich: true,
+            parsed_accession_date_year: Some(json!(2026)),
+            ..Default::default()
+        };
+        assert!(build_index_document(missing).is_err());
+
+        // 2. Null accession_date
+        let mut null_rec = base_record.clone();
+        null_rec["accession_date"] = Value::Null;
+        let null_input = IndexDocumentInput {
+            uri: "/repositories/2/accessions/14".to_string(),
+            record_type: "accession".to_string(),
+            repository: json!(2),
+            record: null_rec,
+            enrich: true,
+            parsed_accession_date_year: Some(json!(2026)),
+            ..Default::default()
+        };
+        assert!(build_index_document(null_input).is_err());
+
+        // 3. Integer accession_date
+        let mut int_rec = base_record.clone();
+        int_rec["accession_date"] = json!(20261017);
+        let int_input = IndexDocumentInput {
+            uri: "/repositories/2/accessions/14".to_string(),
+            record_type: "accession".to_string(),
+            repository: json!(2),
+            record: int_rec,
+            enrich: true,
+            parsed_accession_date_year: Some(json!(2026)),
+            ..Default::default()
+        };
+        assert!(build_index_document(int_input).is_err());
+
+        // 4. Boolean accession_date
+        let mut bool_rec = base_record.clone();
+        bool_rec["accession_date"] = json!(true);
+        let bool_input = IndexDocumentInput {
+            uri: "/repositories/2/accessions/14".to_string(),
+            record_type: "accession".to_string(),
+            repository: json!(2),
+            record: bool_rec,
+            enrich: true,
+            parsed_accession_date_year: Some(json!(2026)),
+            ..Default::default()
+        };
+        assert!(build_index_document(bool_input).is_err());
+    }
+
+    #[test]
+    fn parsed_accession_date_year_validation_and_rejection() {
+        let base_input = |year_val: Option<Value>| IndexDocumentInput {
+            uri: "/repositories/2/accessions/14b".to_string(),
+            record_type: "accession".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/accessions/14b",
+                "display_string": "Year Validation",
+                "accession_date": "2026-10-17",
+                "title": "Accession 14b",
+                "id_0": "ACC-14b"
+            }),
+            enrich: true,
+            parsed_accession_date_year: year_val,
+            ..Default::default()
+        };
+
+        // 1. Missing parsed_accession_date_year
+        assert!(build_index_document(base_input(None)).is_err());
+
+        // 2. String parsed_accession_date_year
+        assert!(build_index_document(base_input(Some(json!("2026")))).is_err());
+
+        // 3. Float parsed_accession_date_year
+        assert!(build_index_document(base_input(Some(json!(2026.5)))).is_err());
+
+        // 4. Boolean parsed_accession_date_year
+        assert!(build_index_document(base_input(Some(json!(true)))).is_err());
+
+        // 5. Out of range positive (> i32::MAX)
+        assert!(build_index_document(base_input(Some(json!((i32::MAX as i64) + 1)))).is_err());
+
+        // 6. Out of range negative (< i32::MIN)
+        assert!(build_index_document(base_input(Some(json!((i32::MIN as i64) - 1)))).is_err());
+
+        // 7. Valid negative year (e.g. BCE)
+        let doc_neg = build_index_document(base_input(Some(json!(-44)))).unwrap();
+        assert_eq!(doc_neg["accession_date_year"], -44);
+
+        // Sentinel without label
+        let sentinel_no_label = IndexDocumentInput {
+            uri: "/repositories/2/accessions/15".to_string(),
+            record_type: "accession".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/accessions/15",
+                "display_string": "Sentinel Missing Label",
+                "accession_date": "9999-12-31",
+                "title": "Accession 15",
+                "id_0": "ACC-15"
+            }),
+            enrich: true,
+            accession_date_unknown_label: None,
+            parsed_accession_date_year: Some(json!(9999)),
+            ..Default::default()
+        };
+        assert!(build_index_document(sentinel_no_label).is_err());
+
+        // Sentinel with empty localized label
+        let sentinel_empty_label = IndexDocumentInput {
+            uri: "/repositories/2/accessions/15".to_string(),
+            record_type: "accession".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/accessions/15",
+                "display_string": "Sentinel Empty Label",
+                "accession_date": "9999-12-31",
+                "title": "Accession 15",
+                "id_0": "ACC-15"
+            }),
+            enrich: true,
+            accession_date_unknown_label: Some("".to_string()),
+            parsed_accession_date_year: Some(json!(9999)),
+            ..Default::default()
+        };
+        assert!(build_index_document(sentinel_empty_label).is_err());
+    }
+
+    #[test]
+    fn accession_date_non_accession_and_unenriched_isolation() {
+        // 1. Unenriched accession request: no accession date fields, no accession_date_metadata marker
+        let unenriched_acc = IndexDocumentInput {
+            uri: "/repositories/2/accessions/16".to_string(),
+            record_type: "accession".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/accessions/16",
+                "display_string": "Unenriched Accession",
+                "accession_date": "2026-10-17",
+                "title": "Accession 16",
+                "id_0": "ACC-16"
+            }),
+            enrich: false,
+            ..Default::default()
+        };
+        let doc_un = build_index_document(unenriched_acc).unwrap();
+        assert!(doc_un.get("accession_date").is_none());
+        assert!(doc_un.get("accession_date_year").is_none());
+        assert!(doc_un.get("_archivalist_rust_fields").is_none());
+
+        // 2. Enriched resource request: no accession_date_metadata marker or accession date fields
+        let enriched_res = IndexDocumentInput {
+            uri: "/repositories/2/resources/16".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/16",
+                "title": "Resource 16",
+                "id_0": "RES-16",
+                "level": "collection"
+            }),
+            enrich: true,
+            ..Default::default()
+        };
+        let doc_res = build_index_document(enriched_res).unwrap();
+        assert!(doc_res.get("accession_date").is_none());
+        assert!(doc_res.get("accession_date_year").is_none());
+        let res_markers = doc_res["_archivalist_rust_fields"].as_array().unwrap();
+        assert!(!res_markers.contains(&json!("accession_date_metadata")));
     }
 }

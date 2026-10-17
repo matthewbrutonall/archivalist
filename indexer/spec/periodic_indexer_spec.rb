@@ -265,6 +265,315 @@ describe "periodic indexer" do
       expect(doc).not_to have_key('_archivalist_rust_fields')
     end
 
+    it "accelerates accession date enrichment and removes handoff metadata when accession_date_metadata is trusted" do
+      accession = build(:json_accession,
+                        'uri' => '/repositories/2/accessions/79',
+                        'title' => 'Native accession title',
+                        'display_string' => 'ACC-79: Trusted Accession',
+                        'accession_date' => '2026-10-17',
+                        'id_0' => 'ACC-79',
+                        'instances' => [])
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prepared, documents|
+          doc = indexer.native_index_document(
+            prepared[:uri], prepared[:record_type], prepared[:values]
+          )
+          doc['fullrecord_published'], doc['fullrecord'] = IndexerCommon.extract_string_values(prepared[:values])
+          doc['accession_date'] = '2026-10-17'
+          doc['accession_date_year'] = 2026
+          doc['_archivalist_rust_fields'] = [
+            'common_metadata',
+            'fullrecord',
+            'accession_digital_object_metadata',
+            'accession_date_metadata',
+          ]
+          documents[prepared[:uri]] = doc
+        end
+      end
+
+      indexer.prepare_docs([accession])
+      doc = indexer.records.first
+      expect(doc['accession_date']).to eq('2026-10-17')
+      expect(doc['accession_date_year']).to eq(2026)
+      expected_pub, expected_unpub = IndexerCommon.extract_string_values(accession)
+      expect(doc['fullrecord_published']).to eq(expected_pub)
+      expect(doc['fullrecord']).to eq(expected_unpub)
+      expect(doc).not_to have_key('_archivalist_rust_fields')
+    end
+
+    it "accelerates sentinel accession date enrichment with localized unknown label and fullrecord append" do
+      unknown_label = I18n.t('accession.accession_date_unknown')
+      accession = build(:json_accession,
+                        'uri' => '/repositories/2/accessions/80',
+                        'title' => 'Sentinel accession title',
+                        'display_string' => 'ACC-80: Sentinel Accession',
+                        'accession_date' => '9999-12-31',
+                        'id_0' => 'ACC-80',
+                        'instances' => [])
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prepared, documents|
+          doc = indexer.native_index_document(
+            prepared[:uri], prepared[:record_type], prepared[:values]
+          )
+          expected_pub, expected_unpub = IndexerCommon.extract_string_values(prepared[:values])
+          doc['fullrecord_published'] = expected_pub
+          doc['fullrecord'] = expected_unpub + ["#{unknown_label} "]
+          doc['accession_date'] = unknown_label
+          doc['accession_date_year'] = 9999
+          doc['_archivalist_rust_fields'] = [
+            'common_metadata',
+            'fullrecord',
+            'accession_digital_object_metadata',
+            'accession_date_metadata',
+          ]
+          documents[prepared[:uri]] = doc
+        end
+      end
+
+      indexer.prepare_docs([accession])
+      doc = indexer.records.first
+      expect(doc['accession_date']).to eq(unknown_label)
+      expect(doc['accession_date_year']).to eq(9999)
+      expect(doc['fullrecord'].last).to eq("#{unknown_label} ")
+      expect(doc).not_to have_key('_archivalist_rust_fields')
+    end
+
+    it "falls back to native accession date handling when accession_date_year is a String (anti-string-coercion)" do
+      accession = build(:json_accession,
+                        'uri' => '/repositories/2/accessions/81',
+                        'title' => 'String year accession',
+                        'display_string' => 'ACC-81: String Year Accession',
+                        'accession_date' => '2026-10-17',
+                        'id_0' => 'ACC-81',
+                        'instances' => [])
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prepared, documents|
+          doc = indexer.native_index_document(
+            prepared[:uri], prepared[:record_type], prepared[:values]
+          )
+          doc['fullrecord'] = ['prior content']
+          doc['accession_date'] = '2026-10-17'
+          doc['accession_date_year'] = '2026' # String instead of Integer
+          doc['_archivalist_rust_fields'] = [
+            'common_metadata',
+            'fullrecord',
+            'accession_digital_object_metadata',
+            'accession_date_metadata',
+          ]
+          documents[prepared[:uri]] = doc
+        end
+      end
+
+      indexer.prepare_docs([accession])
+      doc = indexer.records.first
+      expect(doc['accession_date']).to eq('2026-10-17')
+      expect(doc['accession_date_year']).to eq(2026)
+      expect(doc['accession_date_year'].is_a?(Integer)).to be true
+      expect(doc).not_to have_key('_archivalist_rust_fields')
+    end
+
+    it "falls back to native accession date handling when accession_date value is mismatched" do
+      accession = build(:json_accession,
+                        'uri' => '/repositories/2/accessions/82',
+                        'title' => 'Mismatched date accession',
+                        'display_string' => 'ACC-82: Mismatched Date Accession',
+                        'accession_date' => '2026-10-17',
+                        'id_0' => 'ACC-82',
+                        'instances' => [])
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prepared, documents|
+          doc = indexer.native_index_document(
+            prepared[:uri], prepared[:record_type], prepared[:values]
+          )
+          doc['fullrecord'] = ['prior content']
+          doc['accession_date'] = '1999-01-01' # Mismatched date
+          doc['accession_date_year'] = 1999
+          doc['_archivalist_rust_fields'] = [
+            'common_metadata',
+            'fullrecord',
+            'accession_digital_object_metadata',
+            'accession_date_metadata',
+          ]
+          documents[prepared[:uri]] = doc
+        end
+      end
+
+      indexer.prepare_docs([accession])
+      doc = indexer.records.first
+      expect(doc['accession_date']).to eq('2026-10-17')
+      expect(doc['accession_date_year']).to eq(2026)
+      expect(doc).not_to have_key('_archivalist_rust_fields')
+    end
+
+    it "falls back to native accession date handling when sentinel fullrecord append is missing" do
+      unknown_label = I18n.t('accession.accession_date_unknown')
+      accession = build(:json_accession,
+                        'uri' => '/repositories/2/accessions/83',
+                        'title' => 'Missing sentinel append accession',
+                        'display_string' => 'ACC-83: Missing Sentinel Append',
+                        'accession_date' => '9999-12-31',
+                        'id_0' => 'ACC-83',
+                        'instances' => [])
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prepared, documents|
+          doc = indexer.native_index_document(
+            prepared[:uri], prepared[:record_type], prepared[:values]
+          )
+          doc['fullrecord'] = ['prior content without sentinel append']
+          doc['accession_date'] = unknown_label
+          doc['accession_date_year'] = 9999
+          doc['_archivalist_rust_fields'] = [
+            'common_metadata',
+            'fullrecord',
+            'accession_digital_object_metadata',
+            'accession_date_metadata',
+          ]
+          documents[prepared[:uri]] = doc
+        end
+      end
+
+      indexer.prepare_docs([accession])
+      doc = indexer.records.first
+      expect(doc['accession_date']).to eq(unknown_label)
+      expect(doc['accession_date_year']).to eq(9999)
+      expect(doc['fullrecord'].last).to eq("#{unknown_label} ")
+      expect(doc).not_to have_key('_archivalist_rust_fields')
+    end
+
+    it "falls back to native accession date handling and reconstructs fullrecord without pollution or duplication when sidecar appends wrong localized value" do
+      unknown_label = I18n.t('accession.accession_date_unknown')
+      accession = build(:json_accession,
+                        'uri' => '/repositories/2/accessions/84',
+                        'title' => 'Wrong localized label accession',
+                        'display_string' => 'ACC-84: Wrong Localized Label',
+                        'accession_date' => '9999-12-31',
+                        'id_0' => 'ACC-84',
+                        'instances' => [])
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prepared, documents|
+          doc = indexer.native_index_document(
+            prepared[:uri], prepared[:record_type], prepared[:values]
+          )
+          # Malformed sidecar projection: wrong localized label and corrupted items
+          doc['fullrecord_published'] = ['bogus_published']
+          doc['fullrecord'] = ['corrupted_item', 'Wrong Unknown Label ', 'extraneous_suffix']
+          doc['accession_date'] = 'Wrong Unknown Label'
+          doc['accession_date_year'] = 9999
+          doc['_archivalist_rust_fields'] = [
+            'common_metadata',
+            'fullrecord',
+            'accession_digital_object_metadata',
+            'accession_date_metadata',
+          ]
+          documents[prepared[:uri]] = doc
+        end
+      end
+
+      indexer.prepare_docs([accession])
+      doc = indexer.records.first
+      expect(doc['accession_date']).to eq(unknown_label)
+      expect(doc['accession_date_year']).to eq(9999)
+
+      # Deterministic reconstruction proof: exactly native fullrecord, no pollution, no duplication
+      expected_pub, expected_unpub = IndexerCommon.extract_string_values(accession)
+      expect(doc['fullrecord_published']).to eq(expected_pub)
+      expect(doc['fullrecord']).to eq(expected_unpub + ["#{unknown_label} "])
+      expect(doc['fullrecord']).not_to include('corrupted_item')
+      expect(doc['fullrecord']).not_to include('Wrong Unknown Label ')
+      expect(doc['fullrecord']).not_to include('extraneous_suffix')
+      expect(doc).not_to have_key('_archivalist_rust_fields')
+    end
+
+    it "accepts ordinary accession whose legitimate record content happens to match unknown label in fullrecord" do
+      unknown_label = I18n.t('accession.accession_date_unknown')
+      accession = build(:json_accession,
+                        'uri' => '/repositories/2/accessions/85',
+                        'title' => "Collection containing #{unknown_label} in title",
+                        'display_string' => "ACC-85: Legitimate #{unknown_label}",
+                        'accession_date' => '2026-10-17',
+                        'id_0' => 'ACC-85',
+                        'instances' => [])
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prepared, documents|
+          doc = indexer.native_index_document(
+            prepared[:uri], prepared[:record_type], prepared[:values]
+          )
+          expected_pub, expected_unpub = IndexerCommon.extract_string_values(prepared[:values])
+          doc['fullrecord_published'] = expected_pub
+          doc['fullrecord'] = expected_unpub
+          doc['accession_date'] = '2026-10-17'
+          doc['accession_date_year'] = 2026
+          doc['_archivalist_rust_fields'] = [
+            'common_metadata',
+            'fullrecord',
+            'accession_digital_object_metadata',
+            'accession_date_metadata',
+          ]
+          documents[prepared[:uri]] = doc
+        end
+      end
+
+      indexer.prepare_docs([accession])
+      doc = indexer.records.first
+      expect(doc['accession_date']).to eq('2026-10-17')
+      expect(doc['accession_date_year']).to eq(2026)
+      expected_pub, expected_unpub = IndexerCommon.extract_string_values(accession)
+      expect(doc['fullrecord']).to eq(expected_unpub)
+      expect(doc).not_to have_key('_archivalist_rust_fields')
+    end
+
+    it "accepts non-canonical schema-valid accession dates (year 0, unpadded month, surrounding whitespace)" do
+      examples = [
+        { 'date' => '0000-01-01', 'expected_year' => 0 },
+        { 'date' => '2026-2-03', 'expected_year' => 2026 },
+        { 'date' => '  2026-10-17  ', 'expected_year' => 2026 },
+      ]
+
+      examples.each_with_index do |ex, i|
+        accession = build(:json_accession,
+                          'uri' => "/repositories/2/accessions/#{86 + i}",
+                          'title' => "Accession #{86 + i}",
+                          'display_string' => "ACC-#{86 + i}: Non-canonical",
+                          'accession_date' => ex['date'],
+                          'id_0' => "ACC-#{86 + i}",
+                          'instances' => [])
+
+        allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+          prepared_records.each_with_object({}) do |prepared, documents|
+            doc = indexer.native_index_document(
+              prepared[:uri], prepared[:record_type], prepared[:values]
+            )
+            expected_pub, expected_unpub = IndexerCommon.extract_string_values(prepared[:values])
+            doc['fullrecord_published'] = expected_pub
+            doc['fullrecord'] = expected_unpub
+            doc['accession_date'] = ex['date']
+            doc['accession_date_year'] = ex['expected_year']
+            doc['_archivalist_rust_fields'] = [
+              'common_metadata',
+              'fullrecord',
+              'accession_digital_object_metadata',
+              'accession_date_metadata',
+            ]
+            documents[prepared[:uri]] = doc
+          end
+        end
+
+        indexer.prepare_docs([accession])
+        doc = indexer.records.first
+        expect(doc['accession_date']).to eq(ex['date'])
+        expect(doc['accession_date_year']).to eq(ex['expected_year'])
+        expect(doc).not_to have_key('_archivalist_rust_fields')
+        indexer.records.clear
+      end
+    end
+
     it "retains Rust subject authority fields and removes handoff metadata" do
       subject = build(:json_subject,
                       'uri' => '/subjects/88',

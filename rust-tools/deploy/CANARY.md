@@ -171,7 +171,8 @@ summary, extents, audit fields, exact dynamic-enum sets and values (`*_enum_s`),
 identifiers, finding-aid metadata, classifications, instances, containers, ancestors,
 linked rights agents, and language codes now prepared by Rust. The private handoff
 marker includes `resource_archival_object_metadata` for resources and archival objects
-and is joined by `accession_digital_object_metadata` for accessions and digital objects.
+and is joined by `accession_digital_object_metadata` for accessions and digital objects,
+and `accession_date_metadata` for accessions.
 Subject and agent authority mappings use `agent_subject_metadata`, including
 authority identifiers, rules, repository usage, related agents, and nested
 subject/place terms. Digital-object components and classifications use

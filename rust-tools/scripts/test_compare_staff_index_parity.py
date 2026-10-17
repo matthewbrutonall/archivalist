@@ -895,6 +895,205 @@ class TestStaffIndexParityOffline(unittest.TestCase):
         self.assertFalse(comparator.json_values_strictly_equal({"a": True}, {"a": 1}))
         self.assertFalse(comparator.json_values_strictly_equal({"a": 1}, {"a": 1.0}))
 
+    def test_accession_date_ordinary_and_sentinel_parity(self) -> None:
+        """Accession documents with ordinary and sentinel dates compare cleanly under exact parity."""
+        docs = {
+            "/repositories/2/accessions/10": {
+                "id": "/repositories/2/accessions/10",
+                "types": ["accession"],
+                "primary_type": "accession",
+                "title": "Accession 10",
+                "accession_date": "2026-10-17",
+                "accession_date_year": 2026,
+                "fullrecord": ["ACC-10 title", "summary content"],
+                "_version_": 1001,
+            },
+            "/repositories/2/accessions/11": {
+                "id": "/repositories/2/accessions/11",
+                "types": ["accession"],
+                "primary_type": "accession",
+                "title": "Accession 11",
+                "accession_date": "Date Unknown",
+                "accession_date_year": 9999,
+                "fullrecord": ["ACC-11 title", "Date Unknown "],
+                "_version_": 1002,
+            },
+        }
+        report = comparator.compare_documents(
+            baseline_docs=docs,
+            candidate_docs=docs,
+            ignored_fields=comparator.DEFAULT_IGNORED_FIELDS,
+            baseline_marker_leaks=[],
+            candidate_marker_leaks=[],
+        )
+        self.assertTrue(report["summary"]["parity"])
+        self.assertEqual(report["summary"]["total_differences"], 0)
+        self.assertEqual(report["baseline_count"], 2)
+        self.assertEqual(report["candidate_count"], 2)
+
+    def test_accession_date_year_type_mismatch_detected(self) -> None:
+        """Integer vs String type mismatch on accession_date_year is detected and fails parity."""
+        baseline = {
+            "/repositories/2/accessions/10": {
+                "id": "/repositories/2/accessions/10",
+                "accession_date": "2026-10-17",
+                "accession_date_year": 2026,
+            }
+        }
+        candidate = {
+            "/repositories/2/accessions/10": {
+                "id": "/repositories/2/accessions/10",
+                "accession_date": "2026-10-17",
+                "accession_date_year": "2026",  # Coerced string vs integer
+            }
+        }
+        report = comparator.compare_documents(
+            baseline_docs=baseline,
+            candidate_docs=candidate,
+            ignored_fields=comparator.DEFAULT_IGNORED_FIELDS,
+            baseline_marker_leaks=[],
+            candidate_marker_leaks=[],
+        )
+        self.assertFalse(report["summary"]["parity"])
+        self.assertEqual(report["summary"]["total_differences"], 1)
+        diff = report["differences"]["value_differences"][0]["differences"][0]
+        self.assertEqual(diff["field"], "accession_date_year")
+        self.assertEqual(diff["kind"], "type_mismatch")
+
+    def test_accession_sentinel_fullrecord_mismatch_detected(self) -> None:
+        """Missing sentinel label append in fullrecord is detected and fails parity."""
+        baseline = {
+            "/repositories/2/accessions/11": {
+                "id": "/repositories/2/accessions/11",
+                "accession_date": "незнаний",
+                "accession_date_year": 9999,
+                "fullrecord": ["body", "незнаний "],
+            }
+        }
+        candidate = {
+            "/repositories/2/accessions/11": {
+                "id": "/repositories/2/accessions/11",
+                "accession_date": "незнаний",
+                "accession_date_year": 9999,
+                "fullrecord": ["body"],  # Missing localized unknown append
+            }
+        }
+        report = comparator.compare_documents(
+            baseline_docs=baseline,
+            candidate_docs=candidate,
+            ignored_fields=comparator.DEFAULT_IGNORED_FIELDS,
+            baseline_marker_leaks=[],
+            candidate_marker_leaks=[],
+        )
+        self.assertFalse(report["summary"]["parity"])
+        self.assertEqual(report["summary"]["total_differences"], 1)
+        diff = report["differences"]["value_differences"][0]["differences"][0]
+        self.assertEqual(diff["field"], "fullrecord")
+        self.assertEqual(diff["kind"], "value_mismatch")
+
+    def test_accession_date_non_canonical_schema_valid_parity(self) -> None:
+        """Non-canonical schema-valid dates (year 0, non-padded month, whitespace) compare cleanly."""
+        docs = {
+            "/repositories/2/accessions/20": {
+                "id": "/repositories/2/accessions/20",
+                "types": ["accession"],
+                "accession_date": "0000-01-01",
+                "accession_date_year": 0,
+                "fullrecord": ["Legacy Ancient Acc"],
+            },
+            "/repositories/2/accessions/21": {
+                "id": "/repositories/2/accessions/21",
+                "types": ["accession"],
+                "accession_date": "2026-2-03",
+                "accession_date_year": 2026,
+                "fullrecord": ["Unpadded Month Acc"],
+            },
+            "/repositories/2/accessions/22": {
+                "id": "/repositories/2/accessions/22",
+                "types": ["accession"],
+                "accession_date": "  2026-10-17  ",
+                "accession_date_year": 2026,
+                "fullrecord": ["Whitespace Acc"],
+            },
+        }
+        report = comparator.compare_documents(
+            baseline_docs=docs,
+            candidate_docs=docs,
+            ignored_fields=comparator.DEFAULT_IGNORED_FIELDS,
+            baseline_marker_leaks=[],
+            candidate_marker_leaks=[],
+        )
+        self.assertTrue(report["summary"]["parity"])
+        self.assertEqual(report["summary"]["total_differences"], 0)
+        self.assertEqual(report["baseline_count"], 3)
+        self.assertEqual(report["candidate_count"], 3)
+
+    def test_accession_ordinary_record_with_unknown_label_in_fullrecord_parity(self) -> None:
+        """Ordinary accessions whose legitimate content happens to end with unknown label string have parity."""
+        docs = {
+            "/repositories/2/accessions/30": {
+                "id": "/repositories/2/accessions/30",
+                "types": ["accession"],
+                "title": "Accession 30",
+                "accession_date": "2026-10-17",
+                "accession_date_year": 2026,
+                "fullrecord": ["Scope and content", "Date Unknown "],
+            }
+        }
+        report = comparator.compare_documents(
+            baseline_docs=docs,
+            candidate_docs=docs,
+            ignored_fields=comparator.DEFAULT_IGNORED_FIELDS,
+            baseline_marker_leaks=[],
+            candidate_marker_leaks=[],
+        )
+        self.assertTrue(report["summary"]["parity"])
+        self.assertEqual(report["summary"]["total_differences"], 0)
+
+    def test_accession_candidate_wrong_localized_label_parity_failure(self) -> None:
+        """Candidate appending the wrong localized label to sentinel fullrecord fails parity."""
+        baseline = {
+            "/repositories/2/accessions/40": {
+                "id": "/repositories/2/accessions/40",
+                "accession_date": "незнаний",
+                "accession_date_year": 9999,
+                "fullrecord": ["content", "незнаний "],
+            }
+        }
+        candidate = {
+            "/repositories/2/accessions/40": {
+                "id": "/repositories/2/accessions/40",
+                "accession_date": "незнаний",
+                "accession_date_year": 9999,
+                "fullrecord": ["content", "Date Unknown "],  # Wrong localization appended
+            }
+        }
+        report = comparator.compare_documents(
+            baseline_docs=baseline,
+            candidate_docs=candidate,
+            ignored_fields=comparator.DEFAULT_IGNORED_FIELDS,
+            baseline_marker_leaks=[],
+            candidate_marker_leaks=[],
+        )
+        self.assertFalse(report["summary"]["parity"])
+        self.assertEqual(report["summary"]["total_differences"], 1)
+        diff = report["differences"]["value_differences"][0]["differences"][0]
+        self.assertEqual(diff["field"], "fullrecord")
+        self.assertEqual(diff["kind"], "value_mismatch")
+
+    def test_accession_marker_leakage_detected(self) -> None:
+        """Candidate leaking accession_date_metadata marker into Solr fails parity."""
+        report = comparator.compare_documents(
+            baseline_docs={"/repositories/2/accessions/10": {"id": "/repositories/2/accessions/10"}},
+            candidate_docs={"/repositories/2/accessions/10": {"id": "/repositories/2/accessions/10"}},
+            ignored_fields=comparator.DEFAULT_IGNORED_FIELDS,
+            baseline_marker_leaks=[],
+            candidate_marker_leaks=["/repositories/2/accessions/10"],
+        )
+        self.assertFalse(report["summary"]["parity"])
+        self.assertEqual(report["summary"]["candidate_marker_leaks_count"], 1)
+        self.assertIn("/repositories/2/accessions/10", report["marker_leaks"]["candidate"])
+
 
 if __name__ == "__main__":
     unittest.main()

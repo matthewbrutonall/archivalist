@@ -2,6 +2,7 @@ require 'net/http'
 require 'uri'
 require 'json'
 require 'set'
+require 'date'
 require_relative 'indexer_common_config'
 
 class RustIndexDocumentBuilder
@@ -106,6 +107,7 @@ class RustIndexDocumentBuilder
           expected_fields << 'resource_archival_object_metadata'
         elsif ['accession', 'digital_object'].include?(record_type)
           expected_fields << 'accession_digital_object_metadata'
+          expected_fields << 'accession_date_metadata' if record_type == 'accession'
         elsif record_type == 'subject' || agent_types.include?(record_type)
           expected_fields << 'agent_subject_metadata'
         elsif ['digital_object_component', 'classification', 'classification_term'].include?(record_type)
@@ -124,6 +126,7 @@ class RustIndexDocumentBuilder
           raise "response enrichment marker mismatch for #{uri}"
         end
         validate_dynamic_enum_and_ark_projection!(document, input)
+        validate_accession_date_projection!(document, input) if record_type == 'accession'
         required = ['fullrecord_published', 'fullrecord']
         required.concat(['subjects', 'subject_uris']) if record.has_key?('subjects')
         if record.has_key?('linked_agents')
@@ -160,7 +163,8 @@ class RustIndexDocumentBuilder
                             'title', 'identifier', 'acquisition_type', 'resource_type',
                             'restrictions_apply', 'access_restrictions', 'use_restrictions',
                             'related_resource_uris', 'related_accession_uris', 'slug',
-                            'is_slug_auto', 'external_id', 'ancestors', 'langcode'
+                            'is_slug_auto', 'external_id', 'ancestors', 'langcode',
+                            'accession_date', 'accession_date_year'
                           ])
           if record['collection_management'].is_a?(Hash)
             required.concat(['processing_priority', 'processors'])
@@ -603,6 +607,68 @@ class RustIndexDocumentBuilder
         rescue => e
           raise "response ark_name mismatch for #{uri}: #{e.message}"
         end
+      end
+    end
+  end
+
+  def validate_accession_date_projection!(document, input)
+    uri = input['uri']
+    record = input['record']
+    unless record.is_a?(Hash)
+      raise "record must be a hash for #{uri}"
+    end
+
+    raw_date = record['accession_date']
+    unless raw_date.is_a?(String)
+      raise "record accession_date missing or invalid for #{uri}"
+    end
+
+    parsed_year = begin
+      Date.parse(raw_date).year
+    rescue ArgumentError, TypeError => e
+      raise "record accession_date unparseable for #{uri}: #{e.message}"
+    end
+
+    actual_date = document['accession_date']
+    unless actual_date.is_a?(String)
+      raise "response accession_date must be a string for #{uri}"
+    end
+
+    actual_year = document['accession_date_year']
+    unless actual_year.is_a?(Integer)
+      raise "response accession_date_year must be an integer for #{uri}"
+    end
+
+    unless actual_year == parsed_year
+      raise "response accession_date_year mismatch for #{uri}: expected #{parsed_year.inspect}, got #{actual_year.inspect}"
+    end
+
+    if raw_date == '9999-12-31'
+      expected_unknown = input['accession_date_unknown_label']
+      unless expected_unknown.is_a?(String) && !expected_unknown.empty?
+        raise "accession_date_unknown_label missing or empty in request for #{uri}"
+      end
+
+      unless actual_date == expected_unknown
+        raise "response accession_date mismatch for sentinel on #{uri}: expected #{expected_unknown.inspect}, got #{actual_date.inspect}"
+      end
+
+      fullrecord = document['fullrecord']
+      expected_suffix = "#{expected_unknown} "
+      if fullrecord.is_a?(Array)
+        unless fullrecord.last == expected_suffix
+          raise "response fullrecord array does not end with sentinel label for #{uri}"
+        end
+      elsif fullrecord.is_a?(String)
+        unless fullrecord.end_with?(expected_suffix)
+          raise "response fullrecord string does not end with sentinel label for #{uri}"
+        end
+      else
+        raise "response fullrecord must be array or string for #{uri}"
+      end
+    else
+      unless actual_date == raw_date
+        raise "response accession_date mismatch for #{uri}: expected #{raw_date.inspect}, got #{actual_date.inspect}"
       end
     end
   end

@@ -446,6 +446,48 @@ class IndexerCommon
     true
   end
 
+  def valid_accession_date_projection?(doc, record)
+    return false unless doc.is_a?(Hash)
+    record_data = (record.is_a?(Hash) && record['record'].is_a?(Hash)) ? record['record'] : (record.is_a?(Hash) ? record : nil)
+    return false unless record_data.is_a?(Hash)
+
+    raw_date = record_data['accession_date']
+    return false unless raw_date.is_a?(String)
+
+    parsed_year = begin
+      Date.parse(raw_date).year
+    rescue ArgumentError, TypeError
+      nil
+    end
+    return false if parsed_year.nil?
+
+    actual_date = doc['accession_date']
+    actual_year = doc['accession_date_year']
+    return false unless actual_date.is_a?(String)
+    return false unless actual_year.is_a?(Integer)
+    return false unless actual_year == parsed_year
+
+    expected_unknown = I18n.t('accession.accession_date_unknown')
+    return false unless expected_unknown.is_a?(String) && !expected_unknown.empty?
+
+    if raw_date == '9999-12-31'
+      return false unless actual_date == expected_unknown
+    else
+      return false unless actual_date == raw_date
+    end
+
+    expected_published, expected_unpublished = IndexerCommon.extract_string_values(record_data)
+    if raw_date == '9999-12-31'
+      expected_suffix = "#{expected_unknown} "
+      expected_unpublished = expected_unpublished + [expected_suffix]
+    end
+
+    return false unless doc['fullrecord_published'] == expected_published
+    return false unless doc['fullrecord'] == expected_unpublished
+
+    true
+  end
+
   def compute_expected_dynamic_enums(record_data, fields = enum_fields)
     return {} unless record_data.is_a?(Hash)
 
@@ -545,16 +587,22 @@ class IndexerCommon
     add_document_prepare_hook {|doc, record|
       if doc['primary_type'] == 'accession'
         rust_fields = Array(doc['_archivalist_rust_fields'])
-        date = record['record']['accession_date']
-        if date == '9999-12-31'
-          unknown = I18n.t('accession.accession_date_unknown')
-          doc['accession_date'] = unknown
-          doc['fullrecord'] ||= ''
-          doc['fullrecord'] << unknown + ' '
+        if rust_fields.include?('accession_date_metadata') && valid_accession_date_projection?(doc, record)
+          # Accelerated by Rust sidecar: skip native accession date handling
         else
-          doc['accession_date'] = date
+          doc['_archivalist_rust_fields'].delete('accession_date_metadata') if doc['_archivalist_rust_fields'].is_a?(Array)
+          build_fullrecord(doc, record)
+          date = record['record']['accession_date']
+          if date == '9999-12-31'
+            unknown = I18n.t('accession.accession_date_unknown')
+            doc['accession_date'] = unknown
+            doc['fullrecord'] ||= ''
+            doc['fullrecord'] << unknown + ' '
+          else
+            doc['accession_date'] = date
+          end
+          doc['accession_date_year'] = Date.parse(date).year
         end
-        doc['accession_date_year'] = Date.parse(date).year
         unless rust_fields.include?('accession_digital_object_metadata')
           doc['identifier'] = (0...4).map {|i| record['record']["id_#{i}"]}.compact.join("-")
           doc['title'] = record['record']['display_string']
@@ -1531,6 +1579,16 @@ class IndexerCommon
       if rust_index_document_enrichment_enabled?
         input['dynamic_enum_fields'] = enum_fields
         input['arks_enabled'] = !!AppConfig[:arks_enabled]
+        if prepared[:record_type] == 'accession'
+          input['accession_date_unknown_label'] = I18n.t('accession.accession_date_unknown')
+          if prepared[:values].is_a?(Hash) && prepared[:values]['accession_date'].is_a?(String)
+            begin
+              input['parsed_accession_date_year'] = Date.parse(prepared[:values]['accession_date']).year
+            rescue ArgumentError, TypeError
+              # unparseable date
+            end
+          end
+        end
       end
       input
     end

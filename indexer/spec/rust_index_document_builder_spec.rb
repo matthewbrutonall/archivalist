@@ -98,6 +98,7 @@ describe RustIndexDocumentBuilder do
         'title' => 'New records',
         'display_string' => '2026-004: New records',
         'publish' => true,
+        'accession_date' => '2026-10-17',
         'id_0' => '2026',
         'acquisition_type' => 'gift',
         'resource_type' => 'papers',
@@ -123,6 +124,8 @@ describe RustIndexDocumentBuilder do
       'repository' => 2,
       'fullrecord_published' => [],
       'fullrecord' => [],
+      'accession_date' => '2026-10-17',
+      'accession_date_year' => 2026,
       'identifier' => '2026',
       'acquisition_type' => 'gift',
       'resource_type' => 'papers',
@@ -141,6 +144,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'accession_digital_object_metadata',
+        'accession_date_metadata',
         'dynamic_enum_and_ark_metadata',
       ],
     }
@@ -1416,6 +1420,7 @@ describe RustIndexDocumentBuilder do
         'uri' => '/repositories/2/accessions/2',
         'display_string' => 'Accession 2026-01',
         'title' => nil,
+        'accession_date' => '2026-01-15',
         'id_0' => 'ACC-2',
         'acquisition_type' => nil,
         'resource_type' => nil,
@@ -1466,6 +1471,8 @@ describe RustIndexDocumentBuilder do
       'repository' => 2,
       'fullrecord_published' => [],
       'fullrecord' => [],
+      'accession_date' => '2026-01-15',
+      'accession_date_year' => 2026,
       'identifier' => 'ACC-2',
       'acquisition_type' => nil,
       'resource_type' => nil,
@@ -1486,6 +1493,7 @@ describe RustIndexDocumentBuilder do
         'common_metadata',
         'fullrecord',
         'accession_digital_object_metadata',
+        'accession_date_metadata',
         'dynamic_enum_and_ark_metadata',
       ],
       '_archivalist_collection_management_documents' => [minimal_child],
@@ -2283,6 +2291,274 @@ describe RustIndexDocumentBuilder do
                         'documents' => [doc])
       )
       expect { builder.build([newline_ark_input]) }.to raise_error(/response ark_name mismatch/)
+    end
+  end
+
+  describe 'accession date enrichment validation' do
+    let(:base_accession_input) do
+      {
+        'uri' => '/repositories/2/accessions/88',
+        'record_type' => 'accession',
+        'repository' => 2,
+        'enrich' => true,
+        'accession_date_unknown_label' => 'незнаний',
+        'record' => {
+          'uri' => '/repositories/2/accessions/88',
+          'title' => 'Accession 88',
+          'display_string' => 'ACC-88: Accession 88',
+          'accession_date' => '2026-10-17',
+          'publish' => true,
+          'id_0' => 'ACC-88',
+          'acquisition_type' => 'deposit',
+          'resource_type' => 'records',
+          'restrictions_apply' => false,
+          'access_restrictions' => false,
+          'use_restrictions' => false,
+          'related_resources' => [],
+          'related_accessions' => [],
+          'slug' => 'acc-88',
+          'is_slug_auto' => true,
+        },
+      }
+    end
+
+    def valid_accession_doc_for(input)
+      rec = input['record']
+      raw_date = rec['accession_date']
+      is_sentinel = (raw_date == '9999-12-31')
+      unknown_label = input['accession_date_unknown_label']
+      acc_date = is_sentinel ? unknown_label : raw_date
+      acc_year = is_sentinel ? 9999 : Date.parse(raw_date).year
+      fullrecord = is_sentinel ? ["record content", "#{unknown_label} "] : ["record content"]
+
+      {
+        'id' => input['uri'],
+        'uri' => input['uri'],
+        'title' => rec['display_string'],
+        'primary_type' => 'accession',
+        'types' => ['accession'],
+        'json' => ASUtils.to_json(rec),
+        'suppressed' => false,
+        'publish' => true,
+        'system_generated' => 'false',
+        'repository' => 2,
+        'fullrecord_published' => [],
+        'fullrecord' => fullrecord,
+        'accession_date' => acc_date,
+        'accession_date_year' => acc_year,
+        'identifier' => 'ACC-88',
+        'acquisition_type' => 'deposit',
+        'resource_type' => 'records',
+        'restrictions_apply' => false,
+        'access_restrictions' => false,
+        'use_restrictions' => false,
+        'related_resource_uris' => [],
+        'related_accession_uris' => [],
+        'slug' => 'acc-88',
+        'is_slug_auto' => true,
+        'external_id' => [],
+        'ancestors' => [],
+        'langcode' => [],
+        'four_part_id' => 'ACC-88',
+        '_archivalist_rust_fields' => [
+          'common_metadata',
+          'fullrecord',
+          'accession_digital_object_metadata',
+          'accession_date_metadata',
+          'dynamic_enum_and_ark_metadata',
+        ],
+      }
+    end
+
+    it 'accepts ordinary accession date and year with exact integer type' do
+      doc = valid_accession_doc_for(base_accession_input)
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      result = builder.build([base_accession_input])
+      expect(result[base_accession_input['uri']]['accession_date']).to eq('2026-10-17')
+      expect(result[base_accession_input['uri']]['accession_date_year']).to eq(2026)
+    end
+
+    it 'accepts sentinel accession date with Unicode localized label and array fullrecord' do
+      sentinel_input = base_accession_input.merge(
+        'record' => base_accession_input['record'].merge('accession_date' => '9999-12-31')
+      )
+      doc = valid_accession_doc_for(sentinel_input)
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      result = builder.build([sentinel_input])
+      expect(result[sentinel_input['uri']]['accession_date']).to eq('незнаний')
+      expect(result[sentinel_input['uri']]['accession_date_year']).to eq(9999)
+      expect(result[sentinel_input['uri']]['fullrecord'].last).to eq('незнаний ')
+    end
+
+    it 'accepts sentinel accession date with string fullrecord' do
+      sentinel_input = base_accession_input.merge(
+        'record' => base_accession_input['record'].merge('accession_date' => '9999-12-31')
+      )
+      doc = valid_accession_doc_for(sentinel_input)
+      doc['fullrecord'] = "some initial text незнаний "
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      result = builder.build([sentinel_input])
+      expect(result[sentinel_input['uri']]['fullrecord']).to eq("some initial text незнаний ")
+    end
+
+    it 'rejects string accession_date_year (anti-string-coercion)' do
+      doc = valid_accession_doc_for(base_accession_input)
+      doc['accession_date_year'] = '2026'
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([base_accession_input]) }.to raise_error(/response accession_date_year must be an integer/)
+    end
+
+    it 'rejects float accession_date_year' do
+      doc = valid_accession_doc_for(base_accession_input)
+      doc['accession_date_year'] = 2026.0
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([base_accession_input]) }.to raise_error(/response accession_date_year must be an integer/)
+    end
+
+    it 'rejects mismatched accession_date_year' do
+      doc = valid_accession_doc_for(base_accession_input)
+      doc['accession_date_year'] = 2025
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([base_accession_input]) }.to raise_error(/response accession_date_year mismatch/)
+    end
+
+    it 'rejects mismatched accession_date value' do
+      doc = valid_accession_doc_for(base_accession_input)
+      doc['accession_date'] = '2026-10-18'
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([base_accession_input]) }.to raise_error(/response accession_date mismatch/)
+    end
+
+    it 'rejects missing accession_date_metadata marker on accession' do
+      doc = valid_accession_doc_for(base_accession_input)
+      doc['_archivalist_rust_fields'].delete('accession_date_metadata')
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([base_accession_input]) }.to raise_error(/response enrichment marker mismatch/)
+    end
+
+    it 'rejects missing accession_date field in response' do
+      doc = valid_accession_doc_for(base_accession_input)
+      doc.delete('accession_date')
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([base_accession_input]) }.to raise_error(/response enrichment fields missing.*accession_date/)
+    end
+
+    it 'rejects missing accession_date_year field in response' do
+      doc = valid_accession_doc_for(base_accession_input)
+      doc.delete('accession_date_year')
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([base_accession_input]) }.to raise_error(/response enrichment fields missing.*accession_date_year/)
+    end
+
+    it 'rejects sentinel accession date when accession_date_unknown_label is missing in input' do
+      sentinel_input = base_accession_input.merge(
+        'accession_date_unknown_label' => nil,
+        'record' => base_accession_input['record'].merge('accession_date' => '9999-12-31')
+      )
+      doc = valid_accession_doc_for(sentinel_input.merge('accession_date_unknown_label' => 'unknown'))
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([sentinel_input]) }.to raise_error(/accession_date_unknown_label missing or empty/)
+    end
+
+    it 'rejects sentinel accession date when fullrecord does not end with localized label' do
+      sentinel_input = base_accession_input.merge(
+        'record' => base_accession_input['record'].merge('accession_date' => '9999-12-31')
+      )
+      doc = valid_accession_doc_for(sentinel_input)
+      doc['fullrecord'] = ["without localized label"]
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([sentinel_input]) }.to raise_error(/response fullrecord array does not end with sentinel label/)
+    end
+
+    it 'accepts ordinary accession date when fullrecord legitimately ends with unknown label string' do
+      doc = valid_accession_doc_for(base_accession_input)
+      doc['fullrecord'] = ["content", "незнаний "]
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      result = builder.build([base_accession_input])
+      expect(result[base_accession_input['uri']]['fullrecord']).to eq(["content", "незнаний "])
+    end
+
+    it 'accepts non-canonical schema-valid accession dates (year 0, unpadded month, whitespace)' do
+      examples = [
+        { 'date' => '0000-01-01', 'expected_year' => 0 },
+        { 'date' => '2026-2-03', 'expected_year' => 2026 },
+        { 'date' => '  2026-10-17  ', 'expected_year' => 2026 },
+      ]
+
+      examples.each_with_index do |ex, i|
+        input = base_accession_input.merge(
+          'uri' => "/repositories/2/accessions/#{100 + i}",
+          'parsed_accession_date_year' => ex['expected_year'],
+          'record' => base_accession_input['record'].merge(
+            'uri' => "/repositories/2/accessions/#{100 + i}",
+            'accession_date' => ex['date']
+          )
+        )
+        doc = valid_accession_doc_for(input)
+        allow(builder).to receive(:perform_request).and_return(
+          response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                          'documents' => [doc])
+        )
+        result = builder.build([input])
+        expect(result[input['uri']]['accession_date']).to eq(ex['date'])
+        expect(result[input['uri']]['accession_date_year']).to eq(ex['expected_year'])
+      end
+    end
+
+    it 'preserves and validates Unicode unknown label with intentional surrounding whitespace byte-for-byte' do
+      ws_label = "  незнаний  "
+      sentinel_input = base_accession_input.merge(
+        'accession_date_unknown_label' => ws_label,
+        'parsed_accession_date_year' => 9999,
+        'record' => base_accession_input['record'].merge('accession_date' => '9999-12-31')
+      )
+      doc = valid_accession_doc_for(sentinel_input)
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      result = builder.build([sentinel_input])
+      expect(result[sentinel_input['uri']]['accession_date']).to eq(ws_label)
+      expect(result[sentinel_input['uri']]['fullrecord'].last).to eq("#{ws_label} ")
     end
   end
 end

@@ -98,7 +98,9 @@ Endpoints:
   assessments, top containers, jobs (deterministic staff metadata), synthetic
   collection-management child documents for valid parent records, all
   agent authority types, staff-index dynamic-enum projection (`<field>_enum_s`
-  and `type_enum_s`), and ARK field preparation (`ark_name`).
+  and `type_enum_s`), ARK field preparation (`ark_name`), and accession-date
+  staff enrichment (`accession_date` and `accession_date_year` with sentinel
+  `9999-12-31` handling).
 
 The example systemd unit in `deploy/` binds to loopback by default. Put authentication
 and transport security in front of the sidecar before exposing it beyond the local
@@ -110,7 +112,7 @@ non-production rollout, parity gate, outage fallback test, and rollback procedur
 The search, resource-tree, and index-document gates are automated by
 `scripts/canary_shadow_search.sh`, `scripts/canary_resource_tree.sh`, and
 `scripts/canary_index_document_builder.sh`. Staff-index enrichment parity is
-checked at the resource level by `scripts/canary_index_document_enrichment.sh`,
+checked at the resource and accession level by `scripts/canary_index_document_enrichment.sh`,
 and across complete disposable-repository reindexes by the full STAFF index
 parity comparator, `scripts/compare_staff_index_parity.py`. PUI full-record
 preparation, publication decisions, internal-note privacy filtering, and
@@ -119,9 +121,20 @@ discovery intentionally remain native because inheritance, localization, and
 external I/O are handled by Ruby. Dynamic-enum schema derivation and ARK enablement
 configuration remain in Ruby; Rust handles deterministic recursive traversal, `_resolved`
 exclusion, ordering, deduplication, and trim semantics under strict Ruby validation and
-complete native fallback. Collection-management child documents are generated exclusively
-for staff enrichment; PUI indexing remains native, and Ruby retains sole ownership of Solr
-writes and stale-child deletions.
+complete native fallback. Accession-date staff preparation for ordinary dates and the
+sentinel date `9999-12-31` is owned by Rust when trusted under the distinct
+`accession_date_metadata` capability marker; localization remains Ruby-owned (Ruby
+passes only the minimal localized unknown label `I18n.t('accession.accession_date_unknown')`
+byte-for-byte, and Rust preserves it without trimming or translating). Exact native date
+parsing semantics are preserved by Ruby computing `Date.parse(date).year` and passing
+it as `parsed_accession_date_year` (accepting non-canonical schema-valid dates such as
+year 0 and strings with whitespace); Rust requires this integer within valid signed
+32-bit range and projects `accession_date` and `accession_date_year`. Ruby strictly validates
+exact fullrecord parity against native extraction before trusting the projection, falling
+back completely to native preparation with deterministic `build_fullrecord` reconstruction
+(preventing fullrecord pollution or duplication) on missing, malformed, or mismatched sidecar responses. Collection-management child documents are
+generated exclusively for staff enrichment; PUI indexing remains native, and Ruby
+retains sole ownership of Solr writes and stale-child deletions.
 
 ## Test and benchmark helpers
 
