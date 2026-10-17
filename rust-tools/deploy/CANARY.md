@@ -219,11 +219,19 @@ built-in native child generator; all third-party `add_extra_documents_hook` regi
 unchanged exactly once. Stale-child deletion via `records_with_children` is preserved. It accounts
 for Solr's intentional copy-field merge of `notes_published` into `notes`. Only
 after this passes should `rust_index_document_enrichment_enabled` be set to `true`.
-The enrichment gate is staff-index only; PUI full-record extraction, top-container
-publication decisions (`is_linked_to_published_record` / `pui_container`), and PUI
-removal of `internal_note` and container-profile notes remain native after
-inheritance and privacy filtering. Job, collection-management child, dynamic-enum, and ARK
-enrichment is completely bypassed in PUI.
+The enrichment gate `rust_index_document_enrichment_enabled` is staff-index only;
+PUI document privacy preparation is gated separately under `rust_pui_document_preparation_enabled`
+(disabled by default). Inheritance semantics, top-container publication decisions
+(`is_linked_to_published_record` / `pui_container`), LargeTree/ordered-record indexing,
+and Solr writes remain Ruby-owned. When trusted under the `pui_final_document_metadata`
+capability marker, Rust owns deterministic final public JSON privacy preparation
+(removing ancestors, top-container `internal_note`, and container-profile `notes` across
+nested instances) and published-only fullrecord extraction (`fullrecord_published`),
+while never emitting an unpublished `fullrecord` field. Ruby strictly validates exact
+recursive JSON equality, serialization, and published string values before trusting
+the projection, falling back completely to unchanged native `PUIIndexer#final_doc_rules`
+on missing, malformed, or mismatched sidecar responses. Collection-management child
+documents, dynamic enums, and ARKs remain staff-only and are completely bypassed in PUI.
 Before rollout, also require a complete native-versus-Rust reindex comparison so
 accessions, digital objects and components, subjects, agents, classifications,
 repositories, events, locations, container profiles, location profiles,
@@ -335,9 +343,80 @@ without corruption:
    curl --fail http://127.0.0.1:4570/ready
    ```
 
-## 8. Rollback
+## 8. PUI document preparation parity gate and canary procedure
 
-Set all sidecar enable flags, including `rust_index_document_builder_enabled` and
-`rust_index_document_enrichment_enabled`, to `false` and restart Archivalist. The sidecar
-can then be stopped independently. Do not point the service at the primary Solr
-collection and do not enable these paths by default until all canary gates pass.
+This gate validates complete, stored public Solr document parity between a native baseline
+PUI index and a candidate PUI index prepared with Rust acceleration enabled for an entire
+disposable repository.
+
+> **CRITICAL SAFETY RULE**: Never point this workflow, any canary script, or comparator
+> at the primary production Solr collection (`archivesspace`). All canary procedures
+> must target isolated non-production collections or dedicated test cores.
+
+### Step A: Low-level isolated record canary verification
+
+Run the dedicated non-production canary script on sample archival objects and resources:
+
+```bash
+REPO_ID=2 ARCHIVAL_OBJECT_ID=123 CANARY_SOLR_URL="http://127.0.0.1:8985/solr/test_canary_pui" \
+  scripts/canary_pui_document_preparation.sh
+```
+
+**Scope Notice**: This canary exercises the low-level Rust sidecar document preparation contract directly (it does not perform Ruby RecordInheritance merge). The full two-index comparator in Step B is the end-to-end gate.
+
+The canary verifies:
+1. Sidecar `/health` returns HTTP 200 with `served_by == "aspace-shadow-sidecar"`.
+2. `_archivalist_rust_fields` marker is `["pui_final_document_metadata"]`.
+3. `_archivalist_pui_final` contains clean `json` and `fullrecord_published`.
+4. Root document and parsed JSON have no `ancestors`, no top-container `internal_note`, no container-profile `notes`, and no private `_archivalist_*` keys.
+5. Unpublished `fullrecord` field is suppressed.
+6. Exact exit code `0`.
+
+### Step B: Full repository privacy-normalized PUI parity comparison
+
+Run the offline type-strict privacy-normalized PUI parity comparator between a native PUI reindex
+(`test_pui_baseline`) and a candidate PUI reindex (`test_pui_candidate`):
+
+```bash
+python3 scripts/compare_pui_index_parity.py \
+  --baseline-url http://127.0.0.1:8985/solr/test_pui_baseline \
+  --candidate-url http://127.0.0.1:8985/solr/test_pui_candidate \
+  --repository 2
+```
+
+**Honest Parity Specification**:
+Native ArchivesSpace retains root Solr `ancestors`, keeps `"ancestors": []` in JSON, and serializes JSON before stripping top-container `internal_note` and container-profile `notes`. The Rust candidate intentionally hardens these boundaries by removing root `ancestors`, stripping `ancestors` from JSON, and stripping nested container notes from JSON and `fullrecord_published`.
+
+The comparator enforces this via a strict two-step verification rule:
+1. Candidate is scanned strictly for any privacy leaks (root ancestors, JSON ancestors, internal notes, profile notes, unpublished fullrecord, or `_archivalist_*` keys). Candidate is NEVER normalized to hide leaks; any leak immediately fails.
+2. Only the 4 documented native-private fields are normalized from the baseline (root Solr ancestors, JSON ancestors, top-container internal note, container-profile notes).
+3. Candidate parsed JSON must structurally match the normalized baseline JSON.
+4. All remaining Solr fields, types, values, and array orderings must match with exact type-strict equality. Non-private fields are exact; four documented private baseline fields are normalized.
+
+Acceptance requires exit code `0` (`RESULT: SUCCESS - Privacy-normalized PUI parity verified`):
+- Equal public document counts.
+- Zero missing or extra documents.
+- Zero scalar, array, or type differences on all non-private fields.
+- Four documented private baseline fields normalized.
+- Zero privacy leaks.
+
+### Step C: Sidecar outage and untrusted response fallback
+
+Verify that a sidecar outage, timeout, or malformed/malicious response causes the
+indexer to safely discard the untrusted projection and execute unchanged native
+`PUIIndexer#final_doc_rules` for the batch without leaking private data or halting indexing.
+
+## 9. Rollback
+
+Set all sidecar enable flags, including `rust_index_document_builder_enabled`,
+`rust_index_document_enrichment_enabled`, and `rust_pui_document_preparation_enabled`,
+to `false` and restart Archivalist:
+
+```ruby
+AppConfig[:rust_index_document_builder_enabled] = false
+AppConfig[:rust_index_document_enrichment_enabled] = false
+AppConfig[:rust_pui_document_preparation_enabled] = false
+```
+
+The sidecar can then be stopped independently. Do not point the service at the primary
+Solr collection and do not enable these paths by default until all canary gates pass.

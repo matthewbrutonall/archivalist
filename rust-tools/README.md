@@ -114,27 +114,37 @@ The search, resource-tree, and index-document gates are automated by
 `scripts/canary_index_document_builder.sh`. Staff-index enrichment parity is
 checked at the resource and accession level by `scripts/canary_index_document_enrichment.sh`,
 and across complete disposable-repository reindexes by the full STAFF index
-parity comparator, `scripts/compare_staff_index_parity.py`. PUI full-record
-preparation, publication decisions, internal-note privacy filtering, and
-job-specific dynamic I18n translation, local timestamps, and output-file
-discovery intentionally remain native because inheritance, localization, and
-external I/O are handled by Ruby. Dynamic-enum schema derivation and ARK enablement
-configuration remain in Ruby; Rust handles deterministic recursive traversal, `_resolved`
-exclusion, ordering, deduplication, and trim semantics under strict Ruby validation and
-complete native fallback. Accession-date staff preparation for ordinary dates and the
-sentinel date `9999-12-31` is owned by Rust when trusted under the distinct
-`accession_date_metadata` capability marker; localization remains Ruby-owned (Ruby
-passes only the minimal localized unknown label `I18n.t('accession.accession_date_unknown')`
-byte-for-byte, and Rust preserves it without trimming or translating). Exact native date
-parsing semantics are preserved by Ruby computing `Date.parse(date).year` and passing
-it as `parsed_accession_date_year` (accepting non-canonical schema-valid dates such as
-year 0 and strings with whitespace); Rust requires this integer within valid signed
-32-bit range and projects `accession_date` and `accession_date_year`. Ruby strictly validates
-exact fullrecord parity against native extraction before trusting the projection, falling
-back completely to native preparation with deterministic `build_fullrecord` reconstruction
-(preventing fullrecord pollution or duplication) on missing, malformed, or mismatched sidecar responses. Collection-management child documents are
-generated exclusively for staff enrichment; PUI indexing remains native, and Ruby
-retains sole ownership of Solr writes and stale-child deletions.
+parity comparator, `scripts/compare_staff_index_parity.py`. PUI document privacy
+preparation is gated separately under `AppConfig[:rust_pui_document_preparation_enabled]`
+(disabled by default). Inheritance semantics, top-container publication decisions
+(`is_linked_to_published_record` / `pui_container`), LargeTree/ordered-record indexing,
+and Solr writes remain Ruby-owned. When trusted under the `pui_final_document_metadata`
+capability marker, Rust owns deterministic final public JSON privacy preparation
+(removing ancestors, top-container `internal_note`, and container-profile `notes` across
+nested instances) and published-only fullrecord extraction (`fullrecord_published`),
+while never emitting an unpublished `fullrecord` field. Ruby strictly validates exact
+recursive JSON equality, serialization, and published string values before trusting
+the projection, falling back completely to unchanged native `PUIIndexer#final_doc_rules`
+on missing, malformed, or mismatched sidecar responses. Job-specific dynamic I18n
+translation, local timestamps, and output-file discovery remain native because
+localization and external I/O are handled by Ruby. Dynamic-enum schema derivation
+and ARK enablement configuration remain in Ruby; Rust handles deterministic recursive
+traversal, `_resolved` exclusion, ordering, deduplication, and trim semantics under
+strict Ruby validation and complete native fallback. Accession-date staff preparation
+for ordinary dates and the sentinel date `9999-12-31` is owned by Rust when trusted
+under the distinct `accession_date_metadata` capability marker; localization remains
+Ruby-owned (Ruby passes only the minimal localized unknown label `I18n.t('accession.accession_date_unknown')`
+byte-for-byte, and Rust preserves it without trimming or translating). Exact native
+date parsing semantics are preserved by Ruby computing `Date.parse(date).year` and
+passing it as `parsed_accession_date_year` (accepting non-canonical schema-valid dates
+such as year 0 and strings with whitespace); Rust requires this integer within valid
+signed 32-bit range and projects `accession_date` and `accession_date_year`. Ruby strictly
+validates exact fullrecord parity against native extraction before trusting the projection,
+falling back completely to native preparation with deterministic `build_fullrecord`
+reconstruction (preventing fullrecord pollution or duplication) on missing, malformed,
+or mismatched sidecar responses. Collection-management child documents are generated
+exclusively for staff enrichment; PUI indexing remains native, and Ruby retains sole
+ownership of Solr writes and stale-child deletions.
 
 ## Test and benchmark helpers
 
@@ -143,6 +153,16 @@ Scripts under `scripts/` are code-only harnesses:
 - `compare_staff_index_parity.py`: read-only Staff Solr collection comparator that
   verifies full document and field parity, array ordering, and absence of private
   handoff markers between native baseline and candidate reindexes.
+- `compare_pui_index_parity.py`: read-only PUI Solr collection comparator that
+  verifies privacy-normalized PUI parity, public document parity, type strictness,
+  and canonical structural JSON equality against an unhardened native baseline by
+  normalizing ONLY documented native-private fields after strictly verifying zero
+  candidate privacy leaks (absence of root/JSON ancestors, internal notes, container-profile
+  notes, unpublished fullrecord, and private handoff metadata). Non-private fields are
+  exact; four documented private baseline fields are normalized.
+- `canary_pui_document_preparation.sh`: isolated non-production canary script for
+  low-level PUI document preparation that verifies sidecar /health liveness and response
+  privacy cleaning against the Rust sidecar while permanently refusing primary production Solr collections.
 - Helpers that query records require the caller to provide test-specific values
   through environment variables such as `RESOURCE_URI` and `QUERY`.
 

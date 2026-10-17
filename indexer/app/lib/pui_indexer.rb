@@ -80,6 +80,10 @@ class PUIIndexer < PeriodicIndexer
     # this runs after the hooks in indexer_common, so we can overwrite with confidence
     add_document_prepare_hook {|doc, record|
       if RecordInheritance.has_type?(doc['primary_type'])
+        if rust_pui_document_preparation_enabled? && apply_rust_pui_final_projection(doc, record)
+          next
+        end
+
         # special handling for json because we need to include indirectly inherited
         # fields too - the json sent to indexer_common only has directly inherited
         # fields because only they should be indexed.
@@ -111,6 +115,112 @@ class PUIIndexer < PeriodicIndexer
         build_fullrecord(doc, record)
       end
     }
+  end
+
+  def apply_rust_pui_final_projection(doc, record)
+    return false unless record.is_a?(Hash) && record['record'].is_a?(Hash)
+    record_obj = record['record']
+    rec_uri = record_obj['uri']
+    return false unless rec_uri.is_a?(String) && !rec_uri.empty?
+    rec_type = record_obj['jsonmodel_type']
+    return false unless rec_type.is_a?(String) && rec_type == doc['primary_type']
+
+    uri = rec_uri
+    projection = @pui_final_projections && @pui_final_projections[uri]
+    return false unless projection.is_a?(Hash)
+
+    # 1. Capability marker & structure validation
+    return false unless projection['marker'] == 'pui_final_document_metadata'
+    return false unless projection['json'].is_a?(String)
+    return false unless projection['fullrecord_published'].is_a?(Array)
+    return false if doc.has_key?('fullrecord')
+
+    # 2. Parse projection JSON
+    parsed_json = begin
+                    ASUtils.json_parse(projection['json'])
+                  rescue StandardError
+                    nil
+                  end
+    return false unless parsed_json.is_a?(Hash)
+    return false unless parsed_json['uri'].is_a?(String) && parsed_json['uri'] == uri
+    return false unless parsed_json['jsonmodel_type'].is_a?(String) && parsed_json['jsonmodel_type'] == doc['primary_type']
+
+    # 3. Privacy assertions on parsed_json
+    return false if parsed_json.has_key?('ancestors')
+    if parsed_json['instances'].is_a?(Array)
+      parsed_json['instances'].each do |instance|
+        next unless instance.is_a?(Hash)
+        sub_c = instance['sub_container']
+        if sub_c.is_a?(Hash) && sub_c['top_container'].is_a?(Hash)
+          resolved_tc = sub_c['top_container']['_resolved']
+          if resolved_tc.is_a?(Hash)
+            return false if resolved_tc.has_key?('internal_note')
+            resolved_cp = resolved_tc.dig('container_profile', '_resolved')
+            return false if resolved_cp.is_a?(Hash) && resolved_cp.has_key?('notes')
+          end
+        end
+      end
+    end
+
+    # 4. Authoritative native independent computation:
+    # Build expected clean fully inherited record using exact native merge & clean logic
+    expected_merged = RecordInheritance.merge(deep_copy_record_candidate(record['record']))
+    expected_clean = deep_copy_record_candidate(expected_merged)
+    expected_clean.delete('ancestors')
+    if expected_clean['instances'].is_a?(Array)
+      expected_clean['instances'].each do |instance|
+        next unless instance.is_a?(Hash)
+        sub_c = instance['sub_container']
+        if sub_c.is_a?(Hash) && sub_c['top_container'].is_a?(Hash)
+          resolved_tc = sub_c['top_container']['_resolved']
+          if resolved_tc.is_a?(Hash)
+            resolved_tc.delete('internal_note')
+            resolved_cp = resolved_tc.dig('container_profile', '_resolved')
+            resolved_cp.delete('notes') if resolved_cp.is_a?(Hash)
+          end
+        end
+      end
+    end
+
+    # Exact value and serialization equality
+    return false unless parsed_json == expected_clean
+    return false unless projection['json'] == ASUtils.to_json(expected_clean)
+
+    # Published-only fullrecord check
+    expected_fullrecord = IndexerCommon.extract_string_values(expected_clean, :published_only)
+    return false unless projection['fullrecord_published'] == expected_fullrecord
+
+    # 5. Apply projection safely
+    doc['json'] = projection['json']
+    doc['title'] = record['record']['title'] if record['record']['title']
+
+    # Perform required native mutation on record['record']
+    record['record'].delete('ancestors')
+    if record['record']['instances'].is_a?(Array)
+      record['record']['instances'].each do |instance|
+        next unless instance.is_a?(Hash)
+        sub_c = instance['sub_container']
+        if sub_c.is_a?(Hash) && sub_c['top_container'].is_a?(Hash)
+          resolved_tc = sub_c['top_container']['_resolved']
+          if resolved_tc.is_a?(Hash)
+            resolved_tc.delete('internal_note')
+            resolved_cp = resolved_tc.dig('container_profile', '_resolved')
+            resolved_cp.delete('notes') if resolved_cp.is_a?(Hash)
+          end
+        end
+      end
+    end
+
+    doc['fullrecord_published'] = projection['fullrecord_published']
+    doc.delete('fullrecord')
+    doc.delete('ancestors')
+    doc.delete_if { |k, _| k.to_s.start_with?('_archivalist_') }
+    @pui_final_projections.delete(uri)
+    true
+  rescue StandardError => e
+    Log.warn("PUI final projection validation failed for #{uri}: #{e.class}: #{e.message}; using native fallback")
+    @pui_final_projections.delete(uri) if @pui_final_projections
+    false
   end
 
   def build_fullrecord(doc, record)

@@ -2561,4 +2561,299 @@ describe RustIndexDocumentBuilder do
       expect(result[sentinel_input['uri']]['fullrecord'].last).to eq("#{ws_label} ")
     end
   end
+
+  describe 'PUI final document privacy preparation' do
+    let(:pui_input) do
+      candidate = {
+        'uri' => '/repositories/2/archival_objects/42',
+        'jsonmodel_type' => 'archival_object',
+        'title' => 'Letters to Bro. Paul',
+        'display_string' => 'Letters to Bro. Paul, 1880',
+        'publish' => true,
+        'ancestors' => [
+          {
+            'ref' => '/repositories/2/resources/1',
+            'title' => 'Secret Resource Title'
+          }
+        ],
+        'instances' => [
+          {
+            'sub_container' => {
+              'top_container' => {
+                'ref' => '/repositories/2/top_containers/10',
+                '_resolved' => {
+                  'indicator' => 'Box 1',
+                  'internal_note' => 'RESTRICTED_TC_INTERNAL_NOTE',
+                  'container_profile' => {
+                    'ref' => '/container_profiles/5',
+                    '_resolved' => {
+                      'name' => 'Hollinger Box',
+                      'notes' => 'RESTRICTED_PROFILE_NOTE'
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ],
+        'notes' => [
+          {
+            'jsonmodel_type' => 'note_singlepart',
+            'type' => 'abstract',
+            'publish' => true,
+            'content' => ['Public abstract content']
+          }
+        ]
+      }
+
+      {
+        'uri' => '/repositories/2/archival_objects/42',
+        'record_type' => 'archival_object',
+        'repository' => 2,
+        'record' => {
+          'uri' => '/repositories/2/archival_objects/42',
+          'title' => 'Letters to Bro. Paul',
+          'publish' => true
+        },
+        'prepare_pui_final' => true,
+        'pui_candidate_record' => candidate
+      }
+    end
+
+    def valid_clean_candidate_for(candidate)
+      clean = ASUtils.json_parse(ASUtils.to_json(candidate))
+      clean.delete('ancestors')
+      clean['instances'][0]['sub_container']['top_container']['_resolved'].delete('internal_note')
+      clean['instances'][0]['sub_container']['top_container']['_resolved']['container_profile']['_resolved'].delete('notes')
+      clean
+    end
+
+    def valid_pui_doc_for(input)
+      clean = valid_clean_candidate_for(input['pui_candidate_record'])
+      published_strings = builder.send(:extract_published_strings, clean)
+      {
+        'id' => input['uri'],
+        'uri' => input['uri'],
+        'title' => input['record']['title'],
+        'primary_type' => input['record_type'],
+        'types' => [input['record_type']],
+        'json' => ASUtils.to_json(input['record']),
+        'suppressed' => false,
+        'publish' => true,
+        'system_generated' => 'false',
+        'repository' => input['repository'],
+        '_archivalist_rust_fields' => ['pui_final_document_metadata'],
+        '_archivalist_pui_final' => {
+          'marker' => 'pui_final_document_metadata',
+          'json' => ASUtils.to_json(clean),
+          'fullrecord_published' => published_strings
+        }
+      }
+    end
+
+    it 'accepts a valid PUI final projection matching privacy-clean candidate' do
+      doc = valid_pui_doc_for(pui_input)
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      result = builder.build([pui_input])
+      expect(result[pui_input['uri']]).to eq(doc)
+    end
+
+    it 'rejects wrong marker in _archivalist_rust_fields' do
+      doc = valid_pui_doc_for(pui_input)
+      doc['_archivalist_rust_fields'] = ['wrong_marker']
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/response pui final marker mismatch/)
+    end
+
+    it 'rejects missing or wrong marker in _archivalist_pui_final' do
+      doc = valid_pui_doc_for(pui_input)
+      doc['_archivalist_pui_final']['marker'] = 'bad_marker'
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/pui final payload marker mismatch/)
+    end
+
+    it 'rejects malformed JSON string in pui_final[json]' do
+      doc = valid_pui_doc_for(pui_input)
+      doc['_archivalist_pui_final']['json'] = '{bad json'
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(StandardError)
+    end
+
+    it 'rejects wrong types in pui_final' do
+      doc = valid_pui_doc_for(pui_input)
+      doc['_archivalist_pui_final']['fullrecord_published'] = 'not an array'
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/fullrecord_published must be an Array/)
+    end
+
+    it 'rejects altered public data in pui_final[json]' do
+      doc = valid_pui_doc_for(pui_input)
+      clean = valid_clean_candidate_for(pui_input['pui_candidate_record'])
+      clean['title'] = 'Tampered Title'
+      doc['_archivalist_pui_final']['json'] = ASUtils.to_json(clean)
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/value mismatch/)
+    end
+
+    it 'rejects leaked ancestor in pui_final[json]' do
+      doc = valid_pui_doc_for(pui_input)
+      clean = valid_clean_candidate_for(pui_input['pui_candidate_record'])
+      clean['ancestors'] = [{'ref' => '/repositories/2/resources/1'}]
+      doc['_archivalist_pui_final']['json'] = ASUtils.to_json(clean)
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/must not contain ancestors/)
+    end
+
+    it 'rejects leaked top_container internal_note in pui_final[json]' do
+      doc = valid_pui_doc_for(pui_input)
+      clean = valid_clean_candidate_for(pui_input['pui_candidate_record'])
+      clean['instances'][0]['sub_container']['top_container']['_resolved']['internal_note'] = 'LEAKED'
+      doc['_archivalist_pui_final']['json'] = ASUtils.to_json(clean)
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/contains top_container internal_note/)
+    end
+
+    it 'rejects leaked container_profile notes in pui_final[json]' do
+      doc = valid_pui_doc_for(pui_input)
+      clean = valid_clean_candidate_for(pui_input['pui_candidate_record'])
+      clean['instances'][0]['sub_container']['top_container']['_resolved']['container_profile']['_resolved']['notes'] = 'LEAKED'
+      doc['_archivalist_pui_final']['json'] = ASUtils.to_json(clean)
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/contains container_profile notes/)
+    end
+
+    it 'rejects unexpected unpublished fullrecord field in PUI final document' do
+      doc = valid_pui_doc_for(pui_input)
+      doc['fullrecord'] = ['UNPUBLISHED TEXT']
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/unexpected unpublished fullrecord field/)
+    end
+
+    it 'rejects unexpected _archivalist_pui_final when prepare_pui_final is false' do
+      unenriched_input = pui_input.dup
+      unenriched_input.delete('prepare_pui_final')
+      unenriched_input.delete('pui_candidate_record')
+      doc = valid_pui_doc_for(pui_input)
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([unenriched_input]) }.to raise_error(/unexpected response pui final projection marker/)
+    end
+
+    it 'rejects mismatched fullrecord_published' do
+      doc = valid_pui_doc_for(pui_input)
+      doc['_archivalist_pui_final']['fullrecord_published'] = ['tampered string']
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/fullrecord_published mismatch/)
+    end
+
+    it 'rejects missing, null, wrong-type, or mismatched candidate identity' do
+      doc = valid_pui_doc_for(pui_input)
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+
+      # 1. Missing candidate uri
+      bad_input = pui_input.dup
+      bad_input['pui_candidate_record'] = pui_input['pui_candidate_record'].dup
+      bad_input['pui_candidate_record'].delete('uri')
+      expect { builder.build([bad_input]) }.to raise_error(/pui_candidate_record.uri must be a non-empty string/)
+
+      # 2. Null candidate uri
+      bad_input['pui_candidate_record']['uri'] = nil
+      expect { builder.build([bad_input]) }.to raise_error(/pui_candidate_record.uri must be a non-empty string/)
+
+      # 3. Wrong-type (integer) candidate uri
+      bad_input['pui_candidate_record']['uri'] = 123
+      expect { builder.build([bad_input]) }.to raise_error(/pui_candidate_record.uri must be a non-empty string/)
+
+      # 4. Mismatched candidate uri
+      bad_input['pui_candidate_record']['uri'] = '/repositories/2/archival_objects/999'
+      expect { builder.build([bad_input]) }.to raise_error(/pui_candidate_record uri mismatch/)
+
+      # 5. Missing candidate jsonmodel_type
+      bad_input2 = pui_input.dup
+      bad_input2['pui_candidate_record'] = pui_input['pui_candidate_record'].dup
+      bad_input2['pui_candidate_record'].delete('jsonmodel_type')
+      expect { builder.build([bad_input2]) }.to raise_error(/pui_candidate_record.jsonmodel_type must be a non-empty string/)
+
+      # 6. Null candidate jsonmodel_type
+      bad_input2['pui_candidate_record']['jsonmodel_type'] = nil
+      expect { builder.build([bad_input2]) }.to raise_error(/pui_candidate_record.jsonmodel_type must be a non-empty string/)
+
+      # 7. Mismatched candidate jsonmodel_type
+      bad_input2['pui_candidate_record']['jsonmodel_type'] = 'resource'
+      expect { builder.build([bad_input2]) }.to raise_error(/pui_candidate_record jsonmodel_type mismatch/)
+    end
+
+    it 'rejects missing, null, wrong-type, or mismatched parsed_json identity' do
+      # 1. Mismatched parsed_json uri
+      doc_mismatch_uri = valid_pui_doc_for(pui_input)
+      clean = valid_clean_candidate_for(pui_input['pui_candidate_record'])
+      clean['uri'] = '/repositories/2/archival_objects/999'
+      doc_mismatch_uri['_archivalist_pui_final']['json'] = ASUtils.to_json(clean)
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_mismatch_uri])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/pui final json uri mismatch/)
+
+      # 2. Missing parsed_json uri
+      clean_no_uri = valid_clean_candidate_for(pui_input['pui_candidate_record'])
+      clean_no_uri.delete('uri')
+      doc_no_uri = valid_pui_doc_for(pui_input)
+      doc_no_uri['_archivalist_pui_final']['json'] = ASUtils.to_json(clean_no_uri)
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_no_uri])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/pui final json uri must be a non-empty string/)
+
+      # 3. Mismatched parsed_json jsonmodel_type
+      clean_mismatch_type = valid_clean_candidate_for(pui_input['pui_candidate_record'])
+      clean_mismatch_type['jsonmodel_type'] = 'resource'
+      doc_mismatch_type = valid_pui_doc_for(pui_input)
+      doc_mismatch_type['_archivalist_pui_final']['json'] = ASUtils.to_json(clean_mismatch_type)
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_mismatch_type])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/pui final json jsonmodel_type mismatch/)
+    end
+  end
 end

@@ -1557,6 +1557,25 @@ class IndexerCommon
       self.class.name != 'PUIIndexer'
   end
 
+  def rust_pui_document_preparation_enabled?
+    AppConfig.has_key?(:rust_pui_document_preparation_enabled) &&
+      AppConfig[:rust_pui_document_preparation_enabled] &&
+      self.class.name == 'PUIIndexer'
+  end
+
+  def deep_copy_record_candidate(val)
+    case val
+    when Hash
+      val.each_with_object({}) { |(k, v), h| h[k.to_s] = deep_copy_record_candidate(v) }
+    when Array
+      val.map { |v| deep_copy_record_candidate(v) }
+    when String
+      val.dup
+    else
+      val
+    end
+  end
+
   def rust_index_documents(prepared_records)
     return nil unless rust_index_document_builder_enabled?
 
@@ -1576,6 +1595,12 @@ class IndexerCommon
         'record' => prepared[:values],
         'enrich' => rust_index_document_enrichment_enabled?,
       }
+      if rust_pui_document_preparation_enabled? && RecordInheritance.has_type?(prepared[:record_type])
+        candidate = deep_copy_record_candidate(prepared[:values])
+        candidate = RecordInheritance.merge(candidate)
+        input['prepare_pui_final'] = true
+        input['pui_candidate_record'] = candidate
+      end
       if rust_index_document_enrichment_enabled?
         input['dynamic_enum_fields'] = enum_fields
         input['arks_enabled'] = !!AppConfig[:arks_enabled]
@@ -1604,6 +1629,7 @@ class IndexerCommon
 
   def index_records(records, timing = IndexerTiming.new)
     batch = IndexBatch.new
+    @pui_final_projections = {}
 
     records = dedupe_by_uri(records)
 
@@ -1644,6 +1670,17 @@ class IndexerCommon
           rust_cm_docs.each {|child| child.delete_if {|k, _| k.start_with?('_archivalist_')}}
         end
 
+        if doc.has_key?('_archivalist_pui_final')
+          pui_final = doc.delete('_archivalist_pui_final')
+          @pui_final_projections[uri] = pui_final if pui_final
+        end
+        if doc['_archivalist_rust_fields'].is_a?(Array)
+          doc['_archivalist_rust_fields'].delete('pui_final_document_metadata')
+          doc.delete('_archivalist_rust_fields') if doc['_archivalist_rust_fields'].empty?
+        elsif doc['_archivalist_rust_fields'] == ['pui_final_document_metadata']
+          doc.delete('_archivalist_rust_fields')
+        end
+
         @document_prepare_hooks.each do |hook|
           hook.call(doc, record)
         end
@@ -1659,6 +1696,7 @@ class IndexerCommon
 
         next if skip_index_doc?(doc)
 
+        doc.delete_if {|k, _| k.to_s.start_with?('_archivalist_')}
         batch << clean_whitespace(doc)
 
         # Allow a single record to spawn multiple Solr documents if desired
@@ -1670,6 +1708,7 @@ class IndexerCommon
           end
         end
       end
+      @pui_final_projections = nil
     end
 
     index_batch(batch, timing)

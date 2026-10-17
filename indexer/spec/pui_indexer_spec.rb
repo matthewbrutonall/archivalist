@@ -7,8 +7,9 @@ describe "PUI indexer" do
 
     def indexer.prepare_docs(records)
       records.map {|rec|
-        rec_hash = rec.to_hash(:raw)
-        rec_hash['display_string'] = rec_hash['title']
+        rec_hash = rec.respond_to?(:to_hash) ? rec.to_hash(:raw) : rec
+        rec_hash = ASUtils.json_parse(ASUtils.to_json(rec_hash))
+        rec_hash['display_string'] ||= rec_hash['title']
 
         {'record' => rec_hash, 'uri' => rec['uri']}
       }
@@ -123,7 +124,7 @@ describe "PUI indexer" do
   end
 
   describe "final_doc_rules" do
-    it "runs final PUI doc rules and removes ancestor data after all other hooks have run" do
+    def build_sample_records
       res = build(:json_resource,
                  'uri' => '/repositories/2/resources/1',
                  'title' => "Resource",
@@ -147,13 +148,37 @@ describe "PUI indexer" do
                  },
                  'publish' => true,
                  'has_unpublished_ancestor' => false,
-                 'instances' => [],
+                 'instances' => [
+                   {
+                     'sub_container' => {
+                       'top_container' => {
+                         'ref' => '/repositories/2/top_containers/1',
+                         '_resolved' => {
+                           'internal_note' => 'PRIVATE_INTERNAL_NOTE',
+                           'container_profile' => {
+                             '_resolved' => {
+                               'notes' => 'PRIVATE_CONTAINER_PROFILE_NOTE'
+                             }
+                           }
+                         }
+                       }
+                     }
+                   }
+                 ],
                  'ancestors' => [{
                     "ref" => "/repositories/2/resources/1",
                     "_resolved" => res
                   }],
                  'resource' => "/repositories/2/resources/1")
+      [res, ao]
+    end
 
+    def sample_records
+      build_sample_records
+    end
+
+    it "runs final PUI doc rules and removes ancestor data after all other hooks have run" do
+      _res, ao = sample_records
       rec = indexer.prepare_docs([ao]).first
       doc = indexer.start_index(rec)
 
@@ -162,7 +187,424 @@ describe "PUI indexer" do
 
       indexer.run_final_doc_rules(doc, rec)
       expect(rec['record']['ancestors']).to be_nil
+    end
 
+    it "preserves plugin hook ordering and ancestor visibility before final hook with Rust preparation" do
+      _res, ao = sample_records
+      rec = indexer.prepare_docs([ao]).first
+      doc = indexer.start_index(rec)
+
+      AppConfig[:rust_pui_document_preparation_enabled] = true
+
+      # Generate expected clean candidate and projection
+      candidate = RecordInheritance.merge(indexer.deep_copy_record_candidate(rec['record']))
+      clean_candidate = indexer.deep_copy_record_candidate(candidate)
+      clean_candidate.delete('ancestors')
+      clean_candidate['instances'][0]['sub_container']['top_container']['_resolved'].delete('internal_note')
+      clean_candidate['instances'][0]['sub_container']['top_container']['_resolved']['container_profile']['_resolved'].delete('notes')
+
+      projection = {
+        'marker' => 'pui_final_document_metadata',
+        'json' => ASUtils.to_json(clean_candidate),
+        'fullrecord_published' => IndexerCommon.extract_string_values(clean_candidate, :published_only)
+      }
+      indexer.instance_variable_set(:@pui_final_projections, { rec['record']['uri'] => projection })
+
+      ancestors_seen_by_plugin = nil
+      plugin_hook = proc do |_d, r|
+        ancestors_seen_by_plugin = r['record']['ancestors']&.count
+      end
+
+      # In production, plugins register document prepare hooks during indexer initialization
+      # BEFORE final_doc_rules is called at the end of initialize.
+      # To faithfully test hook ordering on an already-initialized indexer without appending
+      # after final, we place the simulated plugin hook immediately before final_doc_rules:
+      hooks = indexer.instance_variable_get(:@document_prepare_hooks)
+      final_hook = hooks.pop
+      hooks << plugin_hook
+      hooks << final_hook
+
+      # Plugin hook runs before final doc rules
+      indexer.run_all_but_final_doc_rules(doc, rec)
+      expect(ancestors_seen_by_plugin).to eq(1)
+      expect(rec['record']['ancestors'].count).to eq(1)
+
+      # Final doc rules runs and safely strips ancestors
+      indexer.run_final_doc_rules(doc, rec)
+      expect(doc.has_key?('ancestors')).to be(false)
+      expect(rec['record']['ancestors']).to be_nil
+      expect(doc['json']).to eq(ASUtils.to_json(clean_candidate))
+      expect(doc['fullrecord_published']).to eq(projection['fullrecord_published'])
+      expect(doc['fullrecord']).to be_nil
+      expect(doc.keys.none? { |k| k.to_s.start_with?('_archivalist_') }).to be(true)
+      expect(indexer.instance_variable_get(:@pui_final_projections)).to eq({})
+    ensure
+      AppConfig[:rust_pui_document_preparation_enabled] = false
+    end
+
+    it "reflects intentional privacy hardening and baseline normalization between native and Rust-prepared outputs" do
+      _res, ao1 = sample_records
+      _res, ao2 = sample_records
+
+      rec_native = indexer.prepare_docs([ao1]).first
+      doc_native = indexer.start_index(rec_native)
+      doc_native['ancestors'] = ['/repositories/2/resources/1']
+      indexer.run_all_but_final_doc_rules(doc_native, rec_native)
+      indexer.run_final_doc_rules(doc_native, rec_native)
+
+      AppConfig[:rust_pui_document_preparation_enabled] = true
+      rec_rust = indexer.prepare_docs([ao2]).first
+      doc_rust = indexer.start_index(rec_rust)
+      doc_rust['ancestors'] = ['/repositories/2/resources/1']
+
+      candidate = RecordInheritance.merge(indexer.deep_copy_record_candidate(rec_rust['record']))
+      clean_candidate = indexer.deep_copy_record_candidate(candidate)
+      clean_candidate.delete('ancestors')
+      clean_candidate['instances'][0]['sub_container']['top_container']['_resolved'].delete('internal_note')
+      clean_candidate['instances'][0]['sub_container']['top_container']['_resolved']['container_profile']['_resolved'].delete('notes')
+
+      projection = {
+        'marker' => 'pui_final_document_metadata',
+        'json' => ASUtils.to_json(clean_candidate),
+        'fullrecord_published' => IndexerCommon.extract_string_values(clean_candidate, :published_only)
+      }
+      indexer.instance_variable_set(:@pui_final_projections, { rec_rust['record']['uri'] => projection })
+
+      indexer.run_all_but_final_doc_rules(doc_rust, rec_rust)
+      indexer.run_final_doc_rules(doc_rust, rec_rust)
+
+      # 1. Native baseline retains root doc['ancestors'] and empty 'ancestors': [] in JSON
+      expect(doc_native['ancestors']).to eq(['/repositories/2/resources/1'])
+      native_parsed = ASUtils.json_parse(doc_native['json'])
+      expect(native_parsed.has_key?('ancestors')).to be(true)
+
+      # 2. Rust candidate hardens privacy: no root doc['ancestors'] and no ancestors key in JSON
+      expect(doc_rust.has_key?('ancestors')).to be(false)
+      rust_parsed = ASUtils.json_parse(doc_rust['json'])
+      expect(rust_parsed.has_key?('ancestors')).to be(false)
+
+      # 3. When native baseline is normalized of documented private fields, structural parity holds
+      native_normalized = native_parsed.dup
+      native_normalized.delete('ancestors')
+      native_normalized['instances'][0]['sub_container']['top_container']['_resolved'].delete('internal_note')
+      native_normalized['instances'][0]['sub_container']['top_container']['_resolved']['container_profile']['_resolved'].delete('notes')
+      expect(rust_parsed).to eq(native_normalized)
+
+      expect(doc_rust['title']).to eq(doc_native['title'])
+      expect(doc_rust['fullrecord_published']).to eq(doc_native['fullrecord_published'])
+      expect(doc_rust['fullrecord']).to be_nil
+      expect(doc_native['fullrecord']).to be_nil
+      expect(rec_rust['record']['ancestors']).to be_nil
+      expect(rec_native['record']['ancestors']).to be_nil
+    ensure
+      AppConfig[:rust_pui_document_preparation_enabled] = false
+    end
+
+    it "exercises IndexerCommon#index_records end-to-end proving plugin hook ordering, ancestor visibility, marker stripping, privacy invariants, and native fallback" do
+      # Enable both the builder gate and the separate PUI preparation gate
+      AppConfig[:rust_index_document_builder_enabled] = true
+      AppConfig[:rust_pui_document_preparation_enabled] = true
+
+      # 1. Trusted projection through IndexerCommon#index_records
+      test_indexer = PUIIndexer.new(AppConfig[:backend_url], nil, 'PUIIndexer')
+      captured_batch = []
+      test_indexer.define_singleton_method(:index_batch) do |batch, _timing = nil, _opts = {}|
+        captured_batch.concat(batch)
+      end
+
+      _res, ao = sample_records
+      rec_hash = ao.respond_to?(:to_hash) ? ao.to_hash(:raw) : ao
+      rec_hash = ASUtils.json_parse(ASUtils.to_json(rec_hash))
+      rec_hash['display_string'] ||= rec_hash['title']
+      record_input = { 'record' => rec_hash, 'uri' => rec_hash['uri'] }
+
+      expected_candidate = RecordInheritance.merge(test_indexer.deep_copy_record_candidate(rec_hash))
+      clean_expected = test_indexer.deep_copy_record_candidate(expected_candidate)
+      clean_expected.delete('ancestors')
+      clean_expected['instances'][0]['sub_container']['top_container']['_resolved'].delete('internal_note')
+      clean_expected['instances'][0]['sub_container']['top_container']['_resolved']['container_profile']['_resolved'].delete('notes')
+      expected_fullrecord_published = IndexerCommon.extract_string_values(clean_expected, :published_only)
+
+      valid_rust_envelope_doc = {
+        'id' => rec_hash['uri'],
+        'uri' => rec_hash['uri'],
+        'title' => rec_hash['title'],
+        'primary_type' => 'archival_object',
+        'types' => ['archival_object'],
+        'json' => ASUtils.to_json(rec_hash),
+        'suppressed' => false,
+        'publish' => true,
+        'system_generated' => 'false',
+        'repository' => test_indexer.get_record_scope(rec_hash['uri']),
+        '_archivalist_rust_fields' => ['pui_final_document_metadata'],
+        '_archivalist_pui_final' => {
+          'marker' => 'pui_final_document_metadata',
+          'json' => ASUtils.to_json(clean_expected),
+          'fullrecord_published' => expected_fullrecord_published
+        }
+      }
+
+      # Stub ONLY the actual Rust batch call/HTTP boundary (perform_request)
+      allow_any_instance_of(RustIndexDocumentBuilder).to receive(:perform_request) do |_builder, _req|
+        Struct.new(:code, :body).new('200', ASUtils.to_json(
+          'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+          'documents' => [valid_rust_envelope_doc]
+        ))
+      end
+
+      plugin_saw_doc_ancestors = nil
+      plugin_saw_record_ancestors = nil
+      plugin_saw_internal_note = nil
+      plugin_saw_profile_note = nil
+      plugin_saw_pui_final = nil
+      plugin_saw_rust_fields = nil
+
+      plugin_hook = proc do |doc, rec|
+        plugin_saw_doc_ancestors = doc['ancestors']&.dup
+        plugin_saw_record_ancestors = rec['record']['ancestors']&.count
+        plugin_saw_internal_note = rec['record'].dig('instances', 0, 'sub_container', 'top_container', '_resolved', 'internal_note')
+        plugin_saw_profile_note = rec['record'].dig('instances', 0, 'sub_container', 'top_container', '_resolved', 'container_profile', '_resolved', 'notes')
+        plugin_saw_pui_final = doc.has_key?('_archivalist_pui_final')
+        plugin_saw_rust_fields = doc.has_key?('_archivalist_rust_fields')
+      end
+
+      # In production ArchivesSpace, plugins register hooks during initialization before final_doc_rules.
+      # To test hook ordering on an already-initialized indexer without appending after final,
+      # place the simulated plugin hook immediately before final_doc_rules:
+      hooks = test_indexer.instance_variable_get(:@document_prepare_hooks)
+      final_hook = hooks.pop
+      hooks << plugin_hook
+      hooks << final_hook
+
+      # Call IndexerCommon#index_records directly
+      test_indexer.index_records([record_input])
+
+      # Prove plugin sees native ancestors and unmutated record data, but no internal handoff markers
+      expect(plugin_saw_doc_ancestors).to eq(['/repositories/2/resources/1'])
+      expect(plugin_saw_record_ancestors).to eq(1)
+      expect(plugin_saw_internal_note).to eq('PRIVATE_INTERNAL_NOTE')
+      expect(plugin_saw_profile_note).to eq('PRIVATE_CONTAINER_PROFILE_NOTE')
+      expect(plugin_saw_pui_final).to be(false)
+      expect(plugin_saw_rust_fields).to be(false)
+
+      # Prove final Solr-bound document has no doc ancestors, no private data in JSON,
+      # no unpublished fullrecord, no _archivalist_* keys, and exact expected fullrecord_published
+      expect(captured_batch.length).to eq(1)
+      final_doc = captured_batch.first
+      expect(final_doc.has_key?('ancestors')).to be(false)
+      expect(final_doc['ancestors']).to be_nil
+
+      final_json = ASUtils.json_parse(final_doc['json'])
+      expect(final_json.has_key?('ancestors')).to be(false)
+      expect(final_json.dig('instances', 0, 'sub_container', 'top_container', '_resolved', 'internal_note')).to be_nil
+      expect(final_json.dig('instances', 0, 'sub_container', 'top_container', '_resolved', 'container_profile', '_resolved', 'notes')).to be_nil
+      expect(final_doc.has_key?('fullrecord')).to be(false)
+      expect(final_doc['fullrecord']).to be_nil
+      expect(final_doc.keys.none? { |k| k.to_s.start_with?('_archivalist_') }).to be(true)
+      expect(final_doc['fullrecord_published']).to eq(expected_fullrecord_published)
+
+      # Prove original record ancestors and internal notes are removed only at final rules
+      expect(record_input['record']['ancestors']).to be_nil
+      expect(record_input['record'].dig('instances', 0, 'sub_container', 'top_container', '_resolved', 'internal_note')).to be_nil
+      expect(record_input['record'].dig('instances', 0, 'sub_container', 'top_container', '_resolved', 'container_profile', '_resolved', 'notes')).to be_nil
+
+      # 2. Parallel untrusted / malformed projection case through index_records
+      fallback_indexer = PUIIndexer.new(AppConfig[:backend_url], nil, 'PUIIndexer')
+      fallback_batch = []
+      fallback_indexer.define_singleton_method(:index_batch) do |batch, _timing = nil, _opts = {}|
+        fallback_batch.concat(batch)
+      end
+
+      _res2, ao2 = sample_records
+      rec_hash2 = ao2.respond_to?(:to_hash) ? ao2.to_hash(:raw) : ao2
+      rec_hash2 = ASUtils.json_parse(ASUtils.to_json(rec_hash2))
+      rec_hash2['display_string'] ||= rec_hash2['title']
+      record_input2 = { 'record' => rec_hash2, 'uri' => rec_hash2['uri'] }
+
+      malicious_envelope_doc = {
+        'id' => rec_hash2['uri'],
+        'uri' => rec_hash2['uri'],
+        'title' => rec_hash2['title'],
+        'primary_type' => 'archival_object',
+        'types' => ['archival_object'],
+        'json' => ASUtils.to_json(rec_hash2),
+        'suppressed' => false,
+        'publish' => true,
+        'system_generated' => 'false',
+        'repository' => fallback_indexer.get_record_scope(rec_hash2['uri']),
+        '_archivalist_rust_fields' => ['pui_final_document_metadata'],
+        '_archivalist_pui_final' => {
+          'marker' => 'pui_final_document_metadata',
+          'json' => ASUtils.to_json({
+            'uri' => rec_hash2['uri'],
+            'jsonmodel_type' => 'archival_object',
+            'title' => 'Malicious AO',
+            'internal_note' => 'MALICIOUS_PRIVATE_DATA_EXFIL'
+          }),
+          'fullrecord_published' => ['MALICIOUS_PRIVATE_DATA_EXFIL']
+        }
+      }
+
+      allow_any_instance_of(RustIndexDocumentBuilder).to receive(:perform_request) do |_builder, _req|
+        Struct.new(:code, :body).new('200', ASUtils.to_json(
+          'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+          'documents' => [malicious_envelope_doc]
+        ))
+      end
+
+      fallback_indexer.index_records([record_input2])
+
+      expect(fallback_batch.length).to eq(1)
+      fallback_doc = fallback_batch.first
+      expect(fallback_doc['json']).not_to include('MALICIOUS_PRIVATE_DATA_EXFIL')
+      expect(fallback_doc['fullrecord_published']).not_to include('MALICIOUS_PRIVATE_DATA_EXFIL')
+      expect(fallback_doc['fullrecord_published']).not_to include('PRIVATE_INTERNAL_NOTE')
+      expect(fallback_doc['fullrecord_published']).not_to include('PRIVATE_CONTAINER_PROFILE_NOTE')
+      expect(fallback_doc['fullrecord']).to be_nil
+      expect(fallback_doc.keys.none? { |k| k.to_s.start_with?('_archivalist_') }).to be(true)
+      expect(fallback_doc['ancestors']).to eq(['/repositories/2/resources/1'])
+      expect(record_input2['record']['ancestors']).to be_nil
+      expect(record_input2['record'].dig('instances', 0, 'sub_container', 'top_container', '_resolved', 'internal_note')).to be_nil
+      expect(record_input2['record'].dig('instances', 0, 'sub_container', 'top_container', '_resolved', 'container_profile', '_resolved', 'notes')).to be_nil
+    ensure
+      AppConfig[:rust_index_document_builder_enabled] = false
+      AppConfig[:rust_pui_document_preparation_enabled] = false
+    end
+
+    it "rejects projection and uses native fallback when candidate or parsed_json URI or type is missing, null, or mismatched" do
+      _res, ao = sample_records
+      rec = indexer.prepare_docs([ao]).first
+      AppConfig[:rust_pui_document_preparation_enabled] = true
+
+      valid_candidate = RecordInheritance.merge(indexer.deep_copy_record_candidate(rec['record']))
+      valid_clean = indexer.deep_copy_record_candidate(valid_candidate)
+      valid_clean.delete('ancestors')
+      valid_clean['instances'][0]['sub_container']['top_container']['_resolved'].delete('internal_note')
+      valid_clean['instances'][0]['sub_container']['top_container']['_resolved']['container_profile']['_resolved'].delete('notes')
+
+      # 1. Missing record uri
+      bad_rec1 = indexer.deep_copy_record_candidate(rec)
+      bad_rec1['record'].delete('uri')
+      doc1 = indexer.start_index(rec)
+      expect(indexer.apply_rust_pui_final_projection(doc1, bad_rec1)).to be(false)
+
+      # 2. Null record uri
+      bad_rec2 = indexer.deep_copy_record_candidate(rec)
+      bad_rec2['record']['uri'] = nil
+      doc2 = indexer.start_index(rec)
+      expect(indexer.apply_rust_pui_final_projection(doc2, bad_rec2)).to be(false)
+
+      # 3. Non-string (int) record uri
+      bad_rec3 = indexer.deep_copy_record_candidate(rec)
+      bad_rec3['record']['uri'] = 123
+      doc3 = indexer.start_index(rec)
+      expect(indexer.apply_rust_pui_final_projection(doc3, bad_rec3)).to be(false)
+
+      # 4. Missing record jsonmodel_type
+      bad_rec4 = indexer.deep_copy_record_candidate(rec)
+      bad_rec4['record'].delete('jsonmodel_type')
+      doc4 = indexer.start_index(rec)
+      expect(indexer.apply_rust_pui_final_projection(doc4, bad_rec4)).to be(false)
+
+      # 5. Mismatched record jsonmodel_type
+      bad_rec5 = indexer.deep_copy_record_candidate(rec)
+      bad_rec5['record']['jsonmodel_type'] = 'resource'
+      doc5 = indexer.start_index(rec)
+      expect(indexer.apply_rust_pui_final_projection(doc5, bad_rec5)).to be(false)
+
+      # 6. Mismatched parsed_json uri
+      bad_clean6 = indexer.deep_copy_record_candidate(valid_clean)
+      bad_clean6['uri'] = '/repositories/2/archival_objects/999'
+      bad_proj6 = {
+        'marker' => 'pui_final_document_metadata',
+        'json' => ASUtils.to_json(bad_clean6),
+        'fullrecord_published' => ['text']
+      }
+      indexer.instance_variable_set(:@pui_final_projections, { rec['record']['uri'] => bad_proj6 })
+      doc6 = indexer.start_index(rec)
+      expect(indexer.apply_rust_pui_final_projection(doc6, rec)).to be(false)
+
+      # 7. Missing parsed_json uri
+      bad_clean7 = indexer.deep_copy_record_candidate(valid_clean)
+      bad_clean7.delete('uri')
+      bad_proj7 = {
+        'marker' => 'pui_final_document_metadata',
+        'json' => ASUtils.to_json(bad_clean7),
+        'fullrecord_published' => ['text']
+      }
+      indexer.instance_variable_set(:@pui_final_projections, { rec['record']['uri'] => bad_proj7 })
+      doc7 = indexer.start_index(rec)
+      expect(indexer.apply_rust_pui_final_projection(doc7, rec)).to be(false)
+
+      # 8. Mismatched parsed_json jsonmodel_type
+      bad_clean8 = indexer.deep_copy_record_candidate(valid_clean)
+      bad_clean8['jsonmodel_type'] = 'resource'
+      bad_proj8 = {
+        'marker' => 'pui_final_document_metadata',
+        'json' => ASUtils.to_json(bad_clean8),
+        'fullrecord_published' => ['text']
+      }
+      indexer.instance_variable_set(:@pui_final_projections, { rec['record']['uri'] => bad_proj8 })
+      doc8 = indexer.start_index(rec)
+      expect(indexer.apply_rust_pui_final_projection(doc8, rec)).to be(false)
+    ensure
+      AppConfig[:rust_pui_document_preparation_enabled] = false
+    end
+
+    it "falls back to native processing and prevents private text from reaching doc when Rust projection is malicious or invalid" do
+      _res, ao = sample_records
+      rec = indexer.prepare_docs([ao]).first
+      doc = indexer.start_index(rec)
+
+      AppConfig[:rust_pui_document_preparation_enabled] = true
+
+      # Malicious projection attempting to leak private internal_note into json and fullrecord
+      malicious_projection = {
+        'marker' => 'pui_final_document_metadata',
+        'json' => ASUtils.to_json({
+          'uri' => rec['record']['uri'],
+          'jsonmodel_type' => 'archival_object',
+          'title' => 'Malicious AO',
+          'internal_note' => 'MALICIOUS_PRIVATE_DATA_EXFIL'
+        }),
+        'fullrecord_published' => ['MALICIOUS_PRIVATE_DATA_EXFIL']
+      }
+      indexer.instance_variable_set(:@pui_final_projections, { rec['record']['uri'] => malicious_projection })
+
+      indexer.run_all_but_final_doc_rules(doc, rec)
+      indexer.run_final_doc_rules(doc, rec)
+
+      # Malicious projection rejected; native fallback executed
+      expect(doc['json']).not_to include('MALICIOUS_PRIVATE_DATA_EXFIL')
+      expect(doc['fullrecord_published']).not_to include('MALICIOUS_PRIVATE_DATA_EXFIL')
+      expect(doc['fullrecord_published']).not_to include('PRIVATE_INTERNAL_NOTE')
+      expect(doc['fullrecord_published']).not_to include('PRIVATE_CONTAINER_PROFILE_NOTE')
+      expect(doc['fullrecord']).to be_nil
+      expect(rec['record']['ancestors']).to be_nil
+    ensure
+      AppConfig[:rust_pui_document_preparation_enabled] = false
+    end
+
+    it "ignores projection and runs native fallback when feature flag is disabled" do
+      _res, ao = sample_records
+      rec = indexer.prepare_docs([ao]).first
+      doc = indexer.start_index(rec)
+
+      AppConfig[:rust_pui_document_preparation_enabled] = false
+
+      bogus_projection = {
+        'marker' => 'pui_final_document_metadata',
+        'json' => '{"bogus": true}',
+        'fullrecord_published' => ['bogus']
+      }
+      indexer.instance_variable_set(:@pui_final_projections, { rec['record']['uri'] => bogus_projection })
+
+      indexer.run_all_but_final_doc_rules(doc, rec)
+      indexer.run_final_doc_rules(doc, rec)
+
+      expect(doc['json']).not_to eq('{"bogus": true}')
+      expect(doc['fullrecord_published']).not_to eq(['bogus'])
+      expect(rec['record']['ancestors']).to be_nil
     end
   end
 end

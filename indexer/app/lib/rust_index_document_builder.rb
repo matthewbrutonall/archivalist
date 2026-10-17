@@ -64,7 +64,9 @@ class RustIndexDocumentBuilder
       record = input['record']
       agent_types = ['agent_person', 'agent_family', 'agent_software', 'agent_corporate_entity']
       raise "response id mismatch for #{uri}" unless document['id'] == uri
-      expected_title = if ['archival_object', 'accession'].include?(record_type)
+      expected_title = if input['prepare_pui_final']
+                         record['title']
+                       elsif ['archival_object', 'accession'].include?(record_type)
                          record['display_string']
                        elsif record_type == 'digital_object_component'
                          record['display_string']
@@ -363,8 +365,14 @@ class RustIndexDocumentBuilder
         end
         missing = required.uniq.reject {|field| document.has_key?(field)}
         raise "response enrichment fields missing for #{uri}: #{missing.join(', ')}" unless missing.empty?
+      elsif input['prepare_pui_final']
+        validate_pui_final_projection!(document, input)
       elsif document.has_key?('_archivalist_rust_fields')
         raise "unexpected response enrichment marker for #{uri}"
+      end
+
+      if !input['prepare_pui_final'] && document.has_key?('_archivalist_pui_final')
+        raise "unexpected response pui final projection marker for #{uri}"
       end
 
       cm = record.is_a?(Hash) && record['collection_management']
@@ -699,6 +707,164 @@ class RustIndexDocumentBuilder
       result[key] = expected[key].to_a.flatten
     end
     result
+  end
+
+  def validate_pui_final_projection!(document, input)
+    uri = input['uri']
+    unless document['_archivalist_rust_fields'] == ['pui_final_document_metadata']
+      raise "response pui final marker mismatch for #{uri}"
+    end
+    unless document.has_key?('_archivalist_pui_final') && document['_archivalist_pui_final'].is_a?(Hash)
+      raise "missing _archivalist_pui_final for #{uri}"
+    end
+    pui_final = document['_archivalist_pui_final']
+    unless pui_final['marker'] == 'pui_final_document_metadata'
+      raise "pui final payload marker mismatch for #{uri}"
+    end
+    unless pui_final['json'].is_a?(String)
+      raise "pui final json must be a String for #{uri}"
+    end
+    unless pui_final['fullrecord_published'].is_a?(Array)
+      raise "pui final fullrecord_published must be an Array for #{uri}"
+    end
+    if document.has_key?('fullrecord')
+      raise "unexpected unpublished fullrecord field in pui final document for #{uri}"
+    end
+
+    candidate = input['pui_candidate_record']
+    raise "missing pui_candidate_record for #{uri}" unless candidate.is_a?(Hash)
+    cand_uri = candidate['uri']
+    unless cand_uri.is_a?(String) && !cand_uri.empty?
+      raise "pui_candidate_record.uri must be a non-empty string for #{uri}"
+    end
+    unless cand_uri == input['uri']
+      raise "pui_candidate_record uri mismatch for #{uri}: expected #{input['uri']}, got #{cand_uri}"
+    end
+    cand_type = candidate['jsonmodel_type']
+    unless cand_type.is_a?(String) && !cand_type.empty?
+      raise "pui_candidate_record.jsonmodel_type must be a non-empty string for #{uri}"
+    end
+    unless cand_type == input['record_type']
+      raise "pui_candidate_record jsonmodel_type mismatch for #{uri}: expected #{input['record_type']}, got #{cand_type}"
+    end
+
+    parsed_json = ASUtils.json_parse(pui_final['json'])
+    raise "pui final json must parse to a Hash for #{uri}" unless parsed_json.is_a?(Hash)
+    parsed_uri = parsed_json['uri']
+    unless parsed_uri.is_a?(String) && !parsed_uri.empty?
+      raise "pui final json uri must be a non-empty string for #{uri}"
+    end
+    unless parsed_uri == input['uri']
+      raise "pui final json uri mismatch for #{uri}: expected #{input['uri']}, got #{parsed_uri}"
+    end
+    parsed_type = parsed_json['jsonmodel_type']
+    unless parsed_type.is_a?(String) && !parsed_type.empty?
+      raise "pui final json jsonmodel_type must be a non-empty string for #{uri}"
+    end
+    unless parsed_type == input['record_type']
+      raise "pui final json jsonmodel_type mismatch for #{uri}: expected #{input['record_type']}, got #{parsed_type}"
+    end
+
+    if parsed_json.has_key?('ancestors')
+      raise "pui final json must not contain ancestors for #{uri}"
+    end
+    if parsed_json['instances'].is_a?(Array)
+      parsed_json['instances'].each do |instance|
+        next unless instance.is_a?(Hash)
+        sub_container = instance['sub_container']
+        if sub_container.is_a?(Hash) && sub_container['top_container'].is_a?(Hash)
+          resolved_tc = sub_container['top_container']['_resolved']
+          if resolved_tc.is_a?(Hash)
+            if resolved_tc.has_key?('internal_note')
+              raise "pui final json contains top_container internal_note for #{uri}"
+            end
+            resolved_cp = resolved_tc.dig('container_profile', '_resolved')
+            if resolved_cp.is_a?(Hash) && resolved_cp.has_key?('notes')
+              raise "pui final json contains container_profile notes for #{uri}"
+            end
+          end
+        end
+      end
+    end
+
+    expected_clean = reconstruct_expected_pui_final_json(candidate)
+    validate_json_equal!(expected_clean, parsed_json, "pui final json for #{uri}")
+
+    expected_json_string = ASUtils.to_json(expected_clean)
+    unless pui_final['json'] == expected_json_string
+      raise "pui final json serialization mismatch for #{uri}"
+    end
+
+    expected_fullrecord = extract_published_strings(expected_clean)
+    unless pui_final['fullrecord_published'] == expected_fullrecord
+      raise "pui final fullrecord_published mismatch for #{uri}"
+    end
+  end
+
+  def reconstruct_expected_pui_final_json(candidate)
+    expected = deep_copy_json_value(candidate)
+    expected.delete('ancestors')
+    if expected['instances'].is_a?(Array)
+      expected['instances'].each do |instance|
+        next unless instance.is_a?(Hash)
+        sub_container = instance['sub_container']
+        if sub_container.is_a?(Hash) && sub_container['top_container'].is_a?(Hash)
+          top_container = sub_container['top_container']
+          if top_container['_resolved'].is_a?(Hash)
+            top_container['_resolved'].delete('internal_note')
+            if top_container['_resolved']['container_profile'].is_a?(Hash) &&
+               top_container['_resolved']['container_profile']['_resolved'].is_a?(Hash)
+              top_container['_resolved']['container_profile']['_resolved'].delete('notes')
+            end
+          end
+        end
+      end
+    end
+    expected
+  end
+
+  def extract_published_strings(doc)
+    if defined?(IndexerCommon) && IndexerCommon.respond_to?(:extract_string_values)
+      IndexerCommon.extract_string_values(doc, :published_only)
+    else
+      extract_string_values_published_only(doc)
+    end
+  end
+
+  def extract_string_values_published_only(doc)
+    return [doc] if doc.is_a?(String)
+    published_queue = doc.is_a?(Array) ? doc.flatten : [doc]
+    published_strings = []
+
+    while !published_queue.empty?
+      curr = published_queue.pop
+
+      if curr.is_a?(Hash) && curr.has_key?('publish') && !curr['publish']
+        next
+      end
+
+      if curr.is_a?(Hash)
+        curr.each do |key, val|
+          if IndexerCommonConfig.fullrecord_excludes.include?(key.to_s) || key.to_s =~ /_enum_s$/
+            next
+          elsif val.is_a?(String)
+            published_strings.push(val)
+          elsif val.is_a?(Hash)
+            published_queue.push(val)
+          elsif val.is_a?(Array)
+            val.flatten.each do |v|
+              if v.is_a?(String)
+                published_strings.push(v)
+              elsif v.is_a?(Hash)
+                published_queue.push(v)
+              end
+            end
+          end
+        end
+      end
+    end
+
+    published_strings
   end
 
   def perform_request(request)
