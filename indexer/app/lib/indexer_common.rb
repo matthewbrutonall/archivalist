@@ -1563,6 +1563,12 @@ class IndexerCommon
       self.class.name == 'PUIIndexer'
   end
 
+  def rust_pui_availability_preparation_enabled?
+    AppConfig.has_key?(:rust_pui_availability_preparation_enabled) &&
+      AppConfig[:rust_pui_availability_preparation_enabled] &&
+      self.class.name != 'PUIIndexer'
+  end
+
   def deep_copy_record_candidate(val)
     case val
     when Hash
@@ -1601,6 +1607,10 @@ class IndexerCommon
         input['prepare_pui_final'] = true
         input['pui_candidate_record'] = candidate
       end
+      if rust_pui_availability_preparation_enabled?
+        input['prepare_pui_availability'] = true
+        input['record_inheritance_has_type'] = RecordInheritance.has_type?(prepared[:record_type])
+      end
       if rust_index_document_enrichment_enabled?
         input['dynamic_enum_fields'] = enum_fields
         input['arks_enabled'] = !!AppConfig[:arks_enabled]
@@ -1632,6 +1642,7 @@ class IndexerCommon
     @pui_final_projections = {}
     @pui_routing_projections = {}
     @pui_notes_projections = {}
+    @pui_availability_projections = {}
 
     records = dedupe_by_uri(records)
 
@@ -1684,12 +1695,17 @@ class IndexerCommon
           pui_notes = doc.delete('_archivalist_pui_notes')
           @pui_notes_projections[uri] = pui_notes if pui_notes
         end
+        if doc.has_key?('_archivalist_pui_availability')
+          pui_availability = doc.delete('_archivalist_pui_availability')
+          @pui_availability_projections[uri] = pui_availability if pui_availability
+        end
         if doc['_archivalist_rust_fields'].is_a?(Array)
           doc['_archivalist_rust_fields'].delete('pui_final_document_metadata')
           doc['_archivalist_rust_fields'].delete('pui_routing_metadata')
           doc['_archivalist_rust_fields'].delete('pui_notes_metadata')
+          doc['_archivalist_rust_fields'].delete('pui_availability_metadata')
           doc.delete('_archivalist_rust_fields') if doc['_archivalist_rust_fields'].empty?
-        elsif doc['_archivalist_rust_fields'] == ['pui_final_document_metadata']
+        elsif doc['_archivalist_rust_fields'] == ['pui_final_document_metadata'] || doc['_archivalist_rust_fields'] == ['pui_availability_metadata']
           doc.delete('_archivalist_rust_fields')
         end
 
@@ -1723,6 +1739,7 @@ class IndexerCommon
       @pui_final_projections = nil
       @pui_routing_projections = nil
       @pui_notes_projections = nil
+      @pui_availability_projections = nil
     end
 
     index_batch(batch, timing)
@@ -1807,7 +1824,118 @@ class IndexerCommon
     false
   end
 
+  def discard_pui_availability(*uris)
+    if @pui_availability_projections
+      uris.flatten.compact.each do |uri|
+        @pui_availability_projections.delete(uri) if uri.is_a?(String)
+      end
+    end
+    false
+  end
+
+  def apply_rust_pui_availability_plan(doc, record)
+    doc_uri = doc.is_a?(Hash) ? doc['uri'] : nil
+    top_uri = record.is_a?(Hash) ? record['uri'] : nil
+    inner_uri = (record.is_a?(Hash) && record['record'].is_a?(Hash)) ? record['record']['uri'] : nil
+    candidate_uris = [doc_uri, top_uri, inner_uri].compact
+
+    # 1. Structural preconditions: record, record['record'], and doc must be Hashes
+    unless doc.is_a?(Hash) && record.is_a?(Hash) && record['record'].is_a?(Hash)
+      return discard_pui_availability(candidate_uris)
+    end
+    record_obj = record['record']
+
+    # 2. Strict exact URI agreement across record['record']['uri'], top-level record['uri'], and doc['uri']
+    # No fallback between identity sources; all must be present non-empty strings and equal
+    unless inner_uri.is_a?(String) && !inner_uri.strip.empty? &&
+           top_uri.is_a?(String) && !top_uri.strip.empty? &&
+           doc_uri.is_a?(String) && !doc_uri.strip.empty? &&
+           inner_uri == top_uri && top_uri == doc_uri
+      return discard_pui_availability(candidate_uris)
+    end
+    uri = doc_uri
+
+    # 3. doc['types'] must be an Array
+    return discard_pui_availability(uri) unless doc['types'].is_a?(Array)
+
+    # 4. Strict exact type agreement across record['record']['jsonmodel_type'] and doc['primary_type']
+    rec_type = record_obj['jsonmodel_type']
+    primary_type = doc['primary_type']
+    unless rec_type.is_a?(String) && !rec_type.strip.empty? &&
+           primary_type.is_a?(String) && !primary_type.strip.empty? &&
+           rec_type == primary_type
+      return discard_pui_availability(uri)
+    end
+
+    # 5. Plan projection presence in batch map
+    return false unless @pui_availability_projections && @pui_availability_projections.key?(uri)
+    projection = @pui_availability_projections[uri]
+    return discard_pui_availability(uri) unless projection.is_a?(Hash)
+
+    # 6. Exact key set validation: reject missing or extra keys, including non-string keys
+    return discard_pui_availability(uri) if projection.keys.any? { |k| !k.is_a?(String) }
+    missing_keys = RustIndexDocumentBuilder::PUI_AVAILABILITY_FIELDS - projection.keys
+    return discard_pui_availability(uri) unless missing_keys.empty?
+    extra_keys = projection.keys - RustIndexDocumentBuilder::PUI_AVAILABILITY_FIELDS
+    return discard_pui_availability(uri) unless extra_keys.empty?
+
+    # 7. Capability marker & structure validation
+    return discard_pui_availability(uri) unless projection['marker'] == 'pui_availability_metadata'
+
+    # 8. URI and type checks against projection
+    return discard_pui_availability(uri) unless projection['uri'] == uri
+    return discard_pui_availability(uri) unless projection['primary_type'] == primary_type
+
+    # 9. RecordInheritance check
+    expected_inheritance = RecordInheritance.has_type?(primary_type)
+    return discard_pui_availability(uri) unless projection['record_inheritance_has_type'] == expected_inheritance
+
+    # 10. Conditional additions check
+    expected_additions = RustIndexDocumentBuilder.compute_pui_conditional_additions(primary_type, expected_inheritance)
+    return discard_pui_availability(uri) unless projection['conditional_additions'] == expected_additions
+
+    # 11. Top container override check
+    if primary_type == 'top_container'
+      tc_override = projection['top_container_override']
+      return discard_pui_availability(uri) unless tc_override.is_a?(Hash)
+      return discard_pui_availability(uri) if tc_override.keys.any? { |k| !k.is_a?(String) }
+      missing_tc = RustIndexDocumentBuilder::TOP_CONTAINER_OVERRIDE_FIELDS - tc_override.keys
+      return discard_pui_availability(uri) unless missing_tc.empty?
+      extra_tc = tc_override.keys - RustIndexDocumentBuilder::TOP_CONTAINER_OVERRIDE_FIELDS
+      return discard_pui_availability(uri) unless extra_tc.empty?
+
+      expected_linked = record_obj['is_linked_to_published_record']
+      return discard_pui_availability(uri) unless tc_override['publish'] == expected_linked
+      return discard_pui_availability(uri) unless tc_override['additions'] == ['pui_container', 'pui']
+    else
+      return discard_pui_availability(uri) unless projection['top_container_override'].nil?
+    end
+
+    # All validations passed! Apply plan without mutating until this exact point:
+    if doc['publish']
+      doc['types'].concat(projection['conditional_additions'])
+    end
+
+    if primary_type == 'top_container'
+      doc['publish'] = projection['top_container_override']['publish']
+      if doc['publish']
+        doc['types'].concat(projection['top_container_override']['additions'])
+      end
+    end
+
+    @pui_availability_projections.delete(uri)
+    true
+  rescue StandardError => e
+    Log.warn("PUI availability plan application failed for #{uri || doc_uri}: #{e.class}: #{e.message}; falling back to native")
+    discard_pui_availability(candidate_uris)
+    false
+  end
+
   def apply_pui_fields(doc, record)
+    if rust_pui_availability_preparation_enabled? && apply_rust_pui_availability_plan(doc, record)
+      return
+    end
+
     # only add pui types if the record is published
     if doc['publish']
       object_record_types = ['accession', 'digital_object', 'digital_object_component']

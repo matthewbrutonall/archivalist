@@ -45,6 +45,43 @@ class RustIndexDocumentBuilder
     'notes_published',
   ].freeze
 
+  PUI_AVAILABILITY_FIELDS = [
+    'marker',
+    'uri',
+    'primary_type',
+    'record_inheritance_has_type',
+    'conditional_additions',
+    'top_container_override',
+  ].freeze
+
+  TOP_CONTAINER_OVERRIDE_FIELDS = [
+    'publish',
+    'additions',
+  ].freeze
+
+  def self.compute_pui_conditional_additions(primary_type, record_inheritance_has_type)
+    additions = []
+    if ['accession', 'digital_object', 'digital_object_component'].include?(primary_type)
+      additions << 'pui_record'
+    end
+    if ['agent_person', 'agent_corporate_entity'].include?(primary_type)
+      additions << 'pui_agent'
+    end
+    unless record_inheritance_has_type
+      if ['resource'].include?(primary_type)
+        additions << 'pui_collection'
+      elsif ['classification'].include?(primary_type)
+        additions << 'pui_record_group'
+      elsif ['agent_person'].include?(primary_type)
+        additions << 'pui_person'
+      else
+        additions << 'pui_' + primary_type.to_s
+      end
+      additions << 'pui'
+    end
+    additions
+  end
+
   def initialize(base_url, timeout_seconds)
     @url = URI.parse("#{base_url.to_s.chomp('/')}/index/documents")
     @timeout_seconds = timeout_seconds.to_f
@@ -52,6 +89,37 @@ class RustIndexDocumentBuilder
 
   def build(inputs)
     return {} if inputs.empty?
+
+    inputs.each do |input|
+      uri = input['uri']
+      record = input['record']
+      record_type = input['record_type']
+
+      if input['prepare_pui_final'] && input['prepare_pui_availability']
+        raise "cannot combine prepare_pui_final and prepare_pui_availability in same input for #{uri}"
+      end
+
+      if input['prepare_pui_availability']
+        unless record.is_a?(Hash)
+          raise "record must be a Hash for #{uri}"
+        end
+        unless record.has_key?('uri') && record['uri'].is_a?(String) && !record['uri'].strip.empty?
+          raise "record.uri must be a non-empty string for #{uri}"
+        end
+        unless record['uri'] == uri
+          raise "record uri mismatch for #{uri}"
+        end
+        unless record.has_key?('jsonmodel_type') && record['jsonmodel_type'].is_a?(String) && !record['jsonmodel_type'].strip.empty?
+          raise "record.jsonmodel_type must be a non-empty string for #{uri}"
+        end
+        unless record['jsonmodel_type'] == record_type
+          raise "record jsonmodel_type mismatch for #{uri}"
+        end
+        unless input.has_key?('record_inheritance_has_type') && (input['record_inheritance_has_type'] == true || input['record_inheritance_has_type'] == false)
+          raise "record_inheritance_has_type must be explicitly boolean for #{uri}"
+        end
+      end
+    end
 
     request = Net::HTTP::Post.new(@url.request_uri)
     request['Content-Type'] = 'application/json'
@@ -74,6 +142,29 @@ class RustIndexDocumentBuilder
       input = expected[uri]
       record_type = input['record_type']
       record = input['record']
+      if input['prepare_pui_final'] && input['prepare_pui_availability']
+        raise "cannot combine prepare_pui_final and prepare_pui_availability in same input for #{uri}"
+      end
+      if input['prepare_pui_availability']
+        unless record.is_a?(Hash)
+          raise "record must be a Hash for #{uri}"
+        end
+        unless record.has_key?('uri') && record['uri'].is_a?(String) && !record['uri'].strip.empty?
+          raise "record.uri must be a non-empty string for #{uri}"
+        end
+        unless record['uri'] == uri
+          raise "record uri mismatch for #{uri}"
+        end
+        unless record.has_key?('jsonmodel_type') && record['jsonmodel_type'].is_a?(String) && !record['jsonmodel_type'].strip.empty?
+          raise "record.jsonmodel_type must be a non-empty string for #{uri}"
+        end
+        unless record['jsonmodel_type'] == record_type
+          raise "record jsonmodel_type mismatch for #{uri}"
+        end
+        unless input.has_key?('record_inheritance_has_type') && (input['record_inheritance_has_type'] == true || input['record_inheritance_has_type'] == false)
+          raise "record_inheritance_has_type must be explicitly boolean for #{uri}"
+        end
+      end
       agent_types = ['agent_person', 'agent_family', 'agent_software', 'agent_corporate_entity']
       raise "response id mismatch for #{uri}" unless document['id'] == uri
       expected_title = if input['prepare_pui_final']
@@ -136,11 +227,15 @@ class RustIndexDocumentBuilder
           expected_fields << 'job_metadata'
         end
         expected_fields << 'dynamic_enum_and_ark_metadata'
+        if input['prepare_pui_availability']
+          expected_fields << 'pui_availability_metadata'
+        end
         unless document['_archivalist_rust_fields'] == expected_fields
           raise "response enrichment marker mismatch for #{uri}"
         end
         validate_dynamic_enum_and_ark_projection!(document, input)
         validate_accession_date_projection!(document, input) if record_type == 'accession'
+        validate_pui_availability_projection!(document, input) if input['prepare_pui_availability']
         required = ['fullrecord_published', 'fullrecord']
         required.concat(['subjects', 'subject_uris']) if record.has_key?('subjects')
         if record.has_key?('linked_agents')
@@ -381,6 +476,12 @@ class RustIndexDocumentBuilder
         validate_pui_final_projection!(document, input)
         validate_pui_routing_projection!(document, input)
         validate_pui_notes_projection!(document, input)
+      elsif input['prepare_pui_availability']
+        expected_fields = ['pui_availability_metadata']
+        unless document['_archivalist_rust_fields'] == expected_fields
+          raise "response enrichment marker mismatch for #{uri}"
+        end
+        validate_pui_availability_projection!(document, input)
       elsif document.has_key?('_archivalist_rust_fields')
         raise "unexpected response enrichment marker for #{uri}"
       end
@@ -389,6 +490,10 @@ class RustIndexDocumentBuilder
                                          document.has_key?('_archivalist_pui_routing') ||
                                          document.has_key?('_archivalist_pui_notes'))
         raise "unexpected response pui projection marker for #{uri}"
+      end
+
+      if !input['prepare_pui_availability'] && document.has_key?('_archivalist_pui_availability')
+        raise "unexpected response pui availability projection marker for #{uri}"
       end
 
       cm = record.is_a?(Hash) && record['collection_management']
@@ -900,6 +1005,80 @@ class RustIndexDocumentBuilder
       expected_notes = extract_published_strings(raw_notes)
       unless notes_proj['notes_published'] == expected_notes
         raise "pui notes_published mismatch for #{uri}: expected #{expected_notes.inspect}, got #{notes_proj['notes_published'].inspect}"
+      end
+    end
+  end
+
+  def validate_pui_availability_projection!(document, input)
+    uri = input['uri']
+    unless document.has_key?('_archivalist_pui_availability') && document['_archivalist_pui_availability'].is_a?(Hash)
+      raise "missing _archivalist_pui_availability for #{uri}"
+    end
+    proj = document['_archivalist_pui_availability']
+    if proj.keys.any? { |k| !k.is_a?(String) }
+      raise "pui availability contains non-string keys for #{uri}: #{proj.keys.inspect}"
+    end
+    missing_keys = PUI_AVAILABILITY_FIELDS - proj.keys
+    unless missing_keys.empty?
+      raise "pui availability missing required fields for #{uri}: #{missing_keys.sort.join(', ')}"
+    end
+    extra_keys = proj.keys - PUI_AVAILABILITY_FIELDS
+    unless extra_keys.empty?
+      raise "pui availability contains unexpected fields for #{uri}: #{extra_keys.sort.join(', ')}"
+    end
+    unless proj['marker'] == 'pui_availability_metadata'
+      raise "pui availability marker mismatch for #{uri}"
+    end
+    unless proj['uri'] == uri
+      raise "pui availability uri mismatch for #{uri}: expected #{uri}, got #{proj['uri']}"
+    end
+    record_type = input['record_type']
+    unless proj['primary_type'] == record_type
+      raise "pui availability primary_type mismatch for #{uri}: expected #{record_type}, got #{proj['primary_type']}"
+    end
+    unless input.has_key?('record_inheritance_has_type') && (input['record_inheritance_has_type'] == true || input['record_inheritance_has_type'] == false)
+      raise "record_inheritance_has_type must be explicitly boolean for #{uri}"
+    end
+    expected_inheritance = input['record_inheritance_has_type']
+    unless proj['record_inheritance_has_type'] == expected_inheritance
+      raise "pui availability record_inheritance_has_type mismatch for #{uri}: expected #{expected_inheritance}, got #{proj['record_inheritance_has_type']}"
+    end
+
+    expected_additions = self.class.compute_pui_conditional_additions(record_type, expected_inheritance)
+    unless proj['conditional_additions'] == expected_additions
+      raise "pui availability conditional_additions mismatch for #{uri}: expected #{expected_additions.inspect}, got #{proj['conditional_additions'].inspect}"
+    end
+
+    record = input['record']
+    unless record.is_a?(Hash)
+      raise "record must be a Hash for #{uri}"
+    end
+    if record_type == 'top_container'
+      tc_override = proj['top_container_override']
+      unless tc_override.is_a?(Hash)
+        raise "pui availability top_container_override must be a hash for #{uri}"
+      end
+      if tc_override.keys.any? { |k| !k.is_a?(String) }
+        raise "pui availability top_container_override contains non-string keys for #{uri}: #{tc_override.keys.inspect}"
+      end
+      missing_tc = TOP_CONTAINER_OVERRIDE_FIELDS - tc_override.keys
+      unless missing_tc.empty?
+        raise "pui availability top_container_override missing required fields for #{uri}: #{missing_tc.sort.join(', ')}"
+      end
+      extra_tc = tc_override.keys - TOP_CONTAINER_OVERRIDE_FIELDS
+      unless extra_tc.empty?
+        raise "pui availability top_container_override contains unexpected fields for #{uri}: #{extra_tc.sort.join(', ')}"
+      end
+      expected_publish = record['is_linked_to_published_record']
+      unless tc_override['publish'] == expected_publish
+        raise "pui availability top_container_override publish mismatch for #{uri}: expected #{expected_publish.inspect}, got #{tc_override['publish'].inspect}"
+      end
+      unless tc_override['additions'] == ['pui_container', 'pui']
+        raise "pui availability top_container_override additions mismatch for #{uri}: expected ['pui_container', 'pui'], got #{tc_override['additions'].inspect}"
+      end
+    else
+      unless proj['top_container_override'].nil?
+        raise "pui availability top_container_override must be nil for non-top_container #{uri}"
       end
     end
   end

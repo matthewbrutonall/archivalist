@@ -992,3 +992,4 @@ AppConfig[:rust_index_document_builder_timeout_seconds] = 2
 AppConfig[:rust_index_document_builder_max_batch] = 1000
 AppConfig[:rust_index_document_enrichment_enabled] = false
 AppConfig[:rust_pui_document_preparation_enabled] = false
+AppConfig[:rust_pui_availability_preparation_enabled] = false

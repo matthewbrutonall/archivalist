@@ -9,6 +9,8 @@ pub const PUI_ROUTING_METADATA_MARKER: &str = "pui_routing_metadata";
 pub const PUI_ROUTING_DOCUMENTS_KEY: &str = "_archivalist_pui_routing";
 pub const PUI_NOTES_METADATA_MARKER: &str = "pui_notes_metadata";
 pub const PUI_NOTES_DOCUMENTS_KEY: &str = "_archivalist_pui_notes";
+pub const PUI_AVAILABILITY_METADATA_MARKER: &str = "pui_availability_metadata";
+pub const PUI_AVAILABILITY_DOCUMENTS_KEY: &str = "_archivalist_pui_availability";
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Clone)]
 pub struct IndexDocumentInput {
@@ -30,6 +32,10 @@ pub struct IndexDocumentInput {
     pub prepare_pui_final: bool,
     #[serde(default)]
     pub pui_candidate_record: Option<Value>,
+    #[serde(default)]
+    pub prepare_pui_availability: bool,
+    #[serde(default)]
+    pub record_inheritance_has_type: Option<bool>,
 }
 
 impl Default for IndexDocumentInput {
@@ -46,6 +52,8 @@ impl Default for IndexDocumentInput {
             parsed_accession_date_year: None,
             prepare_pui_final: false,
             pui_candidate_record: None,
+            prepare_pui_availability: false,
+            record_inheritance_has_type: None,
         }
     }
 }
@@ -2963,6 +2971,142 @@ fn add_pui_final_fields(
     Ok(())
 }
 
+pub fn compute_pui_conditional_additions(
+    record_type: &str,
+    record_inheritance_has_type: bool,
+) -> Vec<String> {
+    let mut additions = Vec::new();
+    if matches!(
+        record_type,
+        "accession" | "digital_object" | "digital_object_component"
+    ) {
+        additions.push("pui_record".to_string());
+    }
+    if matches!(record_type, "agent_person" | "agent_corporate_entity") {
+        additions.push("pui_agent".to_string());
+    }
+    if !record_inheritance_has_type {
+        match record_type {
+            "resource" => additions.push("pui_collection".to_string()),
+            "classification" => additions.push("pui_record_group".to_string()),
+            "agent_person" => additions.push("pui_person".to_string()),
+            other => additions.push(format!("pui_{other}")),
+        }
+        additions.push("pui".to_string());
+    }
+    additions
+}
+
+fn add_pui_availability_fields(
+    document: &mut Map<String, Value>,
+    input: &IndexDocumentInput,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let uri_val = record
+        .get("uri")
+        .ok_or_else(|| error("record.uri is required when prepare_pui_availability is true"))?;
+    let rec_uri = uri_val
+        .as_str()
+        .ok_or_else(|| error("record.uri must be a non-empty string"))?;
+    if rec_uri.trim().is_empty() {
+        return Err(error("record.uri must not be empty"));
+    }
+    if rec_uri != input.uri {
+        return Err(error(format!(
+            "record uri '{rec_uri}' does not match wrapper uri '{}'",
+            input.uri
+        )));
+    }
+
+    let type_val = record.get("jsonmodel_type").ok_or_else(|| {
+        error("record.jsonmodel_type is required when prepare_pui_availability is true")
+    })?;
+    let rec_type = type_val
+        .as_str()
+        .ok_or_else(|| error("record.jsonmodel_type must be a non-empty string"))?;
+    if rec_type.trim().is_empty() {
+        return Err(error("record.jsonmodel_type must not be empty"));
+    }
+    if rec_type != input.record_type {
+        return Err(error(format!(
+            "record jsonmodel_type '{rec_type}' does not match wrapper record_type '{}'",
+            input.record_type
+        )));
+    }
+
+    let record_inheritance_has_type = input
+        .record_inheritance_has_type
+        .ok_or_else(|| error("record_inheritance_has_type must be explicitly present and boolean when prepare_pui_availability is true"))?;
+
+    let conditional_additions =
+        compute_pui_conditional_additions(&input.record_type, record_inheritance_has_type);
+
+    let top_container_override = if input.record_type == "top_container" {
+        let mut tc_map = Map::new();
+        let linked_publish = record
+            .get("is_linked_to_published_record")
+            .cloned()
+            .unwrap_or(Value::Null);
+        tc_map.insert("publish".to_string(), linked_publish);
+        tc_map.insert(
+            "additions".to_string(),
+            Value::Array(vec![
+                Value::String("pui_container".to_string()),
+                Value::String("pui".to_string()),
+            ]),
+        );
+        Value::Object(tc_map)
+    } else {
+        Value::Null
+    };
+
+    let mut plan = Map::new();
+    plan.insert(
+        "marker".to_string(),
+        Value::String(PUI_AVAILABILITY_METADATA_MARKER.to_string()),
+    );
+    plan.insert("uri".to_string(), Value::String(input.uri.clone()));
+    plan.insert(
+        "primary_type".to_string(),
+        Value::String(input.record_type.clone()),
+    );
+    plan.insert(
+        "record_inheritance_has_type".to_string(),
+        Value::Bool(record_inheritance_has_type),
+    );
+    plan.insert(
+        "conditional_additions".to_string(),
+        Value::Array(
+            conditional_additions
+                .into_iter()
+                .map(Value::String)
+                .collect(),
+        ),
+    );
+    plan.insert("top_container_override".to_string(), top_container_override);
+
+    document.insert(
+        PUI_AVAILABILITY_DOCUMENTS_KEY.to_string(),
+        Value::Object(plan),
+    );
+
+    match document.get_mut("_archivalist_rust_fields") {
+        Some(Value::Array(fields)) => {
+            fields.push(Value::String(PUI_AVAILABILITY_METADATA_MARKER.to_string()));
+        }
+        _ => {
+            document.insert(
+                "_archivalist_rust_fields".to_string(),
+                Value::Array(vec![Value::String(
+                    PUI_AVAILABILITY_METADATA_MARKER.to_string(),
+                )]),
+            );
+        }
+    }
+
+    Ok(())
+}
+
 pub fn build_index_document(input: IndexDocumentInput) -> Result<Value, IndexDocumentError> {
     if input.uri.trim().is_empty() {
         return Err(error("uri must not be empty"));
@@ -2975,12 +3119,54 @@ pub fn build_index_document(input: IndexDocumentInput) -> Result<Value, IndexDoc
             "cannot combine enrich (staff) and prepare_pui_final (pui) in same record",
         ));
     }
+    if input.prepare_pui_final && input.prepare_pui_availability {
+        return Err(error(
+            "cannot combine prepare_pui_final (pui) and prepare_pui_availability in same record",
+        ));
+    }
 
     let record = input
         .record
         .as_object()
         .ok_or_else(|| error("record must be a JSON object"))?;
-    if let Some(record_uri) = record.get("uri").and_then(Value::as_str) {
+
+    if input.prepare_pui_availability {
+        let uri_val = record
+            .get("uri")
+            .ok_or_else(|| error("record.uri is required when prepare_pui_availability is true"))?;
+        let rec_uri = uri_val
+            .as_str()
+            .ok_or_else(|| error("record.uri must be a non-empty string"))?;
+        if rec_uri.trim().is_empty() {
+            return Err(error("record.uri must not be empty"));
+        }
+        if rec_uri != input.uri {
+            return Err(error(format!(
+                "record uri '{rec_uri}' does not match wrapper uri '{}'",
+                input.uri
+            )));
+        }
+
+        let type_val = record.get("jsonmodel_type").ok_or_else(|| {
+            error("record.jsonmodel_type is required when prepare_pui_availability is true")
+        })?;
+        let rec_type = type_val
+            .as_str()
+            .ok_or_else(|| error("record.jsonmodel_type must be a non-empty string"))?;
+        if rec_type.trim().is_empty() {
+            return Err(error("record.jsonmodel_type must not be empty"));
+        }
+        if rec_type != input.record_type {
+            return Err(error(format!(
+                "record jsonmodel_type '{rec_type}' does not match wrapper record_type '{}'",
+                input.record_type
+            )));
+        }
+
+        if input.record_inheritance_has_type.is_none() {
+            return Err(error("record_inheritance_has_type must be explicitly present and boolean when prepare_pui_availability is true"));
+        }
+    } else if let Some(record_uri) = record.get("uri").and_then(Value::as_str) {
         if record_uri != input.uri {
             return Err(error(format!(
                 "record uri '{record_uri}' does not match wrapper uri '{}'",
@@ -3039,6 +3225,10 @@ pub fn build_index_document(input: IndexDocumentInput) -> Result<Value, IndexDoc
         add_enriched_fields(&mut document, &input, record)?;
     } else if input.prepare_pui_final {
         add_pui_final_fields(&mut document, &input)?;
+    }
+
+    if input.prepare_pui_availability {
+        add_pui_availability_fields(&mut document, &input, record)?;
     }
 
     if let Some(child) = collection_management {
@@ -7625,5 +7815,950 @@ mod tests {
         assert!(doc2.get(PUI_NOTES_DOCUMENTS_KEY).is_none());
         assert!(doc2.get(PUI_FINAL_DOCUMENTS_KEY).is_none());
         assert!(doc2.get("_archivalist_rust_fields").is_none());
+    }
+
+    #[test]
+    fn test_compute_pui_conditional_additions_all_types() {
+        // 1. Resource
+        assert_eq!(
+            compute_pui_conditional_additions("resource", false),
+            vec!["pui_collection", "pui"]
+        );
+        assert_eq!(
+            compute_pui_conditional_additions("resource", true),
+            Vec::<String>::new()
+        );
+
+        // 2. Classification
+        assert_eq!(
+            compute_pui_conditional_additions("classification", false),
+            vec!["pui_record_group", "pui"]
+        );
+        assert_eq!(
+            compute_pui_conditional_additions("classification", true),
+            Vec::<String>::new()
+        );
+
+        // 3. Accession
+        assert_eq!(
+            compute_pui_conditional_additions("accession", false),
+            vec!["pui_record", "pui_accession", "pui"]
+        );
+        assert_eq!(
+            compute_pui_conditional_additions("accession", true),
+            vec!["pui_record"]
+        );
+
+        // 4. Digital object
+        assert_eq!(
+            compute_pui_conditional_additions("digital_object", false),
+            vec!["pui_record", "pui_digital_object", "pui"]
+        );
+        assert_eq!(
+            compute_pui_conditional_additions("digital_object", true),
+            vec!["pui_record"]
+        );
+
+        // 5. Digital object component
+        assert_eq!(
+            compute_pui_conditional_additions("digital_object_component", false),
+            vec!["pui_record", "pui_digital_object_component", "pui"]
+        );
+        assert_eq!(
+            compute_pui_conditional_additions("digital_object_component", true),
+            vec!["pui_record"]
+        );
+
+        // 6. Agent person
+        assert_eq!(
+            compute_pui_conditional_additions("agent_person", false),
+            vec!["pui_agent", "pui_person", "pui"]
+        );
+        assert_eq!(
+            compute_pui_conditional_additions("agent_person", true),
+            vec!["pui_agent"]
+        );
+
+        // 7. Agent corporate entity
+        assert_eq!(
+            compute_pui_conditional_additions("agent_corporate_entity", false),
+            vec!["pui_agent", "pui_agent_corporate_entity", "pui"]
+        );
+        assert_eq!(
+            compute_pui_conditional_additions("agent_corporate_entity", true),
+            vec!["pui_agent"]
+        );
+
+        // 8. Other primary type (e.g. subject, location)
+        assert_eq!(
+            compute_pui_conditional_additions("subject", false),
+            vec!["pui_subject", "pui"]
+        );
+        assert_eq!(
+            compute_pui_conditional_additions("location", false),
+            vec!["pui_location", "pui"]
+        );
+        assert_eq!(
+            compute_pui_conditional_additions("archival_object", true),
+            Vec::<String>::new()
+        );
+
+        // 9. Top container
+        assert_eq!(
+            compute_pui_conditional_additions("top_container", false),
+            vec!["pui_top_container", "pui"]
+        );
+    }
+
+    #[test]
+    fn test_pui_availability_plan_for_record_types() {
+        let types = vec![
+            ("resource", vec!["pui_collection", "pui"]),
+            ("classification", vec!["pui_record_group", "pui"]),
+            ("accession", vec!["pui_record", "pui_accession", "pui"]),
+            (
+                "digital_object",
+                vec!["pui_record", "pui_digital_object", "pui"],
+            ),
+            (
+                "digital_object_component",
+                vec!["pui_record", "pui_digital_object_component", "pui"],
+            ),
+            ("agent_person", vec!["pui_agent", "pui_person", "pui"]),
+            (
+                "agent_corporate_entity",
+                vec!["pui_agent", "pui_agent_corporate_entity", "pui"],
+            ),
+            ("subject", vec!["pui_subject", "pui"]),
+        ];
+
+        for (rec_type, expected_additions) in types {
+            let uri = format!("/repositories/2/{rec_type}s/100");
+            let input = IndexDocumentInput {
+                uri: uri.clone(),
+                record_type: rec_type.to_string(),
+                repository: json!(2),
+                record: json!({
+                    "uri": uri,
+                    "jsonmodel_type": rec_type,
+                    "title": format!("Sample {rec_type}"),
+                    "publish": true,
+                }),
+                prepare_pui_availability: true,
+                record_inheritance_has_type: Some(false),
+                ..Default::default()
+            };
+
+            let doc = build_index_document(input).unwrap();
+            let fields = doc["_archivalist_rust_fields"].as_array().unwrap();
+            assert!(fields.contains(&Value::String(PUI_AVAILABILITY_METADATA_MARKER.to_string())));
+
+            let plan = doc[PUI_AVAILABILITY_DOCUMENTS_KEY].as_object().unwrap();
+            assert_eq!(plan["marker"], PUI_AVAILABILITY_METADATA_MARKER);
+            assert_eq!(plan["uri"], uri);
+            assert_eq!(plan["primary_type"], rec_type);
+            assert_eq!(plan["record_inheritance_has_type"], false);
+            assert_eq!(plan["conditional_additions"], json!(expected_additions));
+            assert!(plan["top_container_override"].is_null());
+        }
+    }
+
+    #[test]
+    fn test_pui_availability_inheritance_backed_type() {
+        let uri = "/repositories/2/archival_objects/500".to_string();
+        let input = IndexDocumentInput {
+            uri: uri.clone(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": uri,
+                "jsonmodel_type": "archival_object",
+                "title": "Inheritance-backed AO",
+                "publish": true,
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(true),
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input).unwrap();
+        let plan = doc[PUI_AVAILABILITY_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(plan["marker"], PUI_AVAILABILITY_METADATA_MARKER);
+        assert_eq!(plan["uri"], uri);
+        assert_eq!(plan["primary_type"], "archival_object");
+        assert_eq!(plan["record_inheritance_has_type"], true);
+        assert_eq!(plan["conditional_additions"], json!([]));
+        assert!(plan["top_container_override"].is_null());
+    }
+
+    #[test]
+    fn test_pui_availability_unpublished_records() {
+        let uri = "/repositories/2/resources/999".to_string();
+        let input = IndexDocumentInput {
+            uri: uri.clone(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": uri,
+                "jsonmodel_type": "resource",
+                "title": "Unpublished resource",
+                "publish": false,
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(false),
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input).unwrap();
+        assert_eq!(doc["publish"], false);
+
+        let plan = doc[PUI_AVAILABILITY_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(plan["marker"], PUI_AVAILABILITY_METADATA_MARKER);
+        assert_eq!(plan["uri"], uri);
+        assert_eq!(plan["primary_type"], "resource");
+        assert_eq!(plan["record_inheritance_has_type"], false);
+        assert_eq!(
+            plan["conditional_additions"],
+            json!(["pui_collection", "pui"])
+        );
+        assert!(plan["top_container_override"].is_null());
+    }
+
+    #[test]
+    fn test_pui_availability_unicode_type_safe_inputs() {
+        let uri = "/repositories/2/resources/colección-josé-📚".to_string();
+        let input = IndexDocumentInput {
+            uri: uri.clone(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": uri,
+                "jsonmodel_type": "resource",
+                "title": "Colección José Hernández 📚",
+                "publish": true,
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(false),
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input).unwrap();
+        let plan = doc[PUI_AVAILABILITY_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(plan["uri"], uri);
+        assert_eq!(plan["marker"], PUI_AVAILABILITY_METADATA_MARKER);
+        assert_eq!(
+            plan["conditional_additions"],
+            json!(["pui_collection", "pui"])
+        );
+    }
+
+    #[test]
+    fn test_pui_availability_exhaustive_top_container_matrix() {
+        // Matrix:
+        // initial_publish (false, true) x is_linked_to_published_record (false, true, null)
+        let matrix = vec![
+            // (initial_doc_publish, is_linked, expected_tc_publish_in_plan, expected_final_doc_publish, expected_final_types)
+            (
+                false,
+                Some(false),
+                Value::Bool(false),
+                false,
+                vec!["top_container"],
+            ),
+            (
+                false,
+                Some(true),
+                Value::Bool(true),
+                true,
+                vec!["top_container", "pui_container", "pui"],
+            ),
+            (
+                true,
+                Some(false),
+                Value::Bool(false),
+                false,
+                vec!["top_container", "pui_top_container", "pui"],
+            ),
+            (
+                true,
+                Some(true),
+                Value::Bool(true),
+                true,
+                vec![
+                    "top_container",
+                    "pui_top_container",
+                    "pui",
+                    "pui_container",
+                    "pui",
+                ],
+            ),
+            (
+                false,
+                None,
+                Value::Null,
+                false, // nil is falsey
+                vec!["top_container"],
+            ),
+            (
+                true,
+                None,
+                Value::Null,
+                false, // nil is falsey
+                vec!["top_container", "pui_top_container", "pui"],
+            ),
+        ];
+
+        for (
+            initial_publish,
+            is_linked,
+            expected_plan_publish,
+            expected_final_publish,
+            expected_final_types,
+        ) in matrix
+        {
+            let uri = format!(
+                "/repositories/2/top_containers/tc_init_{initial_publish}_linked_{:?}",
+                is_linked
+            );
+            let mut rec = json!({
+                "uri": uri,
+                "jsonmodel_type": "top_container",
+                "title": "Box 1",
+                "publish": initial_publish,
+            });
+            if let Some(linked) = is_linked {
+                rec["is_linked_to_published_record"] = Value::Bool(linked);
+            }
+
+            let input = IndexDocumentInput {
+                uri: uri.clone(),
+                record_type: "top_container".to_string(),
+                repository: json!(2),
+                record: rec,
+                prepare_pui_availability: true,
+                record_inheritance_has_type: Some(false),
+                ..Default::default()
+            };
+
+            let doc = build_index_document(input).unwrap();
+            assert_eq!(doc["publish"], initial_publish);
+
+            let plan = doc[PUI_AVAILABILITY_DOCUMENTS_KEY].as_object().unwrap();
+            assert_eq!(plan["marker"], PUI_AVAILABILITY_METADATA_MARKER);
+            assert_eq!(plan["uri"], uri);
+            assert_eq!(plan["primary_type"], "top_container");
+            assert_eq!(plan["record_inheritance_has_type"], false);
+            assert_eq!(
+                plan["conditional_additions"],
+                json!(["pui_top_container", "pui"])
+            );
+
+            let tc_override = plan["top_container_override"].as_object().unwrap();
+            assert_eq!(tc_override["publish"], expected_plan_publish);
+            assert_eq!(tc_override["additions"], json!(["pui_container", "pui"]));
+
+            // Simulate the exact native application flow on the document:
+            let mut types = doc["types"].as_array().unwrap().clone();
+            let mut current_publish = doc["publish"].clone();
+
+            // Step 1: if doc['publish'] (truthy check)
+            if current_publish == Value::Bool(true) {
+                for item in plan["conditional_additions"].as_array().unwrap() {
+                    types.push(item.clone());
+                }
+            }
+
+            // Step 2 & 3: Top container override: doc['publish'] = is_linked_to_published_record
+            current_publish = tc_override["publish"].clone();
+            let is_truthy = !current_publish.is_null() && current_publish != Value::Bool(false);
+            if is_truthy {
+                for item in tc_override["additions"].as_array().unwrap() {
+                    types.push(item.clone());
+                }
+            }
+
+            assert_eq!(
+                is_truthy, expected_final_publish,
+                "final publish mismatch for initial={initial_publish}, linked={is_linked:?}"
+            );
+            assert_eq!(
+                types,
+                expected_final_types
+                    .iter()
+                    .map(|s| Value::String(s.to_string()))
+                    .collect::<Vec<_>>(),
+                "final types mismatch for initial={initial_publish}, linked={is_linked:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pui_availability_multi_record_batch_isolation() {
+        let res_input = IndexDocumentInput {
+            uri: "/repositories/2/resources/701".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/701",
+                "jsonmodel_type": "resource",
+                "title": "Batch Resource 701",
+                "publish": true,
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(false),
+            ..Default::default()
+        };
+
+        let tc_input = IndexDocumentInput {
+            uri: "/repositories/2/top_containers/702".to_string(),
+            record_type: "top_container".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/top_containers/702",
+                "jsonmodel_type": "top_container",
+                "title": "Box 702",
+                "publish": false,
+                "is_linked_to_published_record": true,
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(false),
+            ..Default::default()
+        };
+
+        let ao_input = IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/703".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/703",
+                "jsonmodel_type": "archival_object",
+                "title": "Batch AO 703",
+                "publish": true,
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(true),
+            ..Default::default()
+        };
+
+        let unaccelerated_input = IndexDocumentInput {
+            uri: "/repositories/2/resources/704".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/704",
+                "jsonmodel_type": "resource",
+                "title": "Batch Plain 704",
+                "publish": true,
+            }),
+            prepare_pui_availability: false,
+            record_inheritance_has_type: None,
+            ..Default::default()
+        };
+
+        let response = build_index_document_batch(IndexDocumentBatchRequest {
+            records: vec![res_input, tc_input, ao_input, unaccelerated_input],
+        })
+        .unwrap();
+
+        assert_eq!(response.documents.len(), 4);
+
+        // Doc 0: Resource
+        let d0 = &response.documents[0];
+        assert_eq!(d0["id"], "/repositories/2/resources/701");
+        let p0 = d0[PUI_AVAILABILITY_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(p0["marker"], PUI_AVAILABILITY_METADATA_MARKER);
+        assert_eq!(p0["uri"], "/repositories/2/resources/701");
+        assert_eq!(p0["primary_type"], "resource");
+        assert_eq!(
+            p0["conditional_additions"],
+            json!(["pui_collection", "pui"])
+        );
+        assert!(p0["top_container_override"].is_null());
+
+        // Doc 1: Top container
+        let d1 = &response.documents[1];
+        assert_eq!(d1["id"], "/repositories/2/top_containers/702");
+        let p1 = d1[PUI_AVAILABILITY_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(p1["marker"], PUI_AVAILABILITY_METADATA_MARKER);
+        assert_eq!(p1["uri"], "/repositories/2/top_containers/702");
+        assert_eq!(p1["primary_type"], "top_container");
+        assert_eq!(
+            p1["conditional_additions"],
+            json!(["pui_top_container", "pui"])
+        );
+        assert_eq!(
+            p1["top_container_override"],
+            json!({
+                "publish": true,
+                "additions": ["pui_container", "pui"]
+            })
+        );
+
+        // Doc 2: Archival Object with inheritance true
+        let d2 = &response.documents[2];
+        assert_eq!(d2["id"], "/repositories/2/archival_objects/703");
+        let p2 = d2[PUI_AVAILABILITY_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(p2["marker"], PUI_AVAILABILITY_METADATA_MARKER);
+        assert_eq!(p2["uri"], "/repositories/2/archival_objects/703");
+        assert_eq!(p2["primary_type"], "archival_object");
+        assert_eq!(p2["record_inheritance_has_type"], true);
+        assert_eq!(p2["conditional_additions"], json!([]));
+        assert!(p2["top_container_override"].is_null());
+
+        // Doc 3: Unaccelerated record
+        let d3 = &response.documents[3];
+        assert_eq!(d3["id"], "/repositories/2/resources/704");
+        assert!(d3.get(PUI_AVAILABILITY_DOCUMENTS_KEY).is_none());
+        assert!(d3.get("_archivalist_rust_fields").is_none());
+    }
+
+    #[test]
+    fn test_pui_availability_cannot_combine_with_prepare_pui_final() {
+        let input = IndexDocumentInput {
+            uri: "/repositories/2/resources/801".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/801",
+                "jsonmodel_type": "resource",
+                "title": "Combined",
+            }),
+            prepare_pui_final: true,
+            prepare_pui_availability: true,
+            ..Default::default()
+        };
+
+        let err = build_index_document(input).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cannot combine prepare_pui_final (pui) and prepare_pui_availability"));
+    }
+
+    #[test]
+    fn test_pui_availability_record_identity_validation() {
+        // 1. Missing URI in record
+        let missing_uri = IndexDocumentInput {
+            uri: "/repositories/2/resources/802".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "jsonmodel_type": "resource",
+                "title": "Missing URI",
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(false),
+            ..Default::default()
+        };
+        let err_miss_uri = build_index_document(missing_uri).unwrap_err();
+        assert!(err_miss_uri.to_string().contains("record.uri is required"));
+
+        // 2. Null URI in record
+        let null_uri = IndexDocumentInput {
+            uri: "/repositories/2/resources/802".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": null,
+                "jsonmodel_type": "resource",
+                "title": "Null URI",
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(false),
+            ..Default::default()
+        };
+        let err_null_uri = build_index_document(null_uri).unwrap_err();
+        assert!(err_null_uri
+            .to_string()
+            .contains("record.uri must be a non-empty string"));
+
+        // 3. Numeric URI in record
+        let num_uri = IndexDocumentInput {
+            uri: "/repositories/2/resources/802".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": 802,
+                "jsonmodel_type": "resource",
+                "title": "Numeric URI",
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(false),
+            ..Default::default()
+        };
+        let err_num_uri = build_index_document(num_uri).unwrap_err();
+        assert!(err_num_uri
+            .to_string()
+            .contains("record.uri must be a non-empty string"));
+
+        // 4. Array URI in record
+        let arr_uri = IndexDocumentInput {
+            uri: "/repositories/2/resources/802".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": ["/repositories/2/resources/802"],
+                "jsonmodel_type": "resource",
+                "title": "Array URI",
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(false),
+            ..Default::default()
+        };
+        let err_arr_uri = build_index_document(arr_uri).unwrap_err();
+        assert!(err_arr_uri
+            .to_string()
+            .contains("record.uri must be a non-empty string"));
+
+        // 5. Hash URI in record
+        let hash_uri = IndexDocumentInput {
+            uri: "/repositories/2/resources/802".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": {"ref": "/repositories/2/resources/802"},
+                "jsonmodel_type": "resource",
+                "title": "Hash URI",
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(false),
+            ..Default::default()
+        };
+        let err_hash_uri = build_index_document(hash_uri).unwrap_err();
+        assert!(err_hash_uri
+            .to_string()
+            .contains("record.uri must be a non-empty string"));
+
+        // 6. Empty string URI in record
+        let empty_uri = IndexDocumentInput {
+            uri: "/repositories/2/resources/802".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "",
+                "jsonmodel_type": "resource",
+                "title": "Empty URI",
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(false),
+            ..Default::default()
+        };
+        let err_empty_uri = build_index_document(empty_uri).unwrap_err();
+        assert!(err_empty_uri
+            .to_string()
+            .contains("record.uri must not be empty"));
+
+        // 7. Whitespace string URI in record
+        let ws_uri = IndexDocumentInput {
+            uri: "/repositories/2/resources/802".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "   ",
+                "jsonmodel_type": "resource",
+                "title": "Whitespace URI",
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(false),
+            ..Default::default()
+        };
+        let err_ws_uri = build_index_document(ws_uri).unwrap_err();
+        assert!(err_ws_uri
+            .to_string()
+            .contains("record.uri must not be empty"));
+
+        // 8. Mismatched URI in record
+        let bad_uri = IndexDocumentInput {
+            uri: "/repositories/2/resources/802".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/999_MISMATCH",
+                "jsonmodel_type": "resource",
+                "title": "Bad URI",
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(false),
+            ..Default::default()
+        };
+        let err_bad_uri = build_index_document(bad_uri).unwrap_err();
+        assert!(err_bad_uri
+            .to_string()
+            .contains("does not match wrapper uri"));
+
+        // 9. Missing jsonmodel_type in record
+        let missing_type = IndexDocumentInput {
+            uri: "/repositories/2/resources/803".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/803",
+                "title": "Missing Type",
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(false),
+            ..Default::default()
+        };
+        let err_miss_type = build_index_document(missing_type).unwrap_err();
+        assert!(err_miss_type
+            .to_string()
+            .contains("record.jsonmodel_type is required"));
+
+        // 10. Null jsonmodel_type in record
+        let null_type = IndexDocumentInput {
+            uri: "/repositories/2/resources/803".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/803",
+                "jsonmodel_type": null,
+                "title": "Null Type",
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(false),
+            ..Default::default()
+        };
+        let err_null_type = build_index_document(null_type).unwrap_err();
+        assert!(err_null_type
+            .to_string()
+            .contains("record.jsonmodel_type must be a non-empty string"));
+
+        // 11. Numeric jsonmodel_type in record
+        let num_type = IndexDocumentInput {
+            uri: "/repositories/2/resources/803".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/803",
+                "jsonmodel_type": 123,
+                "title": "Numeric Type",
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(false),
+            ..Default::default()
+        };
+        let err_num_type = build_index_document(num_type).unwrap_err();
+        assert!(err_num_type
+            .to_string()
+            .contains("record.jsonmodel_type must be a non-empty string"));
+
+        // 12. Array jsonmodel_type in record
+        let arr_type = IndexDocumentInput {
+            uri: "/repositories/2/resources/803".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/803",
+                "jsonmodel_type": ["resource"],
+                "title": "Array Type",
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(false),
+            ..Default::default()
+        };
+        let err_arr_type = build_index_document(arr_type).unwrap_err();
+        assert!(err_arr_type
+            .to_string()
+            .contains("record.jsonmodel_type must be a non-empty string"));
+
+        // 13. Hash jsonmodel_type in record
+        let hash_type = IndexDocumentInput {
+            uri: "/repositories/2/resources/803".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/803",
+                "jsonmodel_type": {"name": "resource"},
+                "title": "Hash Type",
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(false),
+            ..Default::default()
+        };
+        let err_hash_type = build_index_document(hash_type).unwrap_err();
+        assert!(err_hash_type
+            .to_string()
+            .contains("record.jsonmodel_type must be a non-empty string"));
+
+        // 14. Empty string jsonmodel_type in record
+        let empty_type = IndexDocumentInput {
+            uri: "/repositories/2/resources/803".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/803",
+                "jsonmodel_type": "",
+                "title": "Empty Type",
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(false),
+            ..Default::default()
+        };
+        let err_empty_type = build_index_document(empty_type).unwrap_err();
+        assert!(err_empty_type
+            .to_string()
+            .contains("record.jsonmodel_type must not be empty"));
+
+        // 15. Whitespace string jsonmodel_type in record
+        let ws_type = IndexDocumentInput {
+            uri: "/repositories/2/resources/803".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/803",
+                "jsonmodel_type": "   ",
+                "title": "Whitespace Type",
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(false),
+            ..Default::default()
+        };
+        let err_ws_type = build_index_document(ws_type).unwrap_err();
+        assert!(err_ws_type
+            .to_string()
+            .contains("record.jsonmodel_type must not be empty"));
+
+        // 16. Mismatched jsonmodel_type in record
+        let bad_type = IndexDocumentInput {
+            uri: "/repositories/2/resources/803".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/803",
+                "jsonmodel_type": "archival_object",
+                "title": "Bad Type",
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(false),
+            ..Default::default()
+        };
+        let err_bad_type = build_index_document(bad_type).unwrap_err();
+        assert!(err_bad_type
+            .to_string()
+            .contains("does not match wrapper record_type"));
+
+        // 17. Missing record_inheritance_has_type (None) when prepare_pui_availability is true
+        let missing_inh = IndexDocumentInput {
+            uri: "/repositories/2/resources/804".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/804",
+                "jsonmodel_type": "resource",
+                "title": "Missing Inheritance",
+            }),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: None,
+            ..Default::default()
+        };
+        let err_miss_inh = build_index_document(missing_inh).unwrap_err();
+        assert!(err_miss_inh
+            .to_string()
+            .contains("record_inheritance_has_type must be explicitly present and boolean"));
+
+        // 18. Non-object direct record
+        let non_obj_rec = IndexDocumentInput {
+            uri: "/repositories/2/resources/805".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!("string_record"),
+            prepare_pui_availability: true,
+            record_inheritance_has_type: Some(false),
+            ..Default::default()
+        };
+        let err_non_obj = build_index_document(non_obj_rec).unwrap_err();
+        assert!(err_non_obj
+            .to_string()
+            .contains("record must be a JSON object"));
+
+        // 19. Serde deserialization rejects non-boolean types for record_inheritance_has_type
+        let bad_str_json = r#"{
+            "uri": "/repositories/2/resources/806",
+            "record_type": "resource",
+            "repository": 2,
+            "prepare_pui_availability": true,
+            "record_inheritance_has_type": "true",
+            "record": {"uri": "/repositories/2/resources/806", "jsonmodel_type": "resource"}
+        }"#;
+        assert!(serde_json::from_str::<IndexDocumentInput>(bad_str_json).is_err());
+
+        let bad_int_json = r#"{
+            "uri": "/repositories/2/resources/807",
+            "record_type": "resource",
+            "repository": 2,
+            "prepare_pui_availability": true,
+            "record_inheritance_has_type": 1,
+            "record": {"uri": "/repositories/2/resources/807", "jsonmodel_type": "resource"}
+        }"#;
+        assert!(serde_json::from_str::<IndexDocumentInput>(bad_int_json).is_err());
+
+        // 20. Serde deserializes null to None, which build_index_document rejects
+        let null_inh_json = r#"{
+            "uri": "/repositories/2/resources/808",
+            "record_type": "resource",
+            "repository": 2,
+            "prepare_pui_availability": true,
+            "record_inheritance_has_type": null,
+            "record": {"uri": "/repositories/2/resources/808", "jsonmodel_type": "resource"}
+        }"#;
+        let decoded_null = serde_json::from_str::<IndexDocumentInput>(null_inh_json).unwrap();
+        assert_eq!(decoded_null.record_inheritance_has_type, None);
+        assert!(build_index_document(decoded_null).is_err());
+
+        // 21. Serde deserializes omitted field to None, which build_index_document rejects when prepare_pui_availability is true
+        let omitted_inh_json = r#"{
+            "uri": "/repositories/2/resources/809",
+            "record_type": "resource",
+            "repository": 2,
+            "prepare_pui_availability": true,
+            "record": {"uri": "/repositories/2/resources/809", "jsonmodel_type": "resource"}
+        }"#;
+        let decoded_omitted = serde_json::from_str::<IndexDocumentInput>(omitted_inh_json).unwrap();
+        assert_eq!(decoded_omitted.record_inheritance_has_type, None);
+        assert!(build_index_document(decoded_omitted).is_err());
+
+        // 22. Backward compatibility: omitted record_inheritance_has_type succeeds when prepare_pui_availability is false
+        let non_avail_json = r#"{
+            "uri": "/repositories/2/resources/810",
+            "record_type": "resource",
+            "repository": 2,
+            "prepare_pui_availability": false,
+            "record": {"uri": "/repositories/2/resources/810", "jsonmodel_type": "resource"}
+        }"#;
+        let decoded_non_avail = serde_json::from_str::<IndexDocumentInput>(non_avail_json).unwrap();
+        assert_eq!(decoded_non_avail.record_inheritance_has_type, None);
+        assert!(build_index_document(decoded_non_avail).is_ok());
+    }
+
+    #[test]
+    fn test_pui_availability_top_container_non_boolean_publish() {
+        for val in [
+            json!(0),
+            json!(1),
+            json!("linked_val"),
+            json!(null),
+            json!(false),
+            json!(true),
+        ] {
+            let tc_input = IndexDocumentInput {
+                uri: "/repositories/2/top_containers/901".to_string(),
+                record_type: "top_container".to_string(),
+                repository: json!(2),
+                record: json!({
+                    "uri": "/repositories/2/top_containers/901",
+                    "jsonmodel_type": "top_container",
+                    "title": "Box 901",
+                    "publish": true,
+                    "is_linked_to_published_record": val,
+                }),
+                prepare_pui_availability: true,
+                record_inheritance_has_type: Some(false),
+                ..Default::default()
+            };
+            let doc = build_index_document(tc_input).unwrap();
+            let p = doc[PUI_AVAILABILITY_DOCUMENTS_KEY].as_object().unwrap();
+            let tc_override = p["top_container_override"].as_object().unwrap();
+            assert_eq!(tc_override["publish"], val);
+            assert_eq!(tc_override["additions"], json!(["pui_container", "pui"]));
+        }
     }
 }

@@ -235,6 +235,14 @@ corresponding logical hook positions (`configure_doc_rules`, `add_notes`, `final
 before trusting each projection, falling back completely to unchanged native PUIIndexer
 logic on missing, malformed, or mismatched sidecar responses. Collection-management child
 documents, dynamic enums, and ARKs remain staff-only and are completely bypassed in PUI.
+Main index PUI availability preparation is gated separately under `rust_pui_availability_preparation_enabled`
+(disabled by default) and applies strictly to the common/main index path (`IndexerCommon#apply_pui_fields`).
+It remains completely isolated from `PUIIndexer`. Ruby computes `RecordInheritance.has_type?(record_type)`
+and includes it in the batch payload. Rust produces deterministic conditional type additions and top-container
+publication overrides (`is_linked_to_published_record`) under capability marker `pui_availability_metadata`.
+`IndexerCommon` strips the projection into an isolated batch map before any document prepare hooks run,
+validates the plan at the existing `apply_pui_fields` hook, reads the final `doc['publish']` value, and applies
+exact native type additions, preserving native append order, duplicate tokens, and Ruby truthiness.
 Before rollout, also require a complete native-versus-Rust reindex comparison so
 accessions, digital objects and components, subjects, agents, classifications,
 repositories, events, locations, container profiles, location profiles,
@@ -261,6 +269,7 @@ Point a non-production indexer at a dedicated disposable collection, e.g.
 AppConfig[:solr_url] = "http://127.0.0.1:8985/solr/archivesspace_native_test"
 AppConfig[:rust_index_document_builder_enabled] = false
 AppConfig[:rust_index_document_enrichment_enabled] = false
+AppConfig[:rust_pui_availability_preparation_enabled] = false
 ```
 
 Run a clean reindex of the designated disposable repository (e.g. `REPO_ID=2`). Wait
@@ -279,6 +288,7 @@ AppConfig[:rust_index_document_builder_url] = "http://127.0.0.1:4570"
 AppConfig[:rust_index_document_builder_timeout_seconds] = 2
 AppConfig[:rust_index_document_builder_max_batch] = 1000
 AppConfig[:rust_index_document_enrichment_enabled] = true
+AppConfig[:rust_pui_availability_preparation_enabled] = true
 ```
 
 Run a clean reindex of the same disposable repository (`REPO_ID=2`). Wait for
@@ -415,13 +425,14 @@ for the batch without leaking private data or halting indexing.
 ## 9. Rollback
 
 Set all sidecar enable flags, including `rust_index_document_builder_enabled`,
-`rust_index_document_enrichment_enabled`, and `rust_pui_document_preparation_enabled`,
-to `false` and restart Archivalist:
+`rust_index_document_enrichment_enabled`, `rust_pui_document_preparation_enabled`,
+and `rust_pui_availability_preparation_enabled`, to `false` and restart Archivalist:
 
 ```ruby
 AppConfig[:rust_index_document_builder_enabled] = false
 AppConfig[:rust_index_document_enrichment_enabled] = false
 AppConfig[:rust_pui_document_preparation_enabled] = false
+AppConfig[:rust_pui_availability_preparation_enabled] = false
 ```
 
 The sidecar can then be stopped independently. Do not point the service at the primary

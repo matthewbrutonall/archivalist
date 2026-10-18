@@ -1014,4 +1014,13 @@ describe "PUI indexer" do
       AppConfig[:rust_pui_document_preparation_enabled] = false
     end
   end
+
+  it "isolates rust_pui_availability_preparation_enabled from PUIIndexer" do
+    begin
+      AppConfig[:rust_pui_availability_preparation_enabled] = true
+      expect(indexer.rust_pui_availability_preparation_enabled?).to be(false)
+    ensure
+      AppConfig[:rust_pui_availability_preparation_enabled] = false
+    end
+  end
 end

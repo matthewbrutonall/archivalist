@@ -3079,4 +3079,406 @@ describe RustIndexDocumentBuilder do
       expect { builder.build([pui_input]) }.to raise_error(/pui final json jsonmodel_type mismatch/)
     end
   end
+
+  describe 'PUI availability preparation' do
+    let(:avail_input) do
+      {
+        'uri' => '/repositories/2/resources/77',
+        'record_type' => 'resource',
+        'repository' => 2,
+        'prepare_pui_availability' => true,
+        'record_inheritance_has_type' => false,
+        'record' => {
+          'uri' => '/repositories/2/resources/77',
+          'jsonmodel_type' => 'resource',
+          'title' => 'Avail Resource',
+          'publish' => true,
+        },
+      }
+    end
+
+    def valid_avail_doc_for(inp)
+      {
+        'id' => inp['uri'],
+        'uri' => inp['uri'],
+        'title' => inp['record']['title'],
+        'primary_type' => inp['record_type'],
+        'types' => [inp['record_type']],
+        'json' => ASUtils.to_json(inp['record']),
+        'suppressed' => false,
+        'publish' => true,
+        'system_generated' => 'false',
+        'repository' => inp['repository'],
+        '_archivalist_rust_fields' => ['pui_availability_metadata'],
+        '_archivalist_pui_availability' => {
+          'marker' => 'pui_availability_metadata',
+          'uri' => inp['uri'],
+          'primary_type' => inp['record_type'],
+          'record_inheritance_has_type' => inp['record_inheritance_has_type'],
+          'conditional_additions' => RustIndexDocumentBuilder.compute_pui_conditional_additions(
+            inp['record_type'],
+            inp['record_inheritance_has_type']
+          ),
+          'top_container_override' => inp['record_type'] == 'top_container' ? {
+            'publish' => inp['record']['is_linked_to_published_record'],
+            'additions' => ['pui_container', 'pui'],
+          } : nil,
+        },
+      }
+    end
+
+    it 'accepts a valid PUI availability projection for resource' do
+      doc = valid_avail_doc_for(avail_input)
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      res = builder.build([avail_input])
+      expect(res).to eq(avail_input['uri'] => doc)
+    end
+
+    it 'accepts a valid PUI availability projection for top_container' do
+      tc_input = {
+        'uri' => '/repositories/2/top_containers/88',
+        'record_type' => 'top_container',
+        'repository' => 2,
+        'prepare_pui_availability' => true,
+        'record_inheritance_has_type' => false,
+        'record' => {
+          'uri' => '/repositories/2/top_containers/88',
+          'jsonmodel_type' => 'top_container',
+          'title' => 'Box 88',
+          'publish' => true,
+          'is_linked_to_published_record' => true,
+        },
+      }
+      doc = valid_avail_doc_for(tc_input)
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      res = builder.build([tc_input])
+      expect(res).to eq(tc_input['uri'] => doc)
+    end
+
+    it 'computes exact conditional additions and order for all types' do
+      expect(RustIndexDocumentBuilder.compute_pui_conditional_additions('resource', false))
+        .to eq(['pui_collection', 'pui'])
+      expect(RustIndexDocumentBuilder.compute_pui_conditional_additions('classification', false))
+        .to eq(['pui_record_group', 'pui'])
+      expect(RustIndexDocumentBuilder.compute_pui_conditional_additions('accession', false))
+        .to eq(['pui_record', 'pui_accession', 'pui'])
+      expect(RustIndexDocumentBuilder.compute_pui_conditional_additions('digital_object', false))
+        .to eq(['pui_record', 'pui_digital_object', 'pui'])
+      expect(RustIndexDocumentBuilder.compute_pui_conditional_additions('digital_object_component', false))
+        .to eq(['pui_record', 'pui_digital_object_component', 'pui'])
+      expect(RustIndexDocumentBuilder.compute_pui_conditional_additions('agent_person', false))
+        .to eq(['pui_agent', 'pui_person', 'pui'])
+      expect(RustIndexDocumentBuilder.compute_pui_conditional_additions('agent_corporate_entity', false))
+        .to eq(['pui_agent', 'pui_agent_corporate_entity', 'pui'])
+      expect(RustIndexDocumentBuilder.compute_pui_conditional_additions('subject', false))
+        .to eq(['pui_subject', 'pui'])
+      expect(RustIndexDocumentBuilder.compute_pui_conditional_additions('top_container', false))
+        .to eq(['pui_top_container', 'pui'])
+
+      # When record_inheritance_has_type is true:
+      expect(RustIndexDocumentBuilder.compute_pui_conditional_additions('archival_object', true))
+        .to eq([])
+      expect(RustIndexDocumentBuilder.compute_pui_conditional_additions('resource', true))
+        .to eq([])
+      expect(RustIndexDocumentBuilder.compute_pui_conditional_additions('accession', true))
+        .to eq(['pui_record'])
+      expect(RustIndexDocumentBuilder.compute_pui_conditional_additions('agent_person', true))
+        .to eq(['pui_agent'])
+    end
+
+    it 'rejects combining prepare_pui_final and prepare_pui_availability in same input' do
+      conflict_input = avail_input.merge('prepare_pui_final' => true)
+      expect { builder.build([conflict_input]) }
+        .to raise_error(/cannot combine prepare_pui_final and prepare_pui_availability/)
+    end
+
+    it 'rejects missing, null, wrong-type, empty, or mismatched record uri and jsonmodel_type, plus non-boolean inheritance flag' do
+      # Missing uri
+      bad1 = avail_input.dup
+      bad1['record'] = avail_input['record'].dup
+      bad1['record'].delete('uri')
+      expect { builder.build([bad1]) }.to raise_error(/record.uri must be a non-empty string/)
+
+      # Null uri
+      bad1_null = avail_input.dup
+      bad1_null['record'] = avail_input['record'].dup
+      bad1_null['record']['uri'] = nil
+      expect { builder.build([bad1_null]) }.to raise_error(/record.uri must be a non-empty string/)
+
+      # Numeric uri
+      bad1_num = avail_input.dup
+      bad1_num['record'] = avail_input['record'].dup
+      bad1_num['record']['uri'] = 123
+      expect { builder.build([bad1_num]) }.to raise_error(/record.uri must be a non-empty string/)
+
+      # Array uri
+      bad1_arr = avail_input.dup
+      bad1_arr['record'] = avail_input['record'].dup
+      bad1_arr['record']['uri'] = ['/repositories/2/resources/77']
+      expect { builder.build([bad1_arr]) }.to raise_error(/record.uri must be a non-empty string/)
+
+      # Hash uri
+      bad1_hash = avail_input.dup
+      bad1_hash['record'] = avail_input['record'].dup
+      bad1_hash['record']['uri'] = {'ref' => '/repositories/2/resources/77'}
+      expect { builder.build([bad1_hash]) }.to raise_error(/record.uri must be a non-empty string/)
+
+      # Empty uri
+      bad1_empty = avail_input.dup
+      bad1_empty['record'] = avail_input['record'].dup
+      bad1_empty['record']['uri'] = ''
+      expect { builder.build([bad1_empty]) }.to raise_error(/record.uri must be a non-empty string/)
+
+      # Whitespace uri
+      bad1_ws = avail_input.dup
+      bad1_ws['record'] = avail_input['record'].dup
+      bad1_ws['record']['uri'] = '  '
+      expect { builder.build([bad1_ws]) }.to raise_error(/record.uri must be a non-empty string/)
+
+      # Mismatched uri
+      bad1_mismatch = avail_input.dup
+      bad1_mismatch['record'] = avail_input['record'].dup
+      bad1_mismatch['record']['uri'] = '/repositories/2/resources/999'
+      expect { builder.build([bad1_mismatch]) }.to raise_error(/record uri mismatch/)
+
+      # Missing jsonmodel_type
+      bad2_miss = avail_input.dup
+      bad2_miss['record'] = avail_input['record'].dup
+      bad2_miss['record'].delete('jsonmodel_type')
+      expect { builder.build([bad2_miss]) }.to raise_error(/record.jsonmodel_type must be a non-empty string/)
+
+      # Null jsonmodel_type
+      bad2_null = avail_input.dup
+      bad2_null['record'] = avail_input['record'].dup
+      bad2_null['record']['jsonmodel_type'] = nil
+      expect { builder.build([bad2_null]) }.to raise_error(/record.jsonmodel_type must be a non-empty string/)
+
+      # Numeric jsonmodel_type
+      bad2_num = avail_input.dup
+      bad2_num['record'] = avail_input['record'].dup
+      bad2_num['record']['jsonmodel_type'] = 456
+      expect { builder.build([bad2_num]) }.to raise_error(/record.jsonmodel_type must be a non-empty string/)
+
+      # Array jsonmodel_type
+      bad2_arr = avail_input.dup
+      bad2_arr['record'] = avail_input['record'].dup
+      bad2_arr['record']['jsonmodel_type'] = ['resource']
+      expect { builder.build([bad2_arr]) }.to raise_error(/record.jsonmodel_type must be a non-empty string/)
+
+      # Hash jsonmodel_type
+      bad2_hash = avail_input.dup
+      bad2_hash['record'] = avail_input['record'].dup
+      bad2_hash['record']['jsonmodel_type'] = {'name' => 'resource'}
+      expect { builder.build([bad2_hash]) }.to raise_error(/record.jsonmodel_type must be a non-empty string/)
+
+      # Empty jsonmodel_type
+      bad2_empty = avail_input.dup
+      bad2_empty['record'] = avail_input['record'].dup
+      bad2_empty['record']['jsonmodel_type'] = ''
+      expect { builder.build([bad2_empty]) }.to raise_error(/record.jsonmodel_type must be a non-empty string/)
+
+      # Whitespace jsonmodel_type
+      bad2_ws = avail_input.dup
+      bad2_ws['record'] = avail_input['record'].dup
+      bad2_ws['record']['jsonmodel_type'] = '   '
+      expect { builder.build([bad2_ws]) }.to raise_error(/record.jsonmodel_type must be a non-empty string/)
+
+      # Mismatched jsonmodel_type
+      bad2_mismatch = avail_input.dup
+      bad2_mismatch['record'] = avail_input['record'].dup
+      bad2_mismatch['record']['jsonmodel_type'] = 'archival_object'
+      expect { builder.build([bad2_mismatch]) }.to raise_error(/record jsonmodel_type mismatch/)
+
+      # Non-hash direct record
+      bad3 = avail_input.dup
+      bad3['record'] = 'not a hash'
+      expect { builder.build([bad3]) }.to raise_error(/record must be a Hash/)
+
+      # Missing record_inheritance_has_type
+      bad4 = avail_input.dup
+      bad4.delete('record_inheritance_has_type')
+      expect { builder.build([bad4]) }.to raise_error(/record_inheritance_has_type must be explicitly boolean/)
+
+      # Null record_inheritance_has_type
+      bad4_null = avail_input.dup
+      bad4_null['record_inheritance_has_type'] = nil
+      expect { builder.build([bad4_null]) }.to raise_error(/record_inheritance_has_type must be explicitly boolean/)
+
+      # String record_inheritance_has_type
+      bad4_str = avail_input.dup
+      bad4_str['record_inheritance_has_type'] = 'false'
+      expect { builder.build([bad4_str]) }.to raise_error(/record_inheritance_has_type must be explicitly boolean/)
+
+      # Integer record_inheritance_has_type
+      bad4_int = avail_input.dup
+      bad4_int['record_inheritance_has_type'] = 0
+      expect { builder.build([bad4_int]) }.to raise_error(/record_inheritance_has_type must be explicitly boolean/)
+    end
+
+    it 'rejects projection with non-string keys, missing keys, or extra keys' do
+      # Non-string key
+      doc_sym = valid_avail_doc_for(avail_input)
+      proj = doc_sym['_archivalist_pui_availability'].dup
+      proj[:bad_sym] = 'val'
+      doc_sym['_archivalist_pui_availability'] = proj
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_sym])
+      )
+      expect { builder.build([avail_input]) }.to raise_error(/pui availability contains non-string keys/)
+
+      # Missing key
+      doc_miss = valid_avail_doc_for(avail_input)
+      doc_miss['_archivalist_pui_availability'].delete('conditional_additions')
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_miss])
+      )
+      expect { builder.build([avail_input]) }.to raise_error(/pui availability missing required fields/)
+
+      # Extra key
+      doc_extra = valid_avail_doc_for(avail_input)
+      doc_extra['_archivalist_pui_availability']['malicious_extra'] = 'payload'
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_extra])
+      )
+      expect { builder.build([avail_input]) }.to raise_error(/pui availability contains unexpected fields/)
+    end
+
+    it 'rejects projection with mismatched marker, uri, type, or inheritance flag' do
+      # Marker mismatch
+      doc1 = valid_avail_doc_for(avail_input)
+      doc1['_archivalist_pui_availability']['marker'] = 'pui_wrong_metadata'
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc1])
+      )
+      expect { builder.build([avail_input]) }.to raise_error(/pui availability marker mismatch/)
+
+      # URI mismatch
+      doc2 = valid_avail_doc_for(avail_input)
+      doc2['_archivalist_pui_availability']['uri'] = '/repositories/2/resources/WRONG'
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc2])
+      )
+      expect { builder.build([avail_input]) }.to raise_error(/pui availability uri mismatch/)
+
+      # Primary type mismatch
+      doc3 = valid_avail_doc_for(avail_input)
+      doc3['_archivalist_pui_availability']['primary_type'] = 'accession'
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc3])
+      )
+      expect { builder.build([avail_input]) }.to raise_error(/pui availability primary_type mismatch/)
+
+      # Inheritance flag mismatch
+      doc4 = valid_avail_doc_for(avail_input)
+      doc4['_archivalist_pui_availability']['record_inheritance_has_type'] = true
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc4])
+      )
+      expect { builder.build([avail_input]) }.to raise_error(/pui availability record_inheritance_has_type mismatch/)
+    end
+
+    it 'rejects projection with mismatched conditional additions' do
+      doc = valid_avail_doc_for(avail_input)
+      doc['_archivalist_pui_availability']['conditional_additions'] = ['pui', 'pui_collection'] # wrong order
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      expect { builder.build([avail_input]) }.to raise_error(/pui availability conditional_additions mismatch/)
+    end
+
+    it 'rejects malformed or mismatched top_container_override' do
+      tc_input = {
+        'uri' => '/repositories/2/top_containers/88',
+        'record_type' => 'top_container',
+        'repository' => 2,
+        'prepare_pui_availability' => true,
+        'record_inheritance_has_type' => false,
+        'record' => {
+          'uri' => '/repositories/2/top_containers/88',
+          'jsonmodel_type' => 'top_container',
+          'title' => 'Box 88',
+          'publish' => true,
+          'is_linked_to_published_record' => true,
+        },
+      }
+
+      # 1. Non-top-container has non-nil top_container_override
+      doc_res = valid_avail_doc_for(avail_input)
+      doc_res['_archivalist_pui_availability']['top_container_override'] = {'publish' => true, 'additions' => []}
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_res])
+      )
+      expect { builder.build([avail_input]) }.to raise_error(/top_container_override must be nil for non-top_container/)
+
+      # 2. Top-container has nil top_container_override
+      doc_tc_nil = valid_avail_doc_for(tc_input)
+      doc_tc_nil['_archivalist_pui_availability']['top_container_override'] = nil
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_tc_nil])
+      )
+      expect { builder.build([tc_input]) }.to raise_error(/top_container_override must be a hash/)
+
+      # 3. Top-container has mismatched publish value
+      doc_tc_pub = valid_avail_doc_for(tc_input)
+      doc_tc_pub['_archivalist_pui_availability']['top_container_override']['publish'] = false # record says true
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_tc_pub])
+      )
+      expect { builder.build([tc_input]) }.to raise_error(/top_container_override publish mismatch/)
+
+      # 4. Top-container has mismatched additions
+      doc_tc_add = valid_avail_doc_for(tc_input)
+      doc_tc_add['_archivalist_pui_availability']['top_container_override']['additions'] = ['pui', 'pui_container']
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_tc_add])
+      )
+      expect { builder.build([tc_input]) }.to raise_error(/top_container_override additions mismatch/)
+
+      # 5. Top-container has extra key in top_container_override
+      doc_tc_extra = valid_avail_doc_for(tc_input)
+      doc_tc_extra['_archivalist_pui_availability']['top_container_override']['extra'] = true
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_tc_extra])
+      )
+      expect { builder.build([tc_input]) }.to raise_error(/top_container_override contains unexpected fields/)
+    end
+
+    it 'rejects unexpected PUI availability projection when prepare_pui_availability is not requested' do
+      plain_input = {
+        'uri' => '/repositories/2/resources/99',
+        'record_type' => 'resource',
+        'repository' => 2,
+        'record' => {
+          'uri' => '/repositories/2/resources/99',
+          'title' => 'Plain Res',
+          'publish' => true,
+        },
+      }
+      leaked_doc = valid_avail_doc_for(avail_input).merge('id' => plain_input['uri'], 'uri' => plain_input['uri'])
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [leaked_doc])
+      )
+      expect { builder.build([plain_input]) }.to raise_error(/unexpected response pui availability projection marker/)
+    end
+  end
 end

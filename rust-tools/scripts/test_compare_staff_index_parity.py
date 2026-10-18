@@ -1094,6 +1094,93 @@ class TestStaffIndexParityOffline(unittest.TestCase):
         self.assertEqual(report["summary"]["candidate_marker_leaks_count"], 1)
         self.assertIn("/repositories/2/accessions/10", report["marker_leaks"]["candidate"])
 
+    # 25. PUI Availability Parity & Marker Leakage Tests
+    def test_pui_availability_marker_leakage_in_fetcher(self) -> None:
+        """Candidate leaking pui_availability_metadata marker into Solr is caught by fetcher."""
+        def dispatcher(path: str, params: Dict[str, List[str]]) -> Tuple[int, Dict[str, Any]]:
+            docs = [
+                {
+                    "id": "/repositories/2/top_containers/1",
+                    "title": "Box 1",
+                    comparator.MARKER_FIELD: ["pui_availability_metadata"],
+                }
+            ]
+            return 200, {"response": {"numFound": 1, "docs": docs}, "nextCursorMark": "done"}
+
+        StubSolrHandler.response_dispatcher = dispatcher
+        docs, num_found, leaks = comparator.fetch_solr_documents(
+            collection_url=self.server_url("candidate"),
+            repository_scope="/repositories/2",
+        )
+        self.assertEqual(leaks, ["/repositories/2/top_containers/1"])
+
+    def test_pui_availability_projection_key_leak_fails_parity(self) -> None:
+        """Candidate leaking _archivalist_pui_availability into Solr fails parity."""
+        baseline = {
+            "/repositories/2/top_containers/1": {
+                "id": "/repositories/2/top_containers/1",
+                "types": ["top_container", "pui_top_container", "pui", "pui_container", "pui"],
+                "publish": True,
+            }
+        }
+        candidate = {
+            "/repositories/2/top_containers/1": {
+                "id": "/repositories/2/top_containers/1",
+                "types": ["top_container", "pui_top_container", "pui", "pui_container", "pui"],
+                "publish": True,
+                "_archivalist_pui_availability": {
+                    "marker": "pui_availability_metadata",
+                    "uri": "/repositories/2/top_containers/1",
+                },
+            }
+        }
+        report = comparator.compare_documents(
+            baseline_docs=baseline,
+            candidate_docs=candidate,
+            ignored_fields=comparator.DEFAULT_IGNORED_FIELDS,
+            baseline_marker_leaks=[],
+            candidate_marker_leaks=[],
+        )
+        self.assertFalse(report["summary"]["parity"])
+        self.assertEqual(report["summary"]["missing_fields_count"], 1)
+        missing_record = report["differences"]["missing_fields"][0]
+        self.assertEqual(missing_record["id"], "/repositories/2/top_containers/1")
+        self.assertEqual(missing_record["missing_in_baseline"], ["_archivalist_pui_availability"])
+
+    def test_pui_availability_exact_parity_with_native_types(self) -> None:
+        """Candidate with clean PUI availability types matches native baseline perfectly."""
+        docs = {
+            "/repositories/2/top_containers/1": {
+                "id": "/repositories/2/top_containers/1",
+                "types": ["top_container", "pui_top_container", "pui", "pui_container", "pui"],
+                "publish": True,
+                "_version_": 100,
+            },
+            "/repositories/2/resources/5": {
+                "id": "/repositories/2/resources/5",
+                "types": ["resource", "pui_collection", "pui"],
+                "publish": True,
+                "_version_": 101,
+            },
+            "/repositories/2/archival_objects/12": {
+                "id": "/repositories/2/archival_objects/12",
+                "types": ["archival_object"],
+                "publish": False,
+                "_version_": 102,
+            },
+        }
+        report = comparator.compare_documents(
+            baseline_docs=docs,
+            candidate_docs=docs,
+            ignored_fields=comparator.DEFAULT_IGNORED_FIELDS,
+            baseline_marker_leaks=[],
+            candidate_marker_leaks=[],
+        )
+        self.assertTrue(report["summary"]["parity"])
+        self.assertEqual(report["summary"]["total_differences"], 0)
+        self.assertEqual(report["baseline_count"], 3)
+        self.assertEqual(report["candidate_count"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()

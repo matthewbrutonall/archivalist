@@ -146,7 +146,22 @@ falling back completely to native preparation with deterministic `build_fullreco
 reconstruction (preventing fullrecord pollution or duplication) on missing, malformed,
 or mismatched sidecar responses. Collection-management child documents are generated
 exclusively for staff enrichment; PUI indexing remains native, and Ruby retains sole
-ownership of Solr writes and stale-child deletions.
+ownership of Solr writes and stale-child deletions. Main index PUI availability
+preparation is gated separately under `AppConfig[:rust_pui_availability_preparation_enabled]`
+(disabled by default) and applies to the common/main index path (`IndexerCommon#apply_pui_fields`),
+remaining completely isolated from `PUIIndexer`. Ruby computes `RecordInheritance.has_type?(record_type)`
+and passes it in the batched `/index/documents` payload. Rust emits a narrowly scoped
+PUI-availability plan under `_archivalist_pui_availability` with capability marker
+`pui_availability_metadata`. `IndexerCommon` strips the projection and marker into a per-URI
+batch map before document prepare hooks and plugins run. At the final `apply_pui_fields`
+location, Ruby independently validates the plan and reads `doc['publish']` at apply time.
+On truthy publish, conditional type additions are appended; for `top_container`, `doc['publish']`
+is overridden by `is_linked_to_published_record` and `['pui_container', 'pui']` appended if
+truthy. Exact native append order and duplicates (e.g. published top_container linked to a
+published record acquiring `['pui_top_container', 'pui', 'pui_container', 'pui']`) and Ruby
+truthiness semantics are strictly preserved. If absent, malformed, extra-keyed, or mismatched,
+`IndexerCommon` discards the projection and executes unchanged native `apply_pui_fields` with
+zero partial mutation.
 
 ## Test and benchmark helpers
 

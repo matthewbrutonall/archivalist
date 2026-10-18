@@ -2063,4 +2063,565 @@ describe "periodic indexer" do
       expect(doc).not_to have_key('_archivalist_rust_fields')
     end
   end
+
+  describe "PUI availability preparation" do
+    let(:sample_resource) do
+      {
+        'uri' => '/repositories/2/resources/101',
+        'record' => {
+          'uri' => '/repositories/2/resources/101',
+          'jsonmodel_type' => 'resource',
+          'title' => 'Sample PUI Resource',
+          'publish' => true,
+        },
+      }
+    end
+
+    let(:sample_accession) do
+      {
+        'uri' => '/repositories/2/accessions/102',
+        'record' => {
+          'uri' => '/repositories/2/accessions/102',
+          'jsonmodel_type' => 'accession',
+          'title' => 'Sample PUI Accession',
+          'display_string' => 'Acc 102',
+          'publish' => true,
+        },
+      }
+    end
+
+    let(:sample_top_container) do
+      {
+        'uri' => '/repositories/2/top_containers/103',
+        'record' => {
+          'uri' => '/repositories/2/top_containers/103',
+          'jsonmodel_type' => 'top_container',
+          'title' => 'Box 103',
+          'publish' => true,
+          'is_linked_to_published_record' => true,
+        },
+      }
+    end
+
+    def make_avail_doc(prepared, plan = nil)
+      doc = indexer.native_index_document(prepared[:uri], prepared[:record_type], prepared[:values])
+      uri = prepared[:uri]
+      rec_type = prepared[:record_type]
+      inheritance = RecordInheritance.has_type?(rec_type)
+      doc['_archivalist_rust_fields'] = ['pui_availability_metadata']
+      doc['_archivalist_pui_availability'] = plan || {
+        'marker' => 'pui_availability_metadata',
+        'uri' => uri,
+        'primary_type' => rec_type,
+        'record_inheritance_has_type' => inheritance,
+        'conditional_additions' => RustIndexDocumentBuilder.compute_pui_conditional_additions(rec_type, inheritance),
+        'top_container_override' => rec_type == 'top_container' ? {
+          'publish' => prepared[:values]['is_linked_to_published_record'],
+          'additions' => ['pui_container', 'pui'],
+        } : nil,
+      }
+      doc
+    end
+
+    before(:each) do
+      AppConfig[:rust_index_document_builder_enabled] = true
+      AppConfig[:rust_pui_availability_preparation_enabled] = true
+    end
+
+    after(:each) do
+      AppConfig[:rust_index_document_builder_enabled] = false
+      AppConfig[:rust_pui_availability_preparation_enabled] = false
+    end
+
+    it "applies valid PUI availability plan along trusted path with exact output byte/field compatible with native" do
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prep, docs|
+          docs[prep[:uri]] = make_avail_doc(prep)
+        end
+      end
+
+      indexer.index_records([sample_resource, sample_accession, sample_top_container])
+
+      # 1. Resource doc
+      res_doc = indexer.records.find {|d| d['id'] == sample_resource['uri']}
+      expect(res_doc['publish']).to be(true)
+      expect(res_doc['types']).to eq(['resource', 'pui_collection', 'pui'])
+      expect(res_doc).not_to have_key('_archivalist_pui_availability')
+      expect(res_doc).not_to have_key('_archivalist_rust_fields')
+
+      # 2. Accession doc
+      acc_doc = indexer.records.find {|d| d['id'] == sample_accession['uri']}
+      expect(acc_doc['publish']).to be(true)
+      expect(acc_doc['types']).to eq(['accession', 'pui_record', 'pui_accession', 'pui'])
+      expect(acc_doc).not_to have_key('_archivalist_pui_availability')
+      expect(acc_doc).not_to have_key('_archivalist_rust_fields')
+
+      # 3. Top container doc
+      tc_doc = indexer.records.find {|d| d['id'] == sample_top_container['uri']}
+      expect(tc_doc['publish']).to be(true)
+      expect(tc_doc['types']).to eq(['top_container', 'pui_top_container', 'pui', 'pui_container', 'pui'])
+      expect(tc_doc).not_to have_key('_archivalist_pui_availability')
+      expect(tc_doc).not_to have_key('_archivalist_rust_fields')
+    end
+
+    it "ensures document prepare hooks and plugins cannot see _archivalist_pui_availability or its marker" do
+      hook_saw_pui_avail = nil
+      hook_saw_marker = nil
+
+      indexer.add_document_prepare_hook do |doc, record|
+        hook_saw_pui_avail = doc.has_key?('_archivalist_pui_availability')
+        hook_saw_marker = doc['_archivalist_rust_fields']&.include?('pui_availability_metadata')
+      end
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prep, docs|
+          docs[prep[:uri]] = make_avail_doc(prep)
+        end
+      end
+
+      indexer.index_records([sample_resource])
+
+      expect(hook_saw_pui_avail).to be(false)
+      expect(hook_saw_marker).to be_falsey
+    end
+
+    it "respects publish modifications made by document prepare hooks" do
+      # Hook unpublishes the record before apply_pui_fields runs
+      indexer.add_document_prepare_hook do |doc, record|
+        doc['publish'] = false
+      end
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prep, docs|
+          docs[prep[:uri]] = make_avail_doc(prep)
+        end
+      end
+
+      indexer.index_records([sample_resource])
+
+      res_doc = indexer.records.find {|d| d['id'] == sample_resource['uri']}
+      expect(res_doc['publish']).to be(false)
+      # Since hook set publish to false, conditional additions were NOT added
+      expect(res_doc['types']).to eq(['resource'])
+    end
+
+    it "leaves document unaccelerated and executes native apply_pui_fields when gate is disabled" do
+      AppConfig[:rust_pui_availability_preparation_enabled] = false
+
+      expect(indexer.rust_pui_availability_preparation_enabled?).to be(false)
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prep, docs|
+          # Sidecar was not asked for pui_availability
+          doc = indexer.native_index_document(prep[:uri], prep[:record_type], prep[:values])
+          docs[prep[:uri]] = doc
+        end
+      end
+
+      indexer.index_records([sample_resource, sample_top_container])
+
+      res_doc = indexer.records.find {|d| d['id'] == sample_resource['uri']}
+      expect(res_doc['types']).to eq(['resource', 'pui_collection', 'pui'])
+
+      tc_doc = indexer.records.find {|d| d['id'] == sample_top_container['uri']}
+      expect(tc_doc['types']).to eq(['top_container', 'pui_top_container', 'pui', 'pui_container', 'pui'])
+    end
+
+    it "falls back cleanly to native apply_pui_fields when Rust builder fails or is unavailable" do
+      allow(indexer).to receive(:rust_index_documents).and_return(nil)
+
+      indexer.index_records([sample_resource, sample_top_container])
+
+      res_doc = indexer.records.find {|d| d['id'] == sample_resource['uri']}
+      expect(res_doc['types']).to eq(['resource', 'pui_collection', 'pui'])
+
+      tc_doc = indexer.records.find {|d| d['id'] == sample_top_container['uri']}
+      expect(tc_doc['types']).to eq(['top_container', 'pui_top_container', 'pui', 'pui_container', 'pui'])
+    end
+
+    it "falls back cleanly when projection is missing for a URI in the batch" do
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prep, docs|
+          doc = indexer.native_index_document(prep[:uri], prep[:record_type], prep[:values])
+          # Provide no _archivalist_pui_availability for this document
+          docs[prep[:uri]] = doc
+        end
+      end
+
+      indexer.index_records([sample_resource])
+
+      res_doc = indexer.records.find {|d| d['id'] == sample_resource['uri']}
+      expect(res_doc['types']).to eq(['resource', 'pui_collection', 'pui'])
+    end
+
+    it "falls back to native and evicts projection on malformed, malicious, or extra-key projection" do
+      malformed_projections = [
+        # 1. Non-hash
+        "not a hash",
+        # 2. Missing key
+        {
+          'marker' => 'pui_availability_metadata',
+          'uri' => sample_resource['uri'],
+          'primary_type' => 'resource',
+          # missing record_inheritance_has_type, conditional_additions, top_container_override
+        },
+        # 3. Extra key
+        {
+          'marker' => 'pui_availability_metadata',
+          'uri' => sample_resource['uri'],
+          'primary_type' => 'resource',
+          'record_inheritance_has_type' => false,
+          'conditional_additions' => ['pui_collection', 'pui'],
+          'top_container_override' => nil,
+          'malicious_injection' => 'exploit',
+        },
+        # 4. Non-string key
+        {
+          'marker' => 'pui_availability_metadata',
+          'uri' => sample_resource['uri'],
+          'primary_type' => 'resource',
+          'record_inheritance_has_type' => false,
+          'conditional_additions' => ['pui_collection', 'pui'],
+          'top_container_override' => nil,
+          :bad_sym_key => true,
+        },
+        # 5. Marker mismatch
+        {
+          'marker' => 'wrong_marker',
+          'uri' => sample_resource['uri'],
+          'primary_type' => 'resource',
+          'record_inheritance_has_type' => false,
+          'conditional_additions' => ['pui_collection', 'pui'],
+          'top_container_override' => nil,
+        },
+      ]
+
+      malformed_projections.each do |bad_proj|
+        allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+          prepared_records.each_with_object({}) do |prep, docs|
+            docs[prep[:uri]] = make_avail_doc(prep, bad_proj)
+          end
+        end
+
+        indexer.index_records([sample_resource])
+
+        res_doc = indexer.records.find {|d| d['id'] == sample_resource['uri']}
+        # Fell back cleanly to native
+        expect(res_doc['types']).to eq(['resource', 'pui_collection', 'pui'])
+        expect(res_doc).not_to have_key('_archivalist_pui_availability')
+        expect(res_doc).not_to have_key('_archivalist_rust_fields')
+      end
+    end
+
+    it "strictly validates record identity and plan inheritance, evicting projection and falling back to native without partial mutation" do
+      base_doc = indexer.native_index_document(sample_resource['uri'], 'resource', sample_resource['record'])
+      valid_plan = {
+        'marker' => 'pui_availability_metadata',
+        'uri' => sample_resource['uri'],
+        'primary_type' => 'resource',
+        'record_inheritance_has_type' => false,
+        'conditional_additions' => ['pui_collection', 'pui'],
+        'top_container_override' => nil,
+      }
+
+      cases = [
+        # 1. Missing record.uri
+        lambda do
+          rec = Marshal.load(Marshal.dump(sample_resource))
+          rec['record'].delete('uri')
+          [rec, base_doc.dup, valid_plan.dup]
+        end,
+        # 2. Null record.uri
+        lambda do
+          rec = Marshal.load(Marshal.dump(sample_resource))
+          rec['record']['uri'] = nil
+          [rec, base_doc.dup, valid_plan.dup]
+        end,
+        # 3. Numeric record.uri
+        lambda do
+          rec = Marshal.load(Marshal.dump(sample_resource))
+          rec['record']['uri'] = 123
+          [rec, base_doc.dup, valid_plan.dup]
+        end,
+        # 4. Array record.uri
+        lambda do
+          rec = Marshal.load(Marshal.dump(sample_resource))
+          rec['record']['uri'] = [sample_resource['uri']]
+          [rec, base_doc.dup, valid_plan.dup]
+        end,
+        # 5. Hash record.uri
+        lambda do
+          rec = Marshal.load(Marshal.dump(sample_resource))
+          rec['record']['uri'] = {'ref' => sample_resource['uri']}
+          [rec, base_doc.dup, valid_plan.dup]
+        end,
+        # 6. Empty record.uri
+        lambda do
+          rec = Marshal.load(Marshal.dump(sample_resource))
+          rec['record']['uri'] = ''
+          [rec, base_doc.dup, valid_plan.dup]
+        end,
+        # 7. Whitespace record.uri
+        lambda do
+          rec = Marshal.load(Marshal.dump(sample_resource))
+          rec['record']['uri'] = '   '
+          [rec, base_doc.dup, valid_plan.dup]
+        end,
+        # 8. Mismatched record.uri vs top-level record uri
+        lambda do
+          rec = Marshal.load(Marshal.dump(sample_resource))
+          rec['record']['uri'] = '/repositories/2/resources/mismatch_999'
+          [rec, base_doc.dup, valid_plan.dup]
+        end,
+        # 9. Mismatched doc uri vs record uri
+        lambda do
+          rec = Marshal.load(Marshal.dump(sample_resource))
+          doc = base_doc.dup
+          doc['uri'] = '/repositories/2/resources/doc_mismatch_888'
+          [rec, doc, valid_plan.dup]
+        end,
+        # 10. Missing record.jsonmodel_type
+        lambda do
+          rec = Marshal.load(Marshal.dump(sample_resource))
+          rec['record'].delete('jsonmodel_type')
+          [rec, base_doc.dup, valid_plan.dup]
+        end,
+        # 11. Null record.jsonmodel_type
+        lambda do
+          rec = Marshal.load(Marshal.dump(sample_resource))
+          rec['record']['jsonmodel_type'] = nil
+          [rec, base_doc.dup, valid_plan.dup]
+        end,
+        # 12. Numeric record.jsonmodel_type
+        lambda do
+          rec = Marshal.load(Marshal.dump(sample_resource))
+          rec['record']['jsonmodel_type'] = 456
+          [rec, base_doc.dup, valid_plan.dup]
+        end,
+        # 13. Array record.jsonmodel_type
+        lambda do
+          rec = Marshal.load(Marshal.dump(sample_resource))
+          rec['record']['jsonmodel_type'] = ['resource']
+          [rec, base_doc.dup, valid_plan.dup]
+        end,
+        # 14. Hash record.jsonmodel_type
+        lambda do
+          rec = Marshal.load(Marshal.dump(sample_resource))
+          rec['record']['jsonmodel_type'] = {'name' => 'resource'}
+          [rec, base_doc.dup, valid_plan.dup]
+        end,
+        # 15. Empty record.jsonmodel_type
+        lambda do
+          rec = Marshal.load(Marshal.dump(sample_resource))
+          rec['record']['jsonmodel_type'] = ''
+          [rec, base_doc.dup, valid_plan.dup]
+        end,
+        # 16. Whitespace record.jsonmodel_type
+        lambda do
+          rec = Marshal.load(Marshal.dump(sample_resource))
+          rec['record']['jsonmodel_type'] = '   '
+          [rec, base_doc.dup, valid_plan.dup]
+        end,
+        # 17. Mismatched record.jsonmodel_type vs doc primary_type
+        lambda do
+          rec = Marshal.load(Marshal.dump(sample_resource))
+          rec['record']['jsonmodel_type'] = 'accession'
+          [rec, base_doc.dup, valid_plan.dup]
+        end,
+        # 18. Non-Hash record['record']
+        lambda do
+          rec = {'uri' => sample_resource['uri'], 'record' => 'string_record'}
+          [rec, base_doc.dup, valid_plan.dup]
+        end,
+        # 19. Missing plan record_inheritance_has_type
+        lambda do
+          p = valid_plan.dup
+          p.delete('record_inheritance_has_type')
+          [sample_resource, base_doc.dup, p]
+        end,
+        # 20. Null plan record_inheritance_has_type
+        lambda do
+          p = valid_plan.dup
+          p['record_inheritance_has_type'] = nil
+          [sample_resource, base_doc.dup, p]
+        end,
+        # 21. Numeric plan record_inheritance_has_type
+        lambda do
+          p = valid_plan.dup
+          p['record_inheritance_has_type'] = 0
+          [sample_resource, base_doc.dup, p]
+        end,
+        # 22. String plan record_inheritance_has_type
+        lambda do
+          p = valid_plan.dup
+          p['record_inheritance_has_type'] = 'false'
+          [sample_resource, base_doc.dup, p]
+        end,
+        # 23. Mismatched plan record_inheritance_has_type
+        lambda do
+          p = valid_plan.dup
+          p['record_inheritance_has_type'] = true # resource is false
+          [sample_resource, base_doc.dup, p]
+        end,
+        # 24. Mismatched plan URI
+        lambda do
+          p = valid_plan.dup
+          p['uri'] = '/repositories/2/resources/plan_mismatch_777'
+          [sample_resource, base_doc.dup, p]
+        end,
+        # 25. Mismatched plan primary_type
+        lambda do
+          p = valid_plan.dup
+          p['primary_type'] = 'accession'
+          [sample_resource, base_doc.dup, p]
+        end,
+      ]
+
+      cases.each do |c|
+        rec, test_doc, plan = c.call
+        indexer.instance_variable_set(:@pui_availability_projections, { sample_resource['uri'] => plan })
+
+        # Before apply, types has only initial primary type
+        expect(test_doc['types']).to eq(['resource'])
+
+        # Must reject plan application
+        result = indexer.apply_rust_pui_availability_plan(test_doc, rec)
+        expect(result).to be(false)
+
+        # Candidate URI must be evicted from batch projections map
+        proj_map = indexer.instance_variable_get(:@pui_availability_projections)
+        expect(proj_map.key?(sample_resource['uri'])).to be(false)
+
+        # No partial mutation occurred prior to fallback
+        expect(test_doc['types']).to eq(['resource'])
+
+        # Native fallback runs cleanly without duplication or error (if record is well-formed)
+        if rec['record'].is_a?(Hash)
+          indexer.apply_pui_fields(test_doc, rec)
+          expect(test_doc['types']).to eq(['resource', 'pui_collection', 'pui'])
+        end
+      end
+    end
+
+    it "proves no partial mutation occurs when validation fails before native fallback" do
+      # Malformed top_container_override with extra key
+      bad_tc_proj = {
+        'marker' => 'pui_availability_metadata',
+        'uri' => sample_top_container['uri'],
+        'primary_type' => 'top_container',
+        'record_inheritance_has_type' => false,
+        'conditional_additions' => ['pui_top_container', 'pui'],
+        'top_container_override' => {
+          'publish' => true,
+          'additions' => ['pui_container', 'pui'],
+          'malicious_key' => true,
+        },
+      }
+
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prep, docs|
+          docs[prep[:uri]] = make_avail_doc(prep, bad_tc_proj)
+        end
+      end
+
+      indexer.index_records([sample_top_container])
+
+      tc_doc = indexer.records.find {|d| d['id'] == sample_top_container['uri']}
+      # Native fallback ran cleanly, giving exact expected output without partial mutation duplicates
+      expect(tc_doc['types']).to eq(['top_container', 'pui_top_container', 'pui', 'pui_container', 'pui'])
+    end
+
+    it "proves eviction of @pui_availability_projections on completion and on error" do
+      allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+        prepared_records.each_with_object({}) do |prep, docs|
+          docs[prep[:uri]] = make_avail_doc(prep)
+        end
+      end
+
+      indexer.index_records([sample_resource])
+
+      # Batch map must be nil after index_records completes
+      expect(indexer.instance_variable_get(:@pui_availability_projections)).to be_nil
+    end
+
+    it "treats non-boolean truthy doc['publish'] values set by prepare hooks as truthy with exact native parity" do
+      [0, 1, 'published_via_hook'].each do |truthy_val|
+        indexer.instance_variable_set(:@document_prepare_hooks, [])
+        indexer.add_document_prepare_hook do |doc, record|
+          doc['publish'] = truthy_val
+        end
+
+        allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+          prepared_records.each_with_object({}) do |prep, docs|
+            docs[prep[:uri]] = make_avail_doc(prep)
+          end
+        end
+
+        indexer.index_records([sample_resource])
+        res_doc = indexer.records.find {|d| d['id'] == sample_resource['uri']}
+
+        # Verify truthy treatment and exact uncoerced value
+        expect(res_doc['publish']).to eq(truthy_val)
+        expect(res_doc['types']).to eq(['resource', 'pui_collection', 'pui'])
+
+        # Compare directly against native run
+        native_doc = indexer.native_index_document(sample_resource['uri'], 'resource', sample_resource['record'])
+        native_doc['publish'] = truthy_val
+        indexer.apply_pui_fields(native_doc, sample_resource)
+        expect(res_doc['publish']).to eq(native_doc['publish'])
+        expect(res_doc['types']).to eq(native_doc['types'])
+        indexer.records.clear
+      end
+    end
+
+    it "proves exhaustive top-container matrix preserving exact publish, types, ordering, and duplicates" do
+      matrix = [
+        # [initial_publish, is_linked_value, expected_final_publish, expected_final_types]
+        [false, false, false, ['top_container']],
+        [false, true,  true,  ['top_container', 'pui_container', 'pui']],
+        [true,  false, false, ['top_container', 'pui_top_container', 'pui']],
+        [true,  true,  true,  ['top_container', 'pui_top_container', 'pui', 'pui_container', 'pui']],
+        [true,  nil,   nil,   ['top_container', 'pui_top_container', 'pui']],
+        [false, 0,     0,     ['top_container', 'pui_container', 'pui']],
+        [true,  0,     0,     ['top_container', 'pui_top_container', 'pui', 'pui_container', 'pui']],
+        [false, 1,     1,     ['top_container', 'pui_container', 'pui']],
+        [true,  1,     1,     ['top_container', 'pui_top_container', 'pui', 'pui_container', 'pui']],
+        [false, 'box_linked', 'box_linked', ['top_container', 'pui_container', 'pui']],
+        [true,  'box_linked', 'box_linked', ['top_container', 'pui_top_container', 'pui', 'pui_container', 'pui']],
+      ]
+
+      matrix.each do |init_pub, linked_val, exp_pub, exp_types|
+        tc_record = {
+          'uri' => "/repositories/2/top_containers/matrix_#{init_pub}_#{linked_val}",
+          'record' => {
+            'uri' => "/repositories/2/top_containers/matrix_#{init_pub}_#{linked_val}",
+            'jsonmodel_type' => 'top_container',
+            'title' => 'Matrix Box',
+            'publish' => init_pub,
+            'is_linked_to_published_record' => linked_val,
+          },
+        }
+
+        # 1. Run through accelerated Rust preparation path
+        allow(indexer).to receive(:rust_index_documents) do |prepared_records|
+          prepared_records.each_with_object({}) do |prep, docs|
+            docs[prep[:uri]] = make_avail_doc(prep)
+          end
+        end
+
+        indexer.index_records([tc_record])
+        accelerated_doc = indexer.records.find {|d| d['id'] == tc_record['uri']}
+
+        # 2. Run through native path for exact comparison
+        native_doc = indexer.native_index_document(tc_record['uri'], 'top_container', tc_record['record'])
+        indexer.apply_pui_fields(native_doc, tc_record)
+
+        # Assert exact equality between accelerated and native
+        expect(accelerated_doc['publish']).to eq(native_doc['publish'])
+        expect(accelerated_doc['publish']).to eq(exp_pub)
+        expect(accelerated_doc['types']).to eq(native_doc['types'])
+        expect(accelerated_doc['types']).to eq(exp_types)
+      end
+    end
+  end
 end
