@@ -33,6 +33,18 @@ class RustIndexDocumentBuilder
     'create_time',
   ].freeze
 
+  PUI_ROUTING_FIELDS = [
+    'marker',
+    'id',
+    'pui_parent_id',
+    'types',
+  ].freeze
+
+  PUI_NOTES_FIELDS = [
+    'marker',
+    'notes_published',
+  ].freeze
+
   def initialize(base_url, timeout_seconds)
     @url = URI.parse("#{base_url.to_s.chomp('/')}/index/documents")
     @timeout_seconds = timeout_seconds.to_f
@@ -367,12 +379,16 @@ class RustIndexDocumentBuilder
         raise "response enrichment fields missing for #{uri}: #{missing.join(', ')}" unless missing.empty?
       elsif input['prepare_pui_final']
         validate_pui_final_projection!(document, input)
+        validate_pui_routing_projection!(document, input)
+        validate_pui_notes_projection!(document, input)
       elsif document.has_key?('_archivalist_rust_fields')
         raise "unexpected response enrichment marker for #{uri}"
       end
 
-      if !input['prepare_pui_final'] && document.has_key?('_archivalist_pui_final')
-        raise "unexpected response pui final projection marker for #{uri}"
+      if !input['prepare_pui_final'] && (document.has_key?('_archivalist_pui_final') ||
+                                         document.has_key?('_archivalist_pui_routing') ||
+                                         document.has_key?('_archivalist_pui_notes'))
+        raise "unexpected response pui projection marker for #{uri}"
       end
 
       cm = record.is_a?(Hash) && record['collection_management']
@@ -711,7 +727,7 @@ class RustIndexDocumentBuilder
 
   def validate_pui_final_projection!(document, input)
     uri = input['uri']
-    unless document['_archivalist_rust_fields'] == ['pui_final_document_metadata']
+    unless document['_archivalist_rust_fields'] == ['pui_final_document_metadata', 'pui_routing_metadata', 'pui_notes_metadata']
       raise "response pui final marker mismatch for #{uri}"
     end
     unless document.has_key?('_archivalist_pui_final') && document['_archivalist_pui_final'].is_a?(Hash)
@@ -729,6 +745,23 @@ class RustIndexDocumentBuilder
     end
     if document.has_key?('fullrecord')
       raise "unexpected unpublished fullrecord field in pui final document for #{uri}"
+    end
+
+    record = input['record']
+    raise "missing record for #{uri}" unless record.is_a?(Hash)
+    rec_uri = record['uri']
+    unless rec_uri.is_a?(String) && !rec_uri.empty?
+      raise "record.uri must be a non-empty string for #{uri}"
+    end
+    unless rec_uri == input['uri']
+      raise "record uri mismatch for #{uri}: expected #{input['uri']}, got #{rec_uri}"
+    end
+    rec_type = record['jsonmodel_type']
+    unless rec_type.is_a?(String) && !rec_type.empty?
+      raise "record.jsonmodel_type must be a non-empty string for #{uri}"
+    end
+    unless rec_type == input['record_type']
+      raise "record jsonmodel_type mismatch for #{uri}: expected #{input['record_type']}, got #{rec_type}"
     end
 
     candidate = input['pui_candidate_record']
@@ -798,6 +831,76 @@ class RustIndexDocumentBuilder
     expected_fullrecord = extract_published_strings(expected_clean)
     unless pui_final['fullrecord_published'] == expected_fullrecord
       raise "pui final fullrecord_published mismatch for #{uri}"
+    end
+  end
+
+  def validate_pui_routing_projection!(document, input)
+    uri = input['uri']
+    unless document.has_key?('_archivalist_pui_routing') && document['_archivalist_pui_routing'].is_a?(Hash)
+      raise "missing _archivalist_pui_routing for #{uri}"
+    end
+    routing = document['_archivalist_pui_routing']
+    if routing.keys.any? { |k| !k.is_a?(String) }
+      raise "pui routing contains non-string keys for #{uri}: #{routing.keys.inspect}"
+    end
+    missing_keys = PUI_ROUTING_FIELDS - routing.keys
+    unless missing_keys.empty?
+      raise "pui routing missing required fields for #{uri}: #{missing_keys.sort.join(', ')}"
+    end
+    extra_keys = routing.keys - PUI_ROUTING_FIELDS
+    unless extra_keys.empty?
+      raise "pui routing contains unexpected fields for #{uri}: #{extra_keys.sort.join(', ')}"
+    end
+    unless routing['marker'] == 'pui_routing_metadata'
+      raise "pui routing marker mismatch for #{uri}"
+    end
+    expected_id = "#{uri}#pui"
+    unless routing['id'] == expected_id
+      raise "pui routing id mismatch for #{uri}: expected #{expected_id}, got #{routing['id']}"
+    end
+    unless routing['pui_parent_id'] == uri
+      raise "pui routing pui_parent_id mismatch for #{uri}: expected #{uri}, got #{routing['pui_parent_id']}"
+    end
+    expected_types = ['pui', "pui_#{input['record_type']}", 'pui_record', 'pui_only']
+    unless routing['types'] == expected_types
+      raise "pui routing types mismatch for #{uri}: expected #{expected_types.inspect}, got #{routing['types'].inspect}"
+    end
+  end
+
+  def validate_pui_notes_projection!(document, input)
+    uri = input['uri']
+    unless document.has_key?('_archivalist_pui_notes') && document['_archivalist_pui_notes'].is_a?(Hash)
+      raise "missing _archivalist_pui_notes for #{uri}"
+    end
+    notes_proj = document['_archivalist_pui_notes']
+    if notes_proj.keys.any? { |k| !k.is_a?(String) }
+      raise "pui notes contains non-string keys for #{uri}: #{notes_proj.keys.inspect}"
+    end
+    missing_keys = PUI_NOTES_FIELDS - notes_proj.keys
+    unless missing_keys.empty?
+      raise "pui notes missing required fields for #{uri}: #{missing_keys.sort.join(', ')}"
+    end
+    extra_keys = notes_proj.keys - PUI_NOTES_FIELDS
+    unless extra_keys.empty?
+      raise "pui notes contains unexpected fields for #{uri}: #{extra_keys.sort.join(', ')}"
+    end
+    unless notes_proj['marker'] == 'pui_notes_metadata'
+      raise "pui notes marker mismatch for #{uri}"
+    end
+    record = input['record']
+    raw_notes = record.is_a?(Hash) ? record['notes'] : nil
+    if raw_notes.nil? || raw_notes == false
+      unless notes_proj.key?('notes_published') && notes_proj['notes_published'].nil?
+        raise "pui notes_published must be nil when record notes is absent or false for #{uri}"
+      end
+    else
+      unless notes_proj['notes_published'].is_a?(Array)
+        raise "pui notes_published must be an array when record notes is present for #{uri}"
+      end
+      expected_notes = extract_published_strings(raw_notes)
+      unless notes_proj['notes_published'] == expected_notes
+        raise "pui notes_published mismatch for #{uri}: expected #{expected_notes.inspect}, got #{notes_proj['notes_published'].inspect}"
+      end
     end
   end
 

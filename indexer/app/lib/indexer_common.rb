@@ -1630,6 +1630,8 @@ class IndexerCommon
   def index_records(records, timing = IndexerTiming.new)
     batch = IndexBatch.new
     @pui_final_projections = {}
+    @pui_routing_projections = {}
+    @pui_notes_projections = {}
 
     records = dedupe_by_uri(records)
 
@@ -1674,8 +1676,18 @@ class IndexerCommon
           pui_final = doc.delete('_archivalist_pui_final')
           @pui_final_projections[uri] = pui_final if pui_final
         end
+        if doc.has_key?('_archivalist_pui_routing')
+          pui_routing = doc.delete('_archivalist_pui_routing')
+          @pui_routing_projections[uri] = pui_routing if pui_routing
+        end
+        if doc.has_key?('_archivalist_pui_notes')
+          pui_notes = doc.delete('_archivalist_pui_notes')
+          @pui_notes_projections[uri] = pui_notes if pui_notes
+        end
         if doc['_archivalist_rust_fields'].is_a?(Array)
           doc['_archivalist_rust_fields'].delete('pui_final_document_metadata')
+          doc['_archivalist_rust_fields'].delete('pui_routing_metadata')
+          doc['_archivalist_rust_fields'].delete('pui_notes_metadata')
           doc.delete('_archivalist_rust_fields') if doc['_archivalist_rust_fields'].empty?
         elsif doc['_archivalist_rust_fields'] == ['pui_final_document_metadata']
           doc.delete('_archivalist_rust_fields')
@@ -1709,6 +1721,8 @@ class IndexerCommon
         end
       end
       @pui_final_projections = nil
+      @pui_routing_projections = nil
+      @pui_notes_projections = nil
     end
 
     index_batch(batch, timing)

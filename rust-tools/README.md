@@ -114,18 +114,20 @@ The search, resource-tree, and index-document gates are automated by
 `scripts/canary_index_document_builder.sh`. Staff-index enrichment parity is
 checked at the resource and accession level by `scripts/canary_index_document_enrichment.sh`,
 and across complete disposable-repository reindexes by the full STAFF index
-parity comparator, `scripts/compare_staff_index_parity.py`. PUI document privacy
-preparation is gated separately under `AppConfig[:rust_pui_document_preparation_enabled]`
+parity comparator, `scripts/compare_staff_index_parity.py`. PUI document preparation is gated separately under `AppConfig[:rust_pui_document_preparation_enabled]`
 (disabled by default). Inheritance semantics, top-container publication decisions
 (`is_linked_to_published_record` / `pui_container`), LargeTree/ordered-record indexing,
-and Solr writes remain Ruby-owned. When trusted under the `pui_final_document_metadata`
-capability marker, Rust owns deterministic final public JSON privacy preparation
-(removing ancestors, top-container `internal_note`, and container-profile `notes` across
-nested instances) and published-only fullrecord extraction (`fullrecord_published`),
-while never emitting an unpublished `fullrecord` field. Ruby strictly validates exact
-recursive JSON equality, serialization, and published string values before trusting
-the projection, falling back completely to unchanged native `PUIIndexer#final_doc_rules`
-on missing, malformed, or mismatched sidecar responses. Job-specific dynamic I18n
+and Solr writes remain Ruby-owned. When trusted under capability markers
+(`pui_final_document_metadata`, `pui_routing_metadata`, and `pui_notes_metadata`),
+Rust prepares deterministic final public JSON privacy preparation (removing ancestors,
+top-container `internal_note`, and container-profile `notes` across nested instances)
+and published-only fullrecord extraction (`fullrecord_published`), PUI identity/routing metadata
+(`id: "#{parent_id}#pui"`, `pui_parent_id: parent_id`, and exact types additions in native order),
+and direct-only published note extraction (`notes_published`). Ruby strictly validates exact
+values, types, recursive JSON equality, serialization, and published string values at the
+corresponding logical hook positions (`configure_doc_rules`, `add_notes`, `final_doc_rules`)
+before trusting each projection, falling back completely to unchanged native PUIIndexer
+logic on missing, malformed, or mismatched sidecar responses. Job-specific dynamic I18n
 translation, local timestamps, and output-file discovery remain native because
 localization and external I/O are handled by Ruby. Dynamic-enum schema derivation
 and ARK enablement configuration remain in Ruby; Rust handles deterministic recursive

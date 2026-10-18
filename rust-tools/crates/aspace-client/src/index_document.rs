@@ -5,6 +5,10 @@ use std::fmt;
 pub const MAX_INDEX_DOCUMENT_BATCH: usize = 1_000;
 pub const PUI_FINAL_DOCUMENT_METADATA_MARKER: &str = "pui_final_document_metadata";
 pub const PUI_FINAL_DOCUMENTS_KEY: &str = "_archivalist_pui_final";
+pub const PUI_ROUTING_METADATA_MARKER: &str = "pui_routing_metadata";
+pub const PUI_ROUTING_DOCUMENTS_KEY: &str = "_archivalist_pui_routing";
+pub const PUI_NOTES_METADATA_MARKER: &str = "pui_notes_metadata";
+pub const PUI_NOTES_DOCUMENTS_KEY: &str = "_archivalist_pui_notes";
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Clone)]
 pub struct IndexDocumentInput {
@@ -2780,6 +2784,7 @@ fn add_pui_final_fields(
     document: &mut Map<String, Value>,
     input: &IndexDocumentInput,
 ) -> Result<(), IndexDocumentError> {
+    // 1. Strict validation of candidate record identity
     let candidate_val = input
         .pui_candidate_record
         .as_ref()
@@ -2792,6 +2797,9 @@ fn add_pui_final_fields(
         .get("uri")
         .and_then(Value::as_str)
         .ok_or_else(|| error("pui_candidate_record.uri must be a string"))?;
+    if cand_uri.trim().is_empty() {
+        return Err(error("pui_candidate_record.uri must not be empty"));
+    }
     if cand_uri != input.uri {
         return Err(error(format!(
             "pui_candidate_record uri '{cand_uri}' does not match wrapper uri '{}'",
@@ -2803,6 +2811,11 @@ fn add_pui_final_fields(
         .get("jsonmodel_type")
         .and_then(Value::as_str)
         .ok_or_else(|| error("pui_candidate_record.jsonmodel_type must be a string"))?;
+    if cand_type.trim().is_empty() {
+        return Err(error(
+            "pui_candidate_record.jsonmodel_type must not be empty",
+        ));
+    }
     if cand_type != input.record_type {
         return Err(error(format!(
             "pui_candidate_record jsonmodel_type '{cand_type}' does not match wrapper record_type '{}'",
@@ -2810,29 +2823,122 @@ fn add_pui_final_fields(
         )));
     }
 
+    // 2. Strict validation of direct record identity
+    let record_obj = input
+        .record
+        .as_object()
+        .ok_or_else(|| error("record must be a JSON object"))?;
+    let rec_uri = record_obj
+        .get("uri")
+        .and_then(Value::as_str)
+        .ok_or_else(|| error("record.uri must be a string"))?;
+    if rec_uri.trim().is_empty() {
+        return Err(error("record.uri must not be empty"));
+    }
+    if rec_uri != input.uri {
+        return Err(error(format!(
+            "record uri '{rec_uri}' does not match wrapper uri '{}'",
+            input.uri
+        )));
+    }
+    let rec_type = record_obj
+        .get("jsonmodel_type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| error("record.jsonmodel_type must be a string"))?;
+    if rec_type.trim().is_empty() {
+        return Err(error("record.jsonmodel_type must not be empty"));
+    }
+    if rec_type != input.record_type {
+        return Err(error(format!(
+            "record jsonmodel_type '{rec_type}' does not match wrapper record_type '{}'",
+            input.record_type
+        )));
+    }
+
+    // 3. Prepare PUI identity / routing metadata projection
+    let mut routing_map = Map::new();
+    routing_map.insert(
+        "marker".to_string(),
+        Value::String(PUI_ROUTING_METADATA_MARKER.to_string()),
+    );
+    routing_map.insert(
+        "id".to_string(),
+        Value::String(format!("{}#pui", input.uri)),
+    );
+    routing_map.insert(
+        "pui_parent_id".to_string(),
+        Value::String(input.uri.clone()),
+    );
+    routing_map.insert(
+        "types".to_string(),
+        Value::Array(vec![
+            Value::String("pui".to_string()),
+            Value::String(format!("pui_{}", input.record_type)),
+            Value::String("pui_record".to_string()),
+            Value::String("pui_only".to_string()),
+        ]),
+    );
+    document.insert(
+        PUI_ROUTING_DOCUMENTS_KEY.to_string(),
+        Value::Object(routing_map),
+    );
+
+    // 4. Prepare PUI notes_published projection from direct-only record's notes
+    let mut notes_map = Map::new();
+    notes_map.insert(
+        "marker".to_string(),
+        Value::String(PUI_NOTES_METADATA_MARKER.to_string()),
+    );
+    let notes_val = record_obj.get("notes");
+    let has_notes = !matches!(
+        notes_val,
+        None | Some(Value::Null) | Some(Value::Bool(false))
+    );
+    if has_notes {
+        let (published_note_strings, _unpublished) = extract_string_values(notes_val.unwrap());
+        notes_map.insert(
+            "notes_published".to_string(),
+            Value::Array(
+                published_note_strings
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+    } else {
+        notes_map.insert("notes_published".to_string(), Value::Null);
+    }
+    document.insert(
+        PUI_NOTES_DOCUMENTS_KEY.to_string(),
+        Value::Object(notes_map),
+    );
+
+    // 5. Prepare final PUI document privacy and fullrecord projection
     let mut clean_candidate = candidate_obj.clone();
 
-    // 1. Remove ancestors from the final PUI JSON candidate
+    // Remove ancestors from the final PUI JSON candidate
     clean_candidate.remove("ancestors");
 
-    // 2. Remove top-container internal_note and container-profile notes within instances
+    // Remove top-container internal_note and container-profile notes within instances
     if let Some(Value::Array(instances)) = clean_candidate.get_mut("instances") {
         clean_pui_candidate_instances(instances);
     }
 
-    // 3. Serialize privacy-clean fully inherited record into final json
+    // Serialize privacy-clean fully inherited record into final json
     let pui_json_string = serde_json::to_string(&clean_candidate)
         .map_err(|err| error(format!("failed to serialize clean PUI record: {err}")))?;
 
-    // 4. Generate fullrecord_published using exact native extract_string_values semantics (:published_only)
+    // Generate fullrecord_published using exact native extract_string_values semantics (:published_only)
     let (published_strings, _unpublished) = extract_string_values(&Value::Object(clean_candidate));
 
-    // 5. Capability marker and PUI final payload
+    // Capability markers and PUI final payload
     document.insert(
         "_archivalist_rust_fields".to_string(),
-        Value::Array(vec![Value::String(
-            PUI_FINAL_DOCUMENT_METADATA_MARKER.to_string(),
-        )]),
+        Value::Array(vec![
+            Value::String(PUI_FINAL_DOCUMENT_METADATA_MARKER.to_string()),
+            Value::String(PUI_ROUTING_METADATA_MARKER.to_string()),
+            Value::String(PUI_NOTES_METADATA_MARKER.to_string()),
+        ]),
     );
 
     let mut pui_final_map = Map::new();
@@ -6500,6 +6606,7 @@ mod tests {
             repository: json!(2),
             record: json!({
                 "uri": "/repositories/2/resources/50",
+                "jsonmodel_type": "resource",
                 "title": "Public Collection: Ramón Gómez de la Serna — Obras Completas 📚",
                 "publish": true
             }),
@@ -6519,8 +6626,26 @@ mod tests {
 
         // 3. Markers
         let markers = doc_res["_archivalist_rust_fields"].as_array().unwrap();
-        assert_eq!(markers.len(), 1);
+        assert_eq!(markers.len(), 3);
         assert_eq!(markers[0], json!(PUI_FINAL_DOCUMENT_METADATA_MARKER));
+        assert_eq!(markers[1], json!(PUI_ROUTING_METADATA_MARKER));
+        assert_eq!(markers[2], json!(PUI_NOTES_METADATA_MARKER));
+
+        // 3b. Routing & Notes projections
+        let routing = doc_res[PUI_ROUTING_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(routing.len(), 4);
+        assert_eq!(routing["marker"], PUI_ROUTING_METADATA_MARKER);
+        assert_eq!(routing["id"], "/repositories/2/resources/50#pui");
+        assert_eq!(routing["pui_parent_id"], "/repositories/2/resources/50");
+        assert_eq!(
+            routing["types"],
+            json!(["pui", "pui_resource", "pui_record", "pui_only"])
+        );
+
+        let notes_proj = doc_res[PUI_NOTES_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(notes_proj.len(), 2);
+        assert_eq!(notes_proj["marker"], PUI_NOTES_METADATA_MARKER);
+        assert_eq!(notes_proj["notes_published"], Value::Null);
 
         // 4. PUI Final payload
         let pui_final = doc_res[PUI_FINAL_DOCUMENTS_KEY].as_object().unwrap();
@@ -6618,6 +6743,7 @@ mod tests {
             repository: json!(2),
             record: json!({
                 "uri": "/repositories/2/archival_objects/501",
+                "jsonmodel_type": "archival_object",
                 "title": "Actas Capitulares: Éire & Dublin 1916",
                 "display_string": "ITEM-501: Actas Capitulares: Éire & Dublin 1916",
                 "publish": true
@@ -6631,6 +6757,19 @@ mod tests {
         assert!(doc_ao.get("fullrecord").is_none());
         assert_eq!(doc_ao["id"], "/repositories/2/archival_objects/501");
         assert_eq!(doc_ao["primary_type"], "archival_object");
+
+        let routing_ao = doc_ao[PUI_ROUTING_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(routing_ao.len(), 4);
+        assert_eq!(routing_ao["marker"], PUI_ROUTING_METADATA_MARKER);
+        assert_eq!(routing_ao["id"], "/repositories/2/archival_objects/501#pui");
+        assert_eq!(
+            routing_ao["pui_parent_id"],
+            "/repositories/2/archival_objects/501"
+        );
+        assert_eq!(
+            routing_ao["types"],
+            json!(["pui", "pui_archival_object", "pui_record", "pui_only"])
+        );
 
         let pui_ao = doc_ao[PUI_FINAL_DOCUMENTS_KEY].as_object().unwrap();
         let clean_ao_str = pui_ao["json"].as_str().unwrap();
@@ -6702,6 +6841,7 @@ mod tests {
             repository: json!(2),
             record: json!({
                 "uri": "/repositories/2/resources/60",
+                "jsonmodel_type": "resource",
                 "title": "Alpha Title",
                 "publish": true
             }),
@@ -6932,5 +7072,558 @@ mod tests {
         assert!(err11
             .to_string()
             .contains("pui_candidate_record.jsonmodel_type must be a string"));
+    }
+
+    #[test]
+    fn pui_routing_and_notes_resource_and_archival_object() {
+        let res_candidate = json!({
+            "uri": "/repositories/2/resources/101",
+            "jsonmodel_type": "resource",
+            "title": "Resource Title",
+            "publish": true
+        });
+        let res_input = IndexDocumentInput {
+            uri: "/repositories/2/resources/101".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/101",
+                "jsonmodel_type": "resource",
+                "title": "Resource Title",
+                "publish": true,
+                "notes": [
+                    {
+                        "jsonmodel_type": "note_singlepart",
+                        "type": "abstract",
+                        "publish": true,
+                        "content": ["Published resource abstract."]
+                    }
+                ]
+            }),
+            prepare_pui_final: true,
+            pui_candidate_record: Some(res_candidate),
+            ..Default::default()
+        };
+
+        let res_doc = build_index_document(res_input).unwrap();
+        // Envelope check: top-level id and types must NOT be mutated
+        assert_eq!(res_doc["id"], "/repositories/2/resources/101");
+        assert_eq!(res_doc["types"], json!(["resource"]));
+
+        let res_routing = res_doc[PUI_ROUTING_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(res_routing.len(), 4);
+        assert_eq!(res_routing["marker"], PUI_ROUTING_METADATA_MARKER);
+        assert_eq!(res_routing["id"], "/repositories/2/resources/101#pui");
+        assert_eq!(
+            res_routing["pui_parent_id"],
+            "/repositories/2/resources/101"
+        );
+        assert_eq!(
+            res_routing["types"],
+            json!(["pui", "pui_resource", "pui_record", "pui_only"])
+        );
+
+        let res_notes = res_doc[PUI_NOTES_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(res_notes.len(), 2);
+        assert_eq!(res_notes["marker"], PUI_NOTES_METADATA_MARKER);
+        assert_eq!(
+            res_notes["notes_published"],
+            json!(["abstract", "Published resource abstract."])
+        );
+
+        // Archival object test
+        let ao_candidate = json!({
+            "uri": "/repositories/2/archival_objects/202",
+            "jsonmodel_type": "archival_object",
+            "title": "AO Title",
+            "publish": true
+        });
+        let ao_input = IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/202".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/202",
+                "jsonmodel_type": "archival_object",
+                "title": "AO Title",
+                "publish": true,
+                "notes": [
+                    {
+                        "jsonmodel_type": "note_singlepart",
+                        "type": "materialspec",
+                        "publish": true,
+                        "content": ["Parchment manuscript with wax seal."]
+                    }
+                ]
+            }),
+            prepare_pui_final: true,
+            pui_candidate_record: Some(ao_candidate),
+            ..Default::default()
+        };
+
+        let ao_doc = build_index_document(ao_input).unwrap();
+        assert_eq!(ao_doc["id"], "/repositories/2/archival_objects/202");
+        assert_eq!(ao_doc["types"], json!(["archival_object"]));
+
+        let ao_routing = ao_doc[PUI_ROUTING_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(ao_routing.len(), 4);
+        assert_eq!(ao_routing["marker"], PUI_ROUTING_METADATA_MARKER);
+        assert_eq!(ao_routing["id"], "/repositories/2/archival_objects/202#pui");
+        assert_eq!(
+            ao_routing["pui_parent_id"],
+            "/repositories/2/archival_objects/202"
+        );
+        assert_eq!(
+            ao_routing["types"],
+            json!(["pui", "pui_archival_object", "pui_record", "pui_only"])
+        );
+
+        let ao_notes = ao_doc[PUI_NOTES_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(ao_notes.len(), 2);
+        assert_eq!(ao_notes["marker"], PUI_NOTES_METADATA_MARKER);
+        assert_eq!(
+            ao_notes["notes_published"],
+            json!(["materialspec", "Parchment manuscript with wax seal."])
+        );
+    }
+
+    #[test]
+    fn pui_routing_and_notes_unicode_and_nested_notes() {
+        let candidate = json!({
+            "uri": "/repositories/2/resources/303",
+            "jsonmodel_type": "resource",
+            "title": "Úrchlar: Ramón Gómez de la Serna — Obras Completas 📚",
+            "publish": true
+        });
+        let input = IndexDocumentInput {
+            uri: "/repositories/2/resources/303".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/303",
+                "jsonmodel_type": "resource",
+                "title": "Úrchlar: Ramón Gómez de la Serna — Obras Completas 📚",
+                "publish": true,
+                "notes": [
+                    {
+                        "jsonmodel_type": "note_multipart",
+                        "type": "scopecontent",
+                        "publish": true,
+                        "subnotes": [
+                            {
+                                "jsonmodel_type": "note_text",
+                                "content": "Café de Pombo (Madrid) — 1920: Tertulia literaria y vanguardia artística ☕🎭",
+                                "publish": true
+                            },
+                            {
+                                "jsonmodel_type": "note_text",
+                                "content": "UNPUBLISHED_SECRET_NOTE_PORTION: NOT FOR PUBLIC VIEW",
+                                "publish": false
+                            }
+                        ]
+                    },
+                    {
+                        "jsonmodel_type": "note_multipart",
+                        "type": "bioghist",
+                        "publish": false,
+                        "subnotes": [
+                            {
+                                "jsonmodel_type": "note_text",
+                                "content": "ENTIRE_NOTE_IS_UNPUBLISHED_AND_MUST_BE_EXCLUDED",
+                                "publish": true
+                            }
+                        ]
+                    },
+                    {
+                        "jsonmodel_type": "note_singlepart",
+                        "type": "general",
+                        "publish": true,
+                        "content": ["Buenos Aires — Exilio y memorias (1936–1963) 🇦🇷"]
+                    }
+                ]
+            }),
+            prepare_pui_final: true,
+            pui_candidate_record: Some(candidate),
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input).unwrap();
+        let notes_proj = doc[PUI_NOTES_DOCUMENTS_KEY].as_object().unwrap();
+        let published_notes: Vec<String> = notes_proj["notes_published"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        assert_eq!(
+            published_notes,
+            vec![
+                "general".to_string(),
+                "Buenos Aires — Exilio y memorias (1936–1963) 🇦🇷".to_string(),
+                "scopecontent".to_string(),
+                "Café de Pombo (Madrid) — 1920: Tertulia literaria y vanguardia artística ☕🎭"
+                    .to_string(),
+            ]
+        );
+        assert!(!published_notes.iter().any(|s| s.contains("UNPUBLISHED")));
+    }
+
+    #[test]
+    fn pui_routing_and_notes_absent_notes_behavior() {
+        let candidate = json!({
+            "uri": "/repositories/2/resources/404",
+            "jsonmodel_type": "resource",
+            "title": "Absence Test",
+            "publish": true
+        });
+
+        // Case 1: notes field completely omitted
+        let input_missing = IndexDocumentInput {
+            uri: "/repositories/2/resources/404".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/404",
+                "jsonmodel_type": "resource",
+                "title": "Absence Test",
+                "publish": true
+            }),
+            prepare_pui_final: true,
+            pui_candidate_record: Some(candidate.clone()),
+            ..Default::default()
+        };
+        let doc_missing = build_index_document(input_missing).unwrap();
+        let notes_missing = doc_missing[PUI_NOTES_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(notes_missing["notes_published"], Value::Null);
+
+        // Case 2: notes field is explicitly null
+        let input_null = IndexDocumentInput {
+            uri: "/repositories/2/resources/404".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/404",
+                "jsonmodel_type": "resource",
+                "title": "Absence Test",
+                "publish": true,
+                "notes": null
+            }),
+            prepare_pui_final: true,
+            pui_candidate_record: Some(candidate.clone()),
+            ..Default::default()
+        };
+        let doc_null = build_index_document(input_null).unwrap();
+        let notes_null = doc_null[PUI_NOTES_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(notes_null["notes_published"], Value::Null);
+
+        // Case 3: notes field is explicitly false
+        let input_false = IndexDocumentInput {
+            uri: "/repositories/2/resources/404".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/404",
+                "jsonmodel_type": "resource",
+                "title": "Absence Test",
+                "publish": true,
+                "notes": false
+            }),
+            prepare_pui_final: true,
+            pui_candidate_record: Some(candidate.clone()),
+            ..Default::default()
+        };
+        let doc_false = build_index_document(input_false).unwrap();
+        let notes_false = doc_false[PUI_NOTES_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(notes_false["notes_published"], Value::Null);
+
+        // Case 4: notes field is empty array -> notes_published must be []
+        let input_empty = IndexDocumentInput {
+            uri: "/repositories/2/resources/404".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/404",
+                "jsonmodel_type": "resource",
+                "title": "Absence Test",
+                "publish": true,
+                "notes": []
+            }),
+            prepare_pui_final: true,
+            pui_candidate_record: Some(candidate),
+            ..Default::default()
+        };
+        let doc_empty = build_index_document(input_empty).unwrap();
+        let notes_empty = doc_empty[PUI_NOTES_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(notes_empty["notes_published"], json!([]));
+    }
+
+    #[test]
+    fn pui_identity_malformed_record_inputs() {
+        let valid_cand = json!({
+            "uri": "/repositories/2/resources/505",
+            "jsonmodel_type": "resource"
+        });
+
+        // 1. Non-object record
+        let non_obj_rec = IndexDocumentInput {
+            uri: "/repositories/2/resources/505".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!("string_record_not_object"),
+            prepare_pui_final: true,
+            pui_candidate_record: Some(valid_cand.clone()),
+            ..Default::default()
+        };
+        let err1 = build_index_document(non_obj_rec).unwrap_err();
+        assert!(err1.to_string().contains("record must be a JSON object"));
+
+        // 2. Missing record uri
+        let missing_rec_uri = IndexDocumentInput {
+            uri: "/repositories/2/resources/505".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({"jsonmodel_type": "resource"}),
+            prepare_pui_final: true,
+            pui_candidate_record: Some(valid_cand.clone()),
+            ..Default::default()
+        };
+        let err2 = build_index_document(missing_rec_uri).unwrap_err();
+        assert!(err2.to_string().contains("record.uri must be a string"));
+
+        // 3. Null record uri
+        let null_rec_uri = IndexDocumentInput {
+            uri: "/repositories/2/resources/505".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({"uri": null, "jsonmodel_type": "resource"}),
+            prepare_pui_final: true,
+            pui_candidate_record: Some(valid_cand.clone()),
+            ..Default::default()
+        };
+        let err3 = build_index_document(null_rec_uri).unwrap_err();
+        assert!(err3.to_string().contains("record.uri must be a string"));
+
+        // 4. Empty record uri
+        let empty_rec_uri = IndexDocumentInput {
+            uri: "/repositories/2/resources/505".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({"uri": "   ", "jsonmodel_type": "resource"}),
+            prepare_pui_final: true,
+            pui_candidate_record: Some(valid_cand.clone()),
+            ..Default::default()
+        };
+        let err4 = build_index_document(empty_rec_uri).unwrap_err();
+        assert!(
+            err4.to_string().contains("does not match wrapper uri")
+                || err4.to_string().contains("record.uri must not be empty")
+        );
+
+        // 5. Mismatched record uri
+        let mismatch_rec_uri = IndexDocumentInput {
+            uri: "/repositories/2/resources/505".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/999_MISMATCH",
+                "jsonmodel_type": "resource"
+            }),
+            prepare_pui_final: true,
+            pui_candidate_record: Some(valid_cand.clone()),
+            ..Default::default()
+        };
+        let err5 = build_index_document(mismatch_rec_uri).unwrap_err();
+        assert!(err5.to_string().contains("does not match wrapper uri"));
+
+        // 6. Missing record jsonmodel_type
+        let missing_rec_type = IndexDocumentInput {
+            uri: "/repositories/2/resources/505".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({"uri": "/repositories/2/resources/505"}),
+            prepare_pui_final: true,
+            pui_candidate_record: Some(valid_cand.clone()),
+            ..Default::default()
+        };
+        let err6 = build_index_document(missing_rec_type).unwrap_err();
+        assert!(err6
+            .to_string()
+            .contains("record.jsonmodel_type must be a string"));
+
+        // 7. Null record jsonmodel_type
+        let null_rec_type = IndexDocumentInput {
+            uri: "/repositories/2/resources/505".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/505",
+                "jsonmodel_type": null
+            }),
+            prepare_pui_final: true,
+            pui_candidate_record: Some(valid_cand.clone()),
+            ..Default::default()
+        };
+        let err7 = build_index_document(null_rec_type).unwrap_err();
+        assert!(err7
+            .to_string()
+            .contains("record.jsonmodel_type must be a string"));
+
+        // 8. Empty record jsonmodel_type
+        let empty_rec_type = IndexDocumentInput {
+            uri: "/repositories/2/resources/505".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/505",
+                "jsonmodel_type": " "
+            }),
+            prepare_pui_final: true,
+            pui_candidate_record: Some(valid_cand.clone()),
+            ..Default::default()
+        };
+        let err8 = build_index_document(empty_rec_type).unwrap_err();
+        assert!(err8
+            .to_string()
+            .contains("record.jsonmodel_type must not be empty"));
+
+        // 9. Mismatched record jsonmodel_type
+        let mismatch_rec_type = IndexDocumentInput {
+            uri: "/repositories/2/resources/505".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/505",
+                "jsonmodel_type": "archival_object"
+            }),
+            prepare_pui_final: true,
+            pui_candidate_record: Some(valid_cand),
+            ..Default::default()
+        };
+        let err9 = build_index_document(mismatch_rec_type).unwrap_err();
+        assert!(err9
+            .to_string()
+            .contains("does not match wrapper record_type"));
+    }
+
+    #[test]
+    fn pui_multi_record_batch_isolation() {
+        let res_input = IndexDocumentInput {
+            uri: "/repositories/2/resources/601".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/601",
+                "jsonmodel_type": "resource",
+                "title": "Batch Resource 601",
+                "publish": true,
+                "notes": [
+                    {
+                        "jsonmodel_type": "note_singlepart",
+                        "type": "abstract",
+                        "publish": true,
+                        "content": ["Res 601 Note"]
+                    }
+                ]
+            }),
+            prepare_pui_final: true,
+            pui_candidate_record: Some(json!({
+                "uri": "/repositories/2/resources/601",
+                "jsonmodel_type": "resource",
+                "title": "Batch Resource 601",
+                "publish": true
+            })),
+            ..Default::default()
+        };
+
+        let ao_input = IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/602".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/602",
+                "jsonmodel_type": "archival_object",
+                "title": "Batch AO 602",
+                "publish": true,
+                "notes": [
+                    {
+                        "jsonmodel_type": "note_singlepart",
+                        "type": "scopecontent",
+                        "publish": true,
+                        "content": ["AO 602 Note"]
+                    }
+                ]
+            }),
+            prepare_pui_final: true,
+            pui_candidate_record: Some(json!({
+                "uri": "/repositories/2/archival_objects/602",
+                "jsonmodel_type": "archival_object",
+                "title": "Batch AO 602",
+                "publish": true
+            })),
+            ..Default::default()
+        };
+
+        let plain_input = IndexDocumentInput {
+            uri: "/repositories/2/resources/603".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/603",
+                "jsonmodel_type": "resource",
+                "title": "Batch Plain 603",
+                "publish": true
+            }),
+            prepare_pui_final: false,
+            pui_candidate_record: None,
+            ..Default::default()
+        };
+
+        let response = build_index_document_batch(IndexDocumentBatchRequest {
+            records: vec![res_input, ao_input, plain_input],
+        })
+        .unwrap();
+        let docs = response.documents;
+        assert_eq!(docs.len(), 3);
+
+        // Record 1 (Resource)
+        let doc0 = &docs[0];
+        assert_eq!(doc0["id"], "/repositories/2/resources/601");
+        assert_eq!(doc0["types"], json!(["resource"]));
+        let r0 = doc0[PUI_ROUTING_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(r0["id"], "/repositories/2/resources/601#pui");
+        assert_eq!(r0["pui_parent_id"], "/repositories/2/resources/601");
+        assert_eq!(
+            r0["types"],
+            json!(["pui", "pui_resource", "pui_record", "pui_only"])
+        );
+        let n0 = doc0[PUI_NOTES_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(n0["notes_published"], json!(["abstract", "Res 601 Note"]));
+
+        // Record 2 (Archival Object)
+        let doc1 = &docs[1];
+        assert_eq!(doc1["id"], "/repositories/2/archival_objects/602");
+        assert_eq!(doc1["types"], json!(["archival_object"]));
+        let r1 = doc1[PUI_ROUTING_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(r1["id"], "/repositories/2/archival_objects/602#pui");
+        assert_eq!(r1["pui_parent_id"], "/repositories/2/archival_objects/602");
+        assert_eq!(
+            r1["types"],
+            json!(["pui", "pui_archival_object", "pui_record", "pui_only"])
+        );
+        let n1 = doc1[PUI_NOTES_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(
+            n1["notes_published"],
+            json!(["scopecontent", "AO 602 Note"])
+        );
+
+        // Record 3 (Unaccelerated/plain)
+        let doc2 = &docs[2];
+        assert_eq!(doc2["id"], "/repositories/2/resources/603");
+        assert_eq!(doc2["types"], json!(["resource"]));
+        assert!(doc2.get(PUI_ROUTING_DOCUMENTS_KEY).is_none());
+        assert!(doc2.get(PUI_NOTES_DOCUMENTS_KEY).is_none());
+        assert!(doc2.get(PUI_FINAL_DOCUMENTS_KEY).is_none());
+        assert!(doc2.get("_archivalist_rust_fields").is_none());
     }
 }

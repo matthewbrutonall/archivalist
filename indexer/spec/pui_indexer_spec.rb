@@ -336,11 +336,25 @@ describe "PUI indexer" do
         'publish' => true,
         'system_generated' => 'false',
         'repository' => test_indexer.get_record_scope(rec_hash['uri']),
-        '_archivalist_rust_fields' => ['pui_final_document_metadata'],
+        '_archivalist_rust_fields' => [
+          'pui_final_document_metadata',
+          'pui_routing_metadata',
+          'pui_notes_metadata'
+        ],
         '_archivalist_pui_final' => {
           'marker' => 'pui_final_document_metadata',
           'json' => ASUtils.to_json(clean_expected),
           'fullrecord_published' => expected_fullrecord_published
+        },
+        '_archivalist_pui_routing' => {
+          'marker' => 'pui_routing_metadata',
+          'id' => "#{rec_hash['uri']}#pui",
+          'pui_parent_id' => rec_hash['uri'],
+          'types' => ['pui', 'pui_archival_object', 'pui_record', 'pui_only']
+        },
+        '_archivalist_pui_notes' => {
+          'marker' => 'pui_notes_metadata',
+          'notes_published' => rec_hash['notes'] ? IndexerCommon.extract_string_values(rec_hash['notes'], :published_only) : nil
         }
       }
 
@@ -357,7 +371,12 @@ describe "PUI indexer" do
       plugin_saw_internal_note = nil
       plugin_saw_profile_note = nil
       plugin_saw_pui_final = nil
+      plugin_saw_pui_routing = nil
+      plugin_saw_pui_notes = nil
       plugin_saw_rust_fields = nil
+      plugin_saw_id = nil
+      plugin_saw_pui_parent_id = nil
+      plugin_saw_types = nil
 
       plugin_hook = proc do |doc, rec|
         plugin_saw_doc_ancestors = doc['ancestors']&.dup
@@ -365,7 +384,12 @@ describe "PUI indexer" do
         plugin_saw_internal_note = rec['record'].dig('instances', 0, 'sub_container', 'top_container', '_resolved', 'internal_note')
         plugin_saw_profile_note = rec['record'].dig('instances', 0, 'sub_container', 'top_container', '_resolved', 'container_profile', '_resolved', 'notes')
         plugin_saw_pui_final = doc.has_key?('_archivalist_pui_final')
+        plugin_saw_pui_routing = doc.has_key?('_archivalist_pui_routing')
+        plugin_saw_pui_notes = doc.has_key?('_archivalist_pui_notes')
         plugin_saw_rust_fields = doc.has_key?('_archivalist_rust_fields')
+        plugin_saw_id = doc['id']
+        plugin_saw_pui_parent_id = doc['pui_parent_id']
+        plugin_saw_types = doc['types']&.dup
       end
 
       # In production ArchivesSpace, plugins register hooks during initialization before final_doc_rules.
@@ -385,12 +409,20 @@ describe "PUI indexer" do
       expect(plugin_saw_internal_note).to eq('PRIVATE_INTERNAL_NOTE')
       expect(plugin_saw_profile_note).to eq('PRIVATE_CONTAINER_PROFILE_NOTE')
       expect(plugin_saw_pui_final).to be(false)
+      expect(plugin_saw_pui_routing).to be(false)
+      expect(plugin_saw_pui_notes).to be(false)
       expect(plugin_saw_rust_fields).to be(false)
+      expect(plugin_saw_id).to eq("#{rec_hash['uri']}#pui")
+      expect(plugin_saw_pui_parent_id).to eq(rec_hash['uri'])
+      expect(plugin_saw_types).to eq(['archival_object', 'pui', 'pui_archival_object', 'pui_record', 'pui_only'])
 
       # Prove final Solr-bound document has no doc ancestors, no private data in JSON,
-      # no unpublished fullrecord, no _archivalist_* keys, and exact expected fullrecord_published
+      # no unpublished fullrecord, no _archivalist_* keys, exact routing values and exact fullrecord_published
       expect(captured_batch.length).to eq(1)
       final_doc = captured_batch.first
+      expect(final_doc['id']).to eq("#{rec_hash['uri']}#pui")
+      expect(final_doc['pui_parent_id']).to eq(rec_hash['uri'])
+      expect(final_doc['types']).to eq(['archival_object', 'pui', 'pui_archival_object', 'pui_record', 'pui_only'])
       expect(final_doc.has_key?('ancestors')).to be(false)
       expect(final_doc['ancestors']).to be_nil
 
@@ -432,7 +464,7 @@ describe "PUI indexer" do
         'publish' => true,
         'system_generated' => 'false',
         'repository' => fallback_indexer.get_record_scope(rec_hash2['uri']),
-        '_archivalist_rust_fields' => ['pui_final_document_metadata'],
+        '_archivalist_rust_fields' => ['pui_final_document_metadata', 'pui_routing_metadata', 'pui_notes_metadata'],
         '_archivalist_pui_final' => {
           'marker' => 'pui_final_document_metadata',
           'json' => ASUtils.to_json({
@@ -442,6 +474,18 @@ describe "PUI indexer" do
             'internal_note' => 'MALICIOUS_PRIVATE_DATA_EXFIL'
           }),
           'fullrecord_published' => ['MALICIOUS_PRIVATE_DATA_EXFIL']
+        },
+        '_archivalist_pui_routing' => {
+          'marker' => 'pui_routing_metadata',
+          'id' => "#{rec_hash2['uri']}#pui",
+          'pui_parent_id' => rec_hash2['uri'],
+          'types' => ['pui', 'pui_archival_object', 'pui_record', 'pui_only'],
+          'admin_override' => 'MALICIOUS_ADMIN_INJECTION'
+        },
+        '_archivalist_pui_notes' => {
+          'marker' => 'pui_notes_metadata',
+          'notes_published' => ['MALICIOUS_NOTE_INJECTION'],
+          'private_payload' => 'MALICIOUS_NOTE_PAYLOAD'
         }
       }
 
@@ -456,7 +500,14 @@ describe "PUI indexer" do
 
       expect(fallback_batch.length).to eq(1)
       fallback_doc = fallback_batch.first
+      expect(fallback_doc['id']).to eq("#{rec_hash2['uri']}#pui")
+      expect(fallback_doc['pui_parent_id']).to eq(rec_hash2['uri'])
+      expect(fallback_doc['types']).to eq(['archival_object', 'pui', 'pui_archival_object', 'pui_record', 'pui_only'])
+      expect(fallback_doc.has_key?('admin_override')).to be(false)
+      expect(fallback_doc.has_key?('private_payload')).to be(false)
       expect(fallback_doc['json']).not_to include('MALICIOUS_PRIVATE_DATA_EXFIL')
+      expect(fallback_doc['json']).not_to include('MALICIOUS_ADMIN_INJECTION')
+      expect(fallback_doc['json']).not_to include('MALICIOUS_NOTE_PAYLOAD')
       expect(fallback_doc['fullrecord_published']).not_to include('MALICIOUS_PRIVATE_DATA_EXFIL')
       expect(fallback_doc['fullrecord_published']).not_to include('PRIVATE_INTERNAL_NOTE')
       expect(fallback_doc['fullrecord_published']).not_to include('PRIVATE_CONTAINER_PROFILE_NOTE')
@@ -605,6 +656,362 @@ describe "PUI indexer" do
       expect(doc['json']).not_to eq('{"bogus": true}')
       expect(doc['fullrecord_published']).not_to eq(['bogus'])
       expect(rec['record']['ancestors']).to be_nil
+    end
+
+    it "applies trusted PUI routing projection and preserves exact types and append order" do
+      _res, ao = sample_records
+      rec = indexer.prepare_docs([ao]).first
+      doc = indexer.start_index(rec)
+
+      AppConfig[:rust_pui_document_preparation_enabled] = true
+
+      valid_routing = {
+        'marker' => 'pui_routing_metadata',
+        'id' => "#{rec['record']['uri']}#pui",
+        'pui_parent_id' => rec['record']['uri'],
+        'types' => ['pui', 'pui_archival_object', 'pui_record', 'pui_only']
+      }
+      indexer.instance_variable_set(:@pui_routing_projections, { rec['record']['uri'] => valid_routing })
+
+      expect(indexer.apply_rust_pui_routing_projection(doc, rec)).to be(true)
+      expect(doc['id']).to eq("#{rec['record']['uri']}#pui")
+      expect(doc['pui_parent_id']).to eq(rec['record']['uri'])
+      expect(doc['types']).to eq(['archival_object', 'pui', 'pui_archival_object', 'pui_record', 'pui_only'])
+      expect(indexer.instance_variable_get(:@pui_routing_projections)).to be_empty
+    ensure
+      AppConfig[:rust_pui_document_preparation_enabled] = false
+    end
+
+    it "rejects malicious or mismatched PUI routing projections with native fallback" do
+      _res, ao = sample_records
+      rec = indexer.prepare_docs([ao]).first
+      uri = rec['record']['uri']
+
+      AppConfig[:rust_pui_document_preparation_enabled] = true
+
+      # 1. Extra string key (e.g. admin_override)
+      doc_extra = indexer.start_index(rec)
+      indexer.instance_variable_set(:@pui_routing_projections, { uri => {
+        'marker' => 'pui_routing_metadata',
+        'id' => "#{uri}#pui",
+        'pui_parent_id' => uri,
+        'types' => ['pui', 'pui_archival_object', 'pui_record', 'pui_only'],
+        'admin_override' => true
+      }})
+      expect(indexer.apply_rust_pui_routing_projection(doc_extra, rec)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_routing_projections)[uri]).to be_nil
+      expect(doc_extra['id']).to eq(uri)
+      expect(doc_extra['types']).to eq(['archival_object'])
+      expect(doc_extra.has_key?('admin_override')).to be(false)
+
+      # Native fallback verification
+      indexer.run_all_but_final_doc_rules(doc_extra, rec)
+      expect(doc_extra['id']).to eq("#{uri}#pui")
+      expect(doc_extra['types']).to eq(['archival_object', 'pui', 'pui_archival_object', 'pui_record', 'pui_only'])
+      expect(doc_extra.has_key?('admin_override')).to be(false)
+
+      # 2. Extra symbol key (e.g. :admin_override)
+      doc_sym = indexer.start_index(rec)
+      indexer.instance_variable_set(:@pui_routing_projections, { uri => {
+        'marker' => 'pui_routing_metadata',
+        'id' => "#{uri}#pui",
+        'pui_parent_id' => uri,
+        'types' => ['pui', 'pui_archival_object', 'pui_record', 'pui_only'],
+        :admin_override => true
+      }})
+      expect(indexer.apply_rust_pui_routing_projection(doc_sym, rec)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_routing_projections)[uri]).to be_nil
+      expect(doc_sym['id']).to eq(uri)
+      expect(doc_sym['types']).to eq(['archival_object'])
+
+      # 3. Missing keys (e.g. missing 'types', missing 'id')
+      doc_missing_types = indexer.start_index(rec)
+      indexer.instance_variable_set(:@pui_routing_projections, { uri => {
+        'marker' => 'pui_routing_metadata',
+        'id' => "#{uri}#pui",
+        'pui_parent_id' => uri
+      }})
+      expect(indexer.apply_rust_pui_routing_projection(doc_missing_types, rec)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_routing_projections)[uri]).to be_nil
+      expect(doc_missing_types['id']).to eq(uri)
+      expect(doc_missing_types['types']).to eq(['archival_object'])
+
+      doc_missing_id = indexer.start_index(rec)
+      indexer.instance_variable_set(:@pui_routing_projections, { uri => {
+        'marker' => 'pui_routing_metadata',
+        'pui_parent_id' => uri,
+        'types' => ['pui', 'pui_archival_object', 'pui_record', 'pui_only']
+      }})
+      expect(indexer.apply_rust_pui_routing_projection(doc_missing_id, rec)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_routing_projections)[uri]).to be_nil
+      expect(doc_missing_id['id']).to eq(uri)
+      expect(doc_missing_id['types']).to eq(['archival_object'])
+
+      # 4. Bad marker
+      doc1 = indexer.start_index(rec)
+      indexer.instance_variable_set(:@pui_routing_projections, { uri => {
+        'marker' => 'bad_marker',
+        'id' => "#{uri}#pui",
+        'pui_parent_id' => uri,
+        'types' => ['pui', 'pui_archival_object', 'pui_record', 'pui_only']
+      }})
+      expect(indexer.apply_rust_pui_routing_projection(doc1, rec)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_routing_projections)[uri]).to be_nil
+      expect(doc1['id']).to eq(uri)
+      expect(doc1['types']).to eq(['archival_object'])
+
+      # 5. Tampered id
+      doc2 = indexer.start_index(rec)
+      indexer.instance_variable_set(:@pui_routing_projections, { uri => {
+        'marker' => 'pui_routing_metadata',
+        'id' => "/repositories/2/resources/999#pui",
+        'pui_parent_id' => uri,
+        'types' => ['pui', 'pui_archival_object', 'pui_record', 'pui_only']
+      }})
+      expect(indexer.apply_rust_pui_routing_projection(doc2, rec)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_routing_projections)[uri]).to be_nil
+      expect(doc2['id']).to eq(uri)
+      expect(doc2['types']).to eq(['archival_object'])
+
+      # 6. Tampered parent id
+      doc3 = indexer.start_index(rec)
+      indexer.instance_variable_set(:@pui_routing_projections, { uri => {
+        'marker' => 'pui_routing_metadata',
+        'id' => "#{uri}#pui",
+        'pui_parent_id' => "/repositories/2/resources/999",
+        'types' => ['pui', 'pui_archival_object', 'pui_record', 'pui_only']
+      }})
+      expect(indexer.apply_rust_pui_routing_projection(doc3, rec)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_routing_projections)[uri]).to be_nil
+      expect(doc3['id']).to eq(uri)
+      expect(doc3['types']).to eq(['archival_object'])
+
+      # 7. Tampered types (injected unauthorized type)
+      doc4 = indexer.start_index(rec)
+      indexer.instance_variable_set(:@pui_routing_projections, { uri => {
+        'marker' => 'pui_routing_metadata',
+        'id' => "#{uri}#pui",
+        'pui_parent_id' => uri,
+        'types' => ['pui', 'pui_archival_object', 'pui_record', 'pui_only', 'unauthorized_admin']
+      }})
+      expect(indexer.apply_rust_pui_routing_projection(doc4, rec)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_routing_projections)[uri]).to be_nil
+      expect(doc4['id']).to eq(uri)
+      expect(doc4['types']).to eq(['archival_object'])
+
+      # 8. Tampered types (reordered types)
+      doc5 = indexer.start_index(rec)
+      indexer.instance_variable_set(:@pui_routing_projections, { uri => {
+        'marker' => 'pui_routing_metadata',
+        'id' => "#{uri}#pui",
+        'pui_parent_id' => uri,
+        'types' => ['pui_only', 'pui', 'pui_archival_object', 'pui_record']
+      }})
+      expect(indexer.apply_rust_pui_routing_projection(doc5, rec)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_routing_projections)[uri]).to be_nil
+      expect(doc5['id']).to eq(uri)
+      expect(doc5['types']).to eq(['archival_object'])
+
+      # 9. Mismatched record uri
+      doc6 = indexer.start_index(rec)
+      bad_rec6 = indexer.deep_copy_record_candidate(rec)
+      bad_rec6['record']['uri'] = '/repositories/2/archival_objects/999'
+      indexer.instance_variable_set(:@pui_routing_projections, { uri => {
+        'marker' => 'pui_routing_metadata',
+        'id' => "#{uri}#pui",
+        'pui_parent_id' => uri,
+        'types' => ['pui', 'pui_archival_object', 'pui_record', 'pui_only']
+      }})
+      expect(indexer.apply_rust_pui_routing_projection(doc6, bad_rec6)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_routing_projections)[uri]).to be_nil
+      expect(doc6['id']).to eq(uri)
+      expect(doc6['types']).to eq(['archival_object'])
+
+      # 10. Mismatched record jsonmodel_type
+      doc7 = indexer.start_index(rec)
+      bad_rec7 = indexer.deep_copy_record_candidate(rec)
+      bad_rec7['record']['jsonmodel_type'] = 'resource'
+      indexer.instance_variable_set(:@pui_routing_projections, { uri => {
+        'marker' => 'pui_routing_metadata',
+        'id' => "#{uri}#pui",
+        'pui_parent_id' => uri,
+        'types' => ['pui', 'pui_archival_object', 'pui_record', 'pui_only']
+      }})
+      expect(indexer.apply_rust_pui_routing_projection(doc7, bad_rec7)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_routing_projections)[uri]).to be_nil
+      expect(doc7['id']).to eq(uri)
+      expect(doc7['types']).to eq(['archival_object'])
+    ensure
+      AppConfig[:rust_pui_document_preparation_enabled] = false
+    end
+
+    it "applies trusted PUI notes projection and preserves absence behavior" do
+      _res, ao = sample_records
+      rec = indexer.prepare_docs([ao]).first
+      uri = rec['record']['uri']
+
+      AppConfig[:rust_pui_document_preparation_enabled] = true
+
+      # Case 1: Record has notes
+      rec_with_notes = indexer.deep_copy_record_candidate(rec)
+      rec_with_notes['record']['notes'] = [
+        {
+          'jsonmodel_type' => 'note_singlepart',
+          'type' => 'abstract',
+          'publish' => true,
+          'content' => ['Authentic public note']
+        }
+      ]
+      doc_with_notes = indexer.start_index(rec_with_notes)
+      valid_notes_proj = {
+        'marker' => 'pui_notes_metadata',
+        'notes_published' => IndexerCommon.extract_string_values(rec_with_notes['record']['notes'], :published_only)
+      }
+      indexer.instance_variable_set(:@pui_notes_projections, { uri => valid_notes_proj })
+
+      indexer.add_notes(doc_with_notes, rec_with_notes)
+      expect(doc_with_notes['notes_published']).to eq(['abstract', 'Authentic public note'])
+      expect(indexer.instance_variable_get(:@pui_notes_projections)).to be_empty
+
+      # Case 2: Record has absent notes -> doc['notes_published'] must NOT be set
+      rec_absent_notes = indexer.deep_copy_record_candidate(rec)
+      rec_absent_notes['record'].delete('notes')
+      doc_absent_notes = indexer.start_index(rec_absent_notes)
+      valid_absent_proj = {
+        'marker' => 'pui_notes_metadata',
+        'notes_published' => nil
+      }
+      indexer.instance_variable_set(:@pui_notes_projections, { uri => valid_absent_proj })
+
+      indexer.add_notes(doc_absent_notes, rec_absent_notes)
+      expect(doc_absent_notes.has_key?('notes_published')).to be(false)
+      expect(doc_absent_notes['notes_published']).to be_nil
+      expect(indexer.instance_variable_get(:@pui_notes_projections)).to be_empty
+    ensure
+      AppConfig[:rust_pui_document_preparation_enabled] = false
+    end
+
+    it "rejects malicious or mismatched PUI notes projections with native fallback" do
+      _res, ao = sample_records
+      rec = indexer.prepare_docs([ao]).first
+      uri = rec['record']['uri']
+
+      AppConfig[:rust_pui_document_preparation_enabled] = true
+
+      rec_with_notes = indexer.deep_copy_record_candidate(rec)
+      rec_with_notes['record']['notes'] = [
+        {
+          'jsonmodel_type' => 'note_singlepart',
+          'type' => 'abstract',
+          'publish' => true,
+          'content' => ['Authentic public note']
+        },
+        {
+          'jsonmodel_type' => 'note_singlepart',
+          'type' => 'scopecontent',
+          'publish' => false,
+          'content' => ['PRIVATE_NOTE_MUST_NOT_LEAK']
+        }
+      ]
+
+      # 1. Extra string key (e.g. private_payload)
+      doc_extra_notes = indexer.start_index(rec_with_notes)
+      indexer.instance_variable_set(:@pui_notes_projections, { uri => {
+        'marker' => 'pui_notes_metadata',
+        'notes_published' => ['abstract', 'Authentic public note'],
+        'private_payload' => 'SECRET_INJECTION'
+      }})
+      expect(indexer.apply_rust_pui_notes_projection(doc_extra_notes, rec_with_notes)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_notes_projections)[uri]).to be_nil
+      expect(doc_extra_notes.has_key?('notes_published')).to be(false)
+      indexer.add_notes(doc_extra_notes, rec_with_notes)
+      expect(doc_extra_notes['notes_published']).to eq(['abstract', 'Authentic public note'])
+      expect(doc_extra_notes['notes_published']).not_to include('SECRET_INJECTION')
+      expect(doc_extra_notes.has_key?('private_payload')).to be(false)
+
+      # 2. Extra symbol key (e.g. :private_payload)
+      doc_sym_notes = indexer.start_index(rec_with_notes)
+      indexer.instance_variable_set(:@pui_notes_projections, { uri => {
+        'marker' => 'pui_notes_metadata',
+        'notes_published' => ['abstract', 'Authentic public note'],
+        :private_payload => 'SECRET_INJECTION'
+      }})
+      expect(indexer.apply_rust_pui_notes_projection(doc_sym_notes, rec_with_notes)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_notes_projections)[uri]).to be_nil
+      expect(doc_sym_notes.has_key?('notes_published')).to be(false)
+
+      # 3. Missing keys (e.g. missing 'notes_published', missing 'marker')
+      doc_no_pub = indexer.start_index(rec_with_notes)
+      indexer.instance_variable_set(:@pui_notes_projections, { uri => {
+        'marker' => 'pui_notes_metadata'
+      }})
+      expect(indexer.apply_rust_pui_notes_projection(doc_no_pub, rec_with_notes)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_notes_projections)[uri]).to be_nil
+      expect(doc_no_pub.has_key?('notes_published')).to be(false)
+
+      doc_no_marker = indexer.start_index(rec_with_notes)
+      indexer.instance_variable_set(:@pui_notes_projections, { uri => {
+        'notes_published' => ['abstract', 'Authentic public note']
+      }})
+      expect(indexer.apply_rust_pui_notes_projection(doc_no_marker, rec_with_notes)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_notes_projections)[uri]).to be_nil
+      expect(doc_no_marker.has_key?('notes_published')).to be(false)
+
+      # 4. Absent notes in record with extra keys
+      rec_no_notes = indexer.deep_copy_record_candidate(rec)
+      rec_no_notes['record'].delete('notes')
+      doc_absent_extra = indexer.start_index(rec_no_notes)
+      indexer.instance_variable_set(:@pui_notes_projections, { uri => {
+        'marker' => 'pui_notes_metadata',
+        'notes_published' => nil,
+        'private_payload' => 'INJECTED_STRING'
+      }})
+      expect(indexer.apply_rust_pui_notes_projection(doc_absent_extra, rec_no_notes)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_notes_projections)[uri]).to be_nil
+      indexer.add_notes(doc_absent_extra, rec_no_notes)
+      expect(doc_absent_extra.has_key?('notes_published')).to be(false)
+      expect(doc_absent_extra.has_key?('private_payload')).to be(false)
+
+      # 5. Malicious projection attempting to leak unpublished note
+      doc1 = indexer.start_index(rec_with_notes)
+      malicious_notes_proj = {
+        'marker' => 'pui_notes_metadata',
+        'notes_published' => ['abstract', 'Authentic public note', 'PRIVATE_NOTE_MUST_NOT_LEAK']
+      }
+      indexer.instance_variable_set(:@pui_notes_projections, { uri => malicious_notes_proj })
+      expect(indexer.apply_rust_pui_notes_projection(doc1, rec_with_notes)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_notes_projections)[uri]).to be_nil
+      indexer.add_notes(doc1, rec_with_notes)
+      # Must fall back to native extract_string_values
+      expect(doc1['notes_published']).to eq(['abstract', 'Authentic public note'])
+      expect(doc1['notes_published']).not_to include('PRIVATE_NOTE_MUST_NOT_LEAK')
+
+      # 6. Wrong marker
+      doc2 = indexer.start_index(rec_with_notes)
+      bad_marker_proj = {
+        'marker' => 'bad_marker',
+        'notes_published' => ['abstract', 'Authentic public note']
+      }
+      indexer.instance_variable_set(:@pui_notes_projections, { uri => bad_marker_proj })
+      expect(indexer.apply_rust_pui_notes_projection(doc2, rec_with_notes)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_notes_projections)[uri]).to be_nil
+      indexer.add_notes(doc2, rec_with_notes)
+      expect(doc2['notes_published']).to eq(['abstract', 'Authentic public note'])
+
+      # 7. Absent notes in record but projection injects strings
+      doc3 = indexer.start_index(rec_no_notes)
+      injected_notes_proj = {
+        'marker' => 'pui_notes_metadata',
+        'notes_published' => ['Unauthorized injected note']
+      }
+      indexer.instance_variable_set(:@pui_notes_projections, { uri => injected_notes_proj })
+      expect(indexer.apply_rust_pui_notes_projection(doc3, rec_no_notes)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_notes_projections)[uri]).to be_nil
+      indexer.add_notes(doc3, rec_no_notes)
+      expect(doc3.has_key?('notes_published')).to be(false)
+      expect(doc3['notes_published']).to be_nil
+    ensure
+      AppConfig[:rust_pui_document_preparation_enabled] = false
     end
   end
 end

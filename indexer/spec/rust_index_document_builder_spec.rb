@@ -2612,6 +2612,7 @@ describe RustIndexDocumentBuilder do
         'repository' => 2,
         'record' => {
           'uri' => '/repositories/2/archival_objects/42',
+          'jsonmodel_type' => 'archival_object',
           'title' => 'Letters to Bro. Paul',
           'publish' => true
         },
@@ -2631,6 +2632,11 @@ describe RustIndexDocumentBuilder do
     def valid_pui_doc_for(input)
       clean = valid_clean_candidate_for(input['pui_candidate_record'])
       published_strings = builder.send(:extract_published_strings, clean)
+      notes_published = if input['record']['notes']
+                          builder.send(:extract_published_strings, input['record']['notes'])
+                        else
+                          nil
+                        end
       {
         'id' => input['uri'],
         'uri' => input['uri'],
@@ -2642,11 +2648,25 @@ describe RustIndexDocumentBuilder do
         'publish' => true,
         'system_generated' => 'false',
         'repository' => input['repository'],
-        '_archivalist_rust_fields' => ['pui_final_document_metadata'],
+        '_archivalist_rust_fields' => [
+          'pui_final_document_metadata',
+          'pui_routing_metadata',
+          'pui_notes_metadata'
+        ],
         '_archivalist_pui_final' => {
           'marker' => 'pui_final_document_metadata',
           'json' => ASUtils.to_json(clean),
           'fullrecord_published' => published_strings
+        },
+        '_archivalist_pui_routing' => {
+          'marker' => 'pui_routing_metadata',
+          'id' => "#{input['uri']}#pui",
+          'pui_parent_id' => input['uri'],
+          'types' => ['pui', "pui_#{input['record_type']}", 'pui_record', 'pui_only']
+        },
+        '_archivalist_pui_notes' => {
+          'marker' => 'pui_notes_metadata',
+          'notes_published' => notes_published
         }
       }
     end
@@ -2768,7 +2788,7 @@ describe RustIndexDocumentBuilder do
         response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
                         'documents' => [doc])
       )
-      expect { builder.build([unenriched_input]) }.to raise_error(/unexpected response pui final projection marker/)
+      expect { builder.build([unenriched_input]) }.to raise_error(/unexpected response pui projection marker/)
     end
 
     it 'rejects mismatched fullrecord_published' do
@@ -2779,6 +2799,209 @@ describe RustIndexDocumentBuilder do
                         'documents' => [doc])
       )
       expect { builder.build([pui_input]) }.to raise_error(/fullrecord_published mismatch/)
+    end
+
+    it 'rejects missing, wrong-marker, or mismatched pui_routing projection' do
+      # 1. Missing _archivalist_pui_routing
+      doc_no_routing = valid_pui_doc_for(pui_input)
+      doc_no_routing.delete('_archivalist_pui_routing')
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_no_routing])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/missing _archivalist_pui_routing/)
+
+      # 2. Bad marker
+      doc_bad_marker = valid_pui_doc_for(pui_input)
+      doc_bad_marker['_archivalist_pui_routing']['marker'] = 'bad_marker'
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_bad_marker])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/pui routing marker mismatch/)
+
+      # 3. Mismatched id
+      doc_bad_id = valid_pui_doc_for(pui_input)
+      doc_bad_id['_archivalist_pui_routing']['id'] = "#{pui_input['uri']}#wrong"
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_bad_id])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/pui routing id mismatch/)
+
+      # 4. Mismatched pui_parent_id
+      doc_bad_parent = valid_pui_doc_for(pui_input)
+      doc_bad_parent['_archivalist_pui_routing']['pui_parent_id'] = '/repositories/2/resources/999'
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_bad_parent])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/pui routing pui_parent_id mismatch/)
+
+      # 5. Mismatched types
+      doc_bad_types = valid_pui_doc_for(pui_input)
+      doc_bad_types['_archivalist_pui_routing']['types'] = ['pui', 'unauthorized_type']
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_bad_types])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/pui routing types mismatch/)
+    end
+
+    it 'rejects extra, missing, or non-string keys in pui_routing projection' do
+      # Extra string key (e.g. admin_override)
+      doc_extra = valid_pui_doc_for(pui_input)
+      doc_extra['_archivalist_pui_routing']['admin_override'] = true
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_extra])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/pui routing contains unexpected fields.*admin_override/)
+
+      # Non-string / symbol key (e.g. :admin_override)
+      doc_sym = valid_pui_doc_for(pui_input)
+      doc_sym['_archivalist_pui_routing'][:admin_override] = true
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_sym])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/pui routing contains non-string keys/)
+
+      # Missing key (types)
+      doc_missing_types = valid_pui_doc_for(pui_input)
+      doc_missing_types['_archivalist_pui_routing'].delete('types')
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_missing_types])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/pui routing missing required fields.*types/)
+
+      # Missing key (id)
+      doc_missing_id = valid_pui_doc_for(pui_input)
+      doc_missing_id['_archivalist_pui_routing'].delete('id')
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_missing_id])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/pui routing missing required fields.*id/)
+    end
+
+    it 'rejects missing, wrong-marker, or mismatched pui_notes projection' do
+      # 1. Missing _archivalist_pui_notes
+      doc_no_notes = valid_pui_doc_for(pui_input)
+      doc_no_notes.delete('_archivalist_pui_notes')
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_no_notes])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/missing _archivalist_pui_notes/)
+
+      # 2. Bad marker
+      doc_bad_marker = valid_pui_doc_for(pui_input)
+      doc_bad_marker['_archivalist_pui_notes']['marker'] = 'bad_marker'
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_bad_marker])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/pui notes marker mismatch/)
+
+      # 3. Present notes with mismatched notes_published
+      input_with_notes = pui_input.dup
+      input_with_notes['record'] = pui_input['record'].dup
+      input_with_notes['record']['notes'] = [
+        {
+          'jsonmodel_type' => 'note_singlepart',
+          'type' => 'abstract',
+          'publish' => true,
+          'content' => ['Authentic note']
+        }
+      ]
+      doc_with_notes = valid_pui_doc_for(input_with_notes)
+      doc_with_notes['_archivalist_pui_notes']['notes_published'] = ['Injected unpublished note']
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_with_notes])
+      )
+      expect { builder.build([input_with_notes]) }.to raise_error(/pui notes_published mismatch/)
+
+      # 4. Absent notes with non-nil notes_published
+      doc_absent_notes = valid_pui_doc_for(pui_input)
+      doc_absent_notes['_archivalist_pui_notes']['notes_published'] = ['Should be nil']
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_absent_notes])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/pui notes_published must be nil/)
+    end
+
+    it 'rejects extra, missing, or non-string keys in pui_notes projection' do
+      # Extra string key (e.g. private_payload)
+      doc_extra = valid_pui_doc_for(pui_input)
+      doc_extra['_archivalist_pui_notes']['private_payload'] = 'CONFIDENTIAL_NOTE'
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_extra])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/pui notes contains unexpected fields.*private_payload/)
+
+      # Non-string / symbol key (e.g. :private_payload)
+      doc_sym = valid_pui_doc_for(pui_input)
+      doc_sym['_archivalist_pui_notes'][:private_payload] = 'CONFIDENTIAL_NOTE'
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_sym])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/pui notes contains non-string keys/)
+
+      # Missing key (notes_published)
+      doc_missing_notes = valid_pui_doc_for(pui_input)
+      doc_missing_notes['_archivalist_pui_notes'].delete('notes_published')
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_missing_notes])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/pui notes missing required fields.*notes_published/)
+
+      # Missing key (marker)
+      doc_missing_marker = valid_pui_doc_for(pui_input)
+      doc_missing_marker['_archivalist_pui_notes'].delete('marker')
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_missing_marker])
+      )
+      expect { builder.build([pui_input]) }.to raise_error(/pui notes missing required fields.*marker/)
+    end
+
+    it 'rejects missing, null, wrong-type, or mismatched input record identity' do
+      doc = valid_pui_doc_for(pui_input)
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+
+      # 1. Missing record uri
+      bad_rec1 = pui_input.dup
+      bad_rec1['record'] = pui_input['record'].dup
+      bad_rec1['record'].delete('uri')
+      expect { builder.build([bad_rec1]) }.to raise_error(/record.uri must be a non-empty string/)
+
+      # 2. Mismatched record uri
+      bad_rec2 = pui_input.dup
+      bad_rec2['record'] = pui_input['record'].dup
+      bad_rec2['record']['uri'] = '/repositories/2/archival_objects/999'
+      expect { builder.build([bad_rec2]) }.to raise_error(/record uri mismatch/)
+
+      # 3. Missing record jsonmodel_type
+      bad_rec3 = pui_input.dup
+      bad_rec3['record'] = pui_input['record'].dup
+      bad_rec3['record'].delete('jsonmodel_type')
+      expect { builder.build([bad_rec3]) }.to raise_error(/record.jsonmodel_type must be a non-empty string/)
+
+      # 4. Mismatched record jsonmodel_type
+      bad_rec4 = pui_input.dup
+      bad_rec4['record'] = pui_input['record'].dup
+      bad_rec4['record']['jsonmodel_type'] = 'resource'
+      expect { builder.build([bad_rec4]) }.to raise_error(/record jsonmodel_type mismatch/)
     end
 
     it 'rejects missing, null, wrong-type, or mismatched candidate identity' do

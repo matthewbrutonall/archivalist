@@ -446,6 +446,18 @@ class TestPuiParityComparator(unittest.TestCase):
         self.assertFalse(ok6)
         self.assertTrue(any("contains private handoff field" in r for r in reasons6))
 
+        # 7. Candidate leaks _archivalist_pui_routing metadata
+        cand_routing = dict(clean_base, _archivalist_pui_routing={"marker": "pui_routing_metadata"})
+        ok7, reasons7 = comparator.compare_pui_document(clean_base, cand_routing, comparator.DEFAULT_IGNORED_FIELDS)
+        self.assertFalse(ok7)
+        self.assertTrue(any("contains private handoff field" in r for r in reasons7))
+
+        # 8. Candidate leaks _archivalist_pui_notes metadata
+        cand_notes = dict(clean_base, _archivalist_pui_notes={"marker": "pui_notes_metadata"})
+        ok8, reasons8 = comparator.compare_pui_document(clean_base, cand_notes, comparator.DEFAULT_IGNORED_FIELDS)
+        self.assertFalse(ok8)
+        self.assertTrue(any("contains private handoff field" in r for r in reasons8))
+
     def test_altered_public_field_and_canonical_structural_equality_fails(self) -> None:
         """Any alteration of public metadata or JSON structure fails parity."""
         clean_base = {

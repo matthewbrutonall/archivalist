@@ -148,7 +148,7 @@ run_record_canary() {
 
     # Assert only expected handoff markers exist on root doc
     local extra_handoff_keys
-    extra_handoff_keys="$(printf '%s' "${doc}" | jq -r '[keys[] | select(startswith("_archivalist_") and . != "_archivalist_rust_fields" and . != "_archivalist_pui_final")] | join(", ")')"
+    extra_handoff_keys="$(printf '%s' "${doc}" | jq -r '[keys[] | select(startswith("_archivalist_") and . != "_archivalist_rust_fields" and . != "_archivalist_pui_final" and . != "_archivalist_pui_routing" and . != "_archivalist_pui_notes")] | join(", ")')"
     if [[ -n "${extra_handoff_keys}" ]]; then
         printf 'ERROR: Privacy violation: unexpected handoff fields on document: %s\n' "${extra_handoff_keys}" >&2
         exit 1
@@ -156,7 +156,7 @@ run_record_canary() {
 
     # 3. Assert handoff markers
     local rust_fields
-    rust_fields="$(printf '%s' "${doc}" | jq -r '._archivalist_rust_fields == ["pui_final_document_metadata"]')"
+    rust_fields="$(printf '%s' "${doc}" | jq -r '._archivalist_rust_fields == ["pui_final_document_metadata", "pui_routing_metadata", "pui_notes_metadata"]')"
     if [[ "${rust_fields}" != "true" ]]; then
         printf 'ERROR: Missing or invalid _archivalist_rust_fields marker: %s\n' "$(printf '%s' "${doc}" | jq -c '._archivalist_rust_fields')" >&2
         exit 1
@@ -166,6 +166,65 @@ run_record_canary() {
     pui_marker="$(printf '%s' "${doc}" | jq -r '._archivalist_pui_final.marker')"
     if [[ "${pui_marker}" != "pui_final_document_metadata" ]]; then
         printf 'ERROR: Missing or invalid _archivalist_pui_final.marker: %s\n' "${pui_marker}" >&2
+        exit 1
+    fi
+
+    # 3b. Assert PUI routing projection
+    local routing_marker
+    routing_marker="$(printf '%s' "${doc}" | jq -r '._archivalist_pui_routing.marker')"
+    if [[ "${routing_marker}" != "pui_routing_metadata" ]]; then
+        printf 'ERROR: Missing or invalid _archivalist_pui_routing.marker: %s\n' "${routing_marker}" >&2
+        exit 1
+    fi
+
+    local routing_keys_match
+    routing_keys_match="$(printf '%s' "${doc}" | jq -r '._archivalist_pui_routing | keys | sort == ["id", "marker", "pui_parent_id", "types"]')"
+    if [[ "${routing_keys_match}" != "true" ]]; then
+        printf 'ERROR: Unexpected or missing keys in _archivalist_pui_routing: %s\n' "$(printf '%s' "${doc}" | jq -c '._archivalist_pui_routing | keys')" >&2
+        exit 1
+    fi
+
+    local expected_pui_id="${uri}#pui"
+    local actual_pui_id
+    actual_pui_id="$(printf '%s' "${doc}" | jq -r '._archivalist_pui_routing.id')"
+    if [[ "${actual_pui_id}" != "${expected_pui_id}" ]]; then
+        printf 'ERROR: Invalid _archivalist_pui_routing.id: expected %s, got %s\n' "${expected_pui_id}" "${actual_pui_id}" >&2
+        exit 1
+    fi
+
+    local actual_pui_parent_id
+    actual_pui_parent_id="$(printf '%s' "${doc}" | jq -r '._archivalist_pui_routing.pui_parent_id')"
+    if [[ "${actual_pui_parent_id}" != "${uri}" ]]; then
+        printf 'ERROR: Invalid _archivalist_pui_routing.pui_parent_id: expected %s, got %s\n' "${uri}" "${actual_pui_parent_id}" >&2
+        exit 1
+    fi
+
+    local routing_types_match
+    routing_types_match="$(printf '%s' "${doc}" | jq -r --arg rtype "${record_type}" '._archivalist_pui_routing.types == ["pui", ("pui_" + $rtype), "pui_record", "pui_only"]')"
+    if [[ "${routing_types_match}" != "true" ]]; then
+        printf 'ERROR: Invalid _archivalist_pui_routing.types: %s\n' "$(printf '%s' "${doc}" | jq -c '._archivalist_pui_routing.types')" >&2
+        exit 1
+    fi
+
+    # 3c. Assert PUI notes projection
+    local notes_marker
+    notes_marker="$(printf '%s' "${doc}" | jq -r '._archivalist_pui_notes.marker')"
+    if [[ "${notes_marker}" != "pui_notes_metadata" ]]; then
+        printf 'ERROR: Missing or invalid _archivalist_pui_notes.marker: %s\n' "${notes_marker}" >&2
+        exit 1
+    fi
+
+    local notes_keys_match
+    notes_keys_match="$(printf '%s' "${doc}" | jq -r '._archivalist_pui_notes | keys | sort == ["marker", "notes_published"]')"
+    if [[ "${notes_keys_match}" != "true" ]]; then
+        printf 'ERROR: Unexpected or missing keys in _archivalist_pui_notes: %s\n' "$(printf '%s' "${doc}" | jq -c '._archivalist_pui_notes | keys')" >&2
+        exit 1
+    fi
+
+    local has_notes_published_key
+    has_notes_published_key="$(printf '%s' "${doc}" | jq '._archivalist_pui_notes | has("notes_published")')"
+    if [[ "${has_notes_published_key}" != "true" ]]; then
+        printf 'ERROR: _archivalist_pui_notes missing notes_published key\n' >&2
         exit 1
     fi
 

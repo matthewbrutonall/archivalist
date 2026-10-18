@@ -220,17 +220,20 @@ unchanged exactly once. Stale-child deletion via `records_with_children` is pres
 for Solr's intentional copy-field merge of `notes_published` into `notes`. Only
 after this passes should `rust_index_document_enrichment_enabled` be set to `true`.
 The enrichment gate `rust_index_document_enrichment_enabled` is staff-index only;
-PUI document privacy preparation is gated separately under `rust_pui_document_preparation_enabled`
+PUI document preparation is gated separately under `rust_pui_document_preparation_enabled`
 (disabled by default). Inheritance semantics, top-container publication decisions
 (`is_linked_to_published_record` / `pui_container`), LargeTree/ordered-record indexing,
-and Solr writes remain Ruby-owned. When trusted under the `pui_final_document_metadata`
-capability marker, Rust owns deterministic final public JSON privacy preparation
-(removing ancestors, top-container `internal_note`, and container-profile `notes` across
-nested instances) and published-only fullrecord extraction (`fullrecord_published`),
-while never emitting an unpublished `fullrecord` field. Ruby strictly validates exact
-recursive JSON equality, serialization, and published string values before trusting
-the projection, falling back completely to unchanged native `PUIIndexer#final_doc_rules`
-on missing, malformed, or mismatched sidecar responses. Collection-management child
+and Solr writes remain Ruby-owned. When trusted under capability markers
+(`pui_final_document_metadata`, `pui_routing_metadata`, and `pui_notes_metadata`),
+Rust prepares deterministic final public JSON privacy preparation (removing ancestors,
+top-container `internal_note`, and container-profile `notes` across nested instances)
+and published-only fullrecord extraction (`fullrecord_published`), PUI identity/routing metadata
+(`id: "#{parent_id}#pui"`, `pui_parent_id: parent_id`, and exact types additions in native order),
+and direct-only published note extraction (`notes_published`). Ruby strictly validates exact
+values, types, recursive JSON equality, serialization, and published string values at the
+corresponding logical hook positions (`configure_doc_rules`, `add_notes`, `final_doc_rules`)
+before trusting each projection, falling back completely to unchanged native PUIIndexer
+logic on missing, malformed, or mismatched sidecar responses. Collection-management child
 documents, dynamic enums, and ARKs remain staff-only and are completely bypassed in PUI.
 Before rollout, also require a complete native-versus-Rust reindex comparison so
 accessions, digital objects and components, subjects, agents, classifications,
@@ -366,11 +369,13 @@ REPO_ID=2 ARCHIVAL_OBJECT_ID=123 CANARY_SOLR_URL="http://127.0.0.1:8985/solr/tes
 
 The canary verifies:
 1. Sidecar `/health` returns HTTP 200 with `served_by == "aspace-shadow-sidecar"`.
-2. `_archivalist_rust_fields` marker is `["pui_final_document_metadata"]`.
+2. `_archivalist_rust_fields` marker contains `["pui_final_document_metadata", "pui_routing_metadata", "pui_notes_metadata"]`.
 3. `_archivalist_pui_final` contains clean `json` and `fullrecord_published`.
-4. Root document and parsed JSON have no `ancestors`, no top-container `internal_note`, no container-profile `notes`, and no private `_archivalist_*` keys.
-5. Unpublished `fullrecord` field is suppressed.
-6. Exact exit code `0`.
+4. `_archivalist_pui_routing` contains exact `id`, `pui_parent_id`, and `types` with expected values.
+5. `_archivalist_pui_notes` contains `notes_published` extracted strictly from direct record notes.
+6. Root document and parsed JSON have no `ancestors`, no top-container `internal_note`, no container-profile `notes`, and no private `_archivalist_*` keys.
+7. Unpublished `fullrecord` field is suppressed.
+8. Exact exit code `0`.
 
 ### Step B: Full repository privacy-normalized PUI parity comparison
 
@@ -404,7 +409,8 @@ Acceptance requires exit code `0` (`RESULT: SUCCESS - Privacy-normalized PUI par
 
 Verify that a sidecar outage, timeout, or malformed/malicious response causes the
 indexer to safely discard the untrusted projection and execute unchanged native
-`PUIIndexer#final_doc_rules` for the batch without leaking private data or halting indexing.
+`PUIIndexer#configure_doc_rules`, `PUIIndexer#add_notes`, and `PUIIndexer#final_doc_rules`
+for the batch without leaking private data or halting indexing.
 
 ## 9. Rollback
 

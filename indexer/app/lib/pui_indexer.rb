@@ -9,6 +9,9 @@ class PUIIndexer < PeriodicIndexer
 
   PUI_RESOLVES = AppConfig[:record_inheritance_resolves]
 
+  PUI_ROUTING_FIELDS = ['marker', 'id', 'pui_parent_id', 'types'].freeze
+  PUI_NOTES_FIELDS = ['marker', 'notes_published'].freeze
+
   def initialize(backend = nil, state = nil, name)
     state_class = AppConfig[:index_state_class].constantize
     index_state = state || state_class.new("indexer_pui_state")
@@ -62,6 +65,10 @@ class PUIIndexer < PeriodicIndexer
     add_document_prepare_hook {|doc, record|
 
       if RecordInheritance.has_type?(doc['primary_type'])
+        if rust_pui_document_preparation_enabled? && apply_rust_pui_routing_projection(doc, record)
+          next
+        end
+
         parent_id = doc['id']
         doc['id'] = "#{parent_id}#pui"
         doc['pui_parent_id'] = parent_id
@@ -223,11 +230,137 @@ class PUIIndexer < PeriodicIndexer
     false
   end
 
+  def discard_pui_routing(uri)
+    @pui_routing_projections.delete(uri) if @pui_routing_projections && uri
+    false
+  end
+
+  def discard_pui_notes(uri)
+    @pui_notes_projections.delete(uri) if @pui_notes_projections && uri
+    false
+  end
+
+  def apply_rust_pui_routing_projection(doc, record)
+    return false unless record.is_a?(Hash) && record['record'].is_a?(Hash)
+    record_obj = record['record']
+    rec_uri = record_obj['uri']
+    return false unless rec_uri.is_a?(String) && !rec_uri.empty?
+    uri = rec_uri
+
+    rec_type = record_obj['jsonmodel_type']
+    return discard_pui_routing(uri) unless rec_type.is_a?(String) && rec_type == doc['primary_type']
+    return discard_pui_routing(uri) unless RecordInheritance.has_type?(doc['primary_type'])
+
+    if @pui_routing_projections && @pui_routing_projections.key?(uri)
+      projection = @pui_routing_projections[uri]
+      return discard_pui_routing(uri) unless projection.is_a?(Hash)
+    else
+      return false
+    end
+
+    # 1. Exact key set validation: reject missing or extra keys, including string/symbol edge concerns
+    return discard_pui_routing(uri) if projection.keys.any? { |k| !k.is_a?(String) }
+    return discard_pui_routing(uri) unless (PUI_ROUTING_FIELDS - projection.keys).empty? && (projection.keys - PUI_ROUTING_FIELDS).empty?
+
+    # 2. Capability marker & structure validation
+    return discard_pui_routing(uri) unless projection['marker'] == 'pui_routing_metadata'
+    return discard_pui_routing(uri) unless projection['id'].is_a?(String)
+    return discard_pui_routing(uri) unless projection['pui_parent_id'].is_a?(String)
+    return discard_pui_routing(uri) unless projection['types'].is_a?(Array)
+
+    # 3. Authoritative native independent computation:
+    # doc['id'] prior to this hook equals the native id / parent_id (which is rec_uri)
+    parent_id = doc['id']
+    return discard_pui_routing(uri) unless parent_id == uri
+
+    expected_id = "#{parent_id}#pui"
+    expected_parent_id = parent_id
+    expected_type_additions = ['pui', "pui_#{doc['primary_type']}", 'pui_record', 'pui_only']
+
+    # Exact value equality against native independent computation
+    return discard_pui_routing(uri) unless projection['id'] == expected_id
+    return discard_pui_routing(uri) unless projection['pui_parent_id'] == expected_parent_id
+    return discard_pui_routing(uri) unless projection['types'] == expected_type_additions
+
+    # 4. Apply projection safely with exact native append semantics
+    doc['id'] = projection['id']
+    doc['pui_parent_id'] = projection['pui_parent_id']
+    doc['types'] ||= []
+    doc['types'].concat(projection['types'])
+
+    @pui_routing_projections.delete(uri)
+    true
+  rescue StandardError => e
+    Log.warn("PUI routing projection validation failed for #{uri}: #{e.class}: #{e.message}; using native fallback")
+    @pui_routing_projections.delete(uri) if @pui_routing_projections
+    false
+  end
+
+  def apply_rust_pui_notes_projection(doc, record)
+    return false unless record.is_a?(Hash) && record['record'].is_a?(Hash)
+    record_obj = record['record']
+    rec_uri = record_obj['uri']
+    return false unless rec_uri.is_a?(String) && !rec_uri.empty?
+    uri = rec_uri
+
+    rec_type = record_obj['jsonmodel_type']
+    return discard_pui_notes(uri) unless rec_type.is_a?(String) && rec_type == doc['primary_type']
+    return discard_pui_notes(uri) unless RecordInheritance.has_type?(doc['primary_type'])
+
+    if @pui_notes_projections && @pui_notes_projections.key?(uri)
+      projection = @pui_notes_projections[uri]
+      return discard_pui_notes(uri) unless projection.is_a?(Hash)
+    else
+      return false
+    end
+
+    # 1. Exact key set validation: reject missing or extra keys, including string/symbol edge concerns
+    return discard_pui_notes(uri) if projection.keys.any? { |k| !k.is_a?(String) }
+    return discard_pui_notes(uri) unless (PUI_NOTES_FIELDS - projection.keys).empty? && (projection.keys - PUI_NOTES_FIELDS).empty?
+
+    # 2. Capability marker & structure validation
+    return discard_pui_notes(uri) unless projection['marker'] == 'pui_notes_metadata'
+
+    # 3. Check notes presence / absence
+    raw_notes = record_obj['notes']
+    has_notes = !raw_notes.nil? && raw_notes != false
+
+    if !has_notes
+      # Preserve absence behavior exactly when notes is absent/nil/false
+      return discard_pui_notes(uri) unless projection['notes_published'].nil?
+      # Do not set doc['notes_published']
+      @pui_notes_projections.delete(uri)
+      return true
+    end
+
+    # When notes are present, notes_published must be an Array
+    return discard_pui_notes(uri) unless projection['notes_published'].is_a?(Array)
+
+    # 4. Authoritative native independent computation:
+    expected_notes_published = IndexerCommon.extract_string_values(raw_notes, :published_only)
+
+    # Exact equality against native independent computation
+    return discard_pui_notes(uri) unless projection['notes_published'] == expected_notes_published
+
+    # 5. Apply projection safely
+    doc['notes_published'] = projection['notes_published']
+    @pui_notes_projections.delete(uri)
+    true
+  rescue StandardError => e
+    Log.warn("PUI notes projection validation failed for #{uri}: #{e.class}: #{e.message}; using native fallback")
+    @pui_notes_projections.delete(uri) if @pui_notes_projections
+    false
+  end
+
   def build_fullrecord(doc, record)
     doc['fullrecord_published'] = IndexerCommon.extract_string_values(record['record'], :published_only)
   end
 
   def add_notes(doc, record)
+    if rust_pui_document_preparation_enabled? && apply_rust_pui_notes_projection(doc, record)
+      return
+    end
+
     if record['record']['notes']
       doc['notes_published'] = IndexerCommon.extract_string_values(record['record']['notes'], :published_only)
     end
