@@ -264,6 +264,15 @@ class PUIIndexer < PeriodicIndexer
     false
   end
 
+  def discard_pui_common(*uris)
+    if @pui_common_projections
+      uris.flatten.compact.each do |uri|
+        @pui_common_projections.delete(uri) if uri.is_a?(String)
+      end
+    end
+    false
+  end
+
   def apply_rust_pui_routing_projection(doc, record)
     return false unless record.is_a?(Hash) && record['record'].is_a?(Hash)
     record_obj = record['record']
@@ -388,6 +397,132 @@ class PUIIndexer < PeriodicIndexer
     if record['record']['notes']
       doc['notes_published'] = IndexerCommon.extract_string_values(record['record']['notes'], :published_only)
     end
+  end
+
+  def apply_rust_pui_common_helper(helper_name, doc, record)
+    doc_uri = doc.is_a?(Hash) ? doc['uri'] : nil
+    top_uri = record.is_a?(Hash) ? record['uri'] : nil
+    inner_uri = (record.is_a?(Hash) && record['record'].is_a?(Hash)) ? record['record']['uri'] : nil
+    candidate_uris = [doc_uri, top_uri, inner_uri].compact
+
+    unless doc.is_a?(Hash) && record.is_a?(Hash) && record['record'].is_a?(Hash)
+      return discard_pui_common(candidate_uris)
+    end
+    record_obj = record['record']
+
+    # Strict exact URI agreement across record['record']['uri'], top-level record['uri'], and doc['uri']
+    # Note: doc['id'] may legitimately become "#{uri}#pui", but doc['uri'] stays native
+    unless inner_uri.is_a?(String) && !inner_uri.strip.empty? &&
+           top_uri.is_a?(String) && !top_uri.strip.empty? &&
+           doc_uri.is_a?(String) && !doc_uri.strip.empty? &&
+           inner_uri == top_uri && top_uri == doc_uri
+      return discard_pui_common(candidate_uris)
+    end
+    uri = doc_uri
+
+    rec_type = record_obj['jsonmodel_type']
+    primary_type = doc['primary_type']
+    unless rec_type.is_a?(String) && !rec_type.strip.empty? &&
+           primary_type.is_a?(String) && !primary_type.strip.empty? &&
+           rec_type == primary_type
+      return discard_pui_common(uri)
+    end
+
+    if @pui_common_projections && @pui_common_projections.key?(uri)
+      projection = @pui_common_projections[uri]
+      return discard_pui_common(uri) unless projection.is_a?(Hash)
+    else
+      return false
+    end
+
+    # 1. Envelope validation: string keys only and exact allowed keys
+    return discard_pui_common(uri) if projection.keys.any? { |k| !k.is_a?(String) }
+    expected_fields = RustIndexDocumentBuilder::PUI_COMMON_FIELDS
+    return discard_pui_common(uri) unless (expected_fields - projection.keys).empty? && (projection.keys - expected_fields).empty?
+
+    # 2. Markers and identity
+    return discard_pui_common(uri) unless projection['marker'] == 'pui_common_metadata'
+    return discard_pui_common(uri) unless projection['uri'] == uri
+    return discard_pui_common(uri) unless projection['primary_type'] == doc['primary_type']
+
+    # 3. Helper patch must be a Hash with strictly allowed keys
+    helper_patch = projection[helper_name]
+    return discard_pui_common(uri) unless helper_patch.is_a?(Hash)
+    return discard_pui_common(uri) if helper_patch.keys.any? { |k| !k.is_a?(String) }
+    allowed_keys = RustIndexDocumentBuilder::PUI_COMMON_HELPER_FIELDS[helper_name]
+    return discard_pui_common(uri) unless (helper_patch.keys - allowed_keys).empty?
+
+    # 4. Authoritative native independent computation on scratch doc
+    scratch_doc = {}
+    yield scratch_doc
+
+    # 5. Type-strict JSON equality between scratch_doc and helper_patch
+    begin
+      RustIndexDocumentBuilder.validate_json_equal!(scratch_doc, helper_patch, "pui_common.#{helper_name}")
+    rescue StandardError => e
+      Log.warn("PUI common projection validation failed for #{uri} on #{helper_name}: #{e.class}: #{e.message}; using native fallback") if defined?(Log) && Log.respond_to?(:warn)
+      return discard_pui_common(uri)
+    end
+
+    # 6. Apply strictly equal patch to doc
+    helper_patch.each do |k, v|
+      doc[k] = v
+    end
+
+    true
+  rescue StandardError => e
+    Log.warn("PUI common helper failed for #{uri}: #{e.class}: #{e.message}; using native fallback") if defined?(Log) && Log.respond_to?(:warn)
+    discard_pui_common(uri)
+    false
+  end
+
+  def add_subjects(doc, record)
+    if rust_pui_common_metadata_enabled? && apply_rust_pui_common_helper('subjects', doc, record) { |scratch| super(scratch, record) }
+      return
+    end
+    super
+  end
+
+  def add_agents(doc, record)
+    if rust_pui_common_metadata_enabled? && apply_rust_pui_common_helper('agents', doc, record) { |scratch| super(scratch, record) }
+      return
+    end
+    super
+  end
+
+  def add_audit_info(doc, record)
+    if rust_pui_common_metadata_enabled? && apply_rust_pui_common_helper('audit_info', doc, record) { |scratch| super(scratch, record) }
+      return
+    end
+    super
+  end
+
+  def add_years(doc, record)
+    if rust_pui_common_metadata_enabled? && apply_rust_pui_common_helper('years', doc, record) { |scratch| super(scratch, record) }
+      return
+    end
+    super
+  end
+
+  def add_level(doc, record)
+    if rust_pui_common_metadata_enabled? && apply_rust_pui_common_helper('level', doc, record) { |scratch| super(scratch, record) }
+      return
+    end
+    super
+  end
+
+  def add_summary(doc, record)
+    if rust_pui_common_metadata_enabled? && apply_rust_pui_common_helper('summary', doc, record) { |scratch| super(scratch, record) }
+      return
+    end
+    super
+  end
+
+  def add_extents(doc, record)
+    if rust_pui_common_metadata_enabled? && apply_rust_pui_common_helper('extents', doc, record) { |scratch| super(scratch, record) }
+      return
+    end
+    super
   end
 
   def add_infscroll_docs(resource_uris, batch)

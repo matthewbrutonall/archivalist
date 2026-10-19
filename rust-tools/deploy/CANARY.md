@@ -454,12 +454,28 @@ When testing `AppConfig[:rust_pui_record_inheritance_candidate_enabled] = true`,
    private marker leakage.
 5. Direct-only inheritance (`fetch_records`), backend/OAI, and non-PUI paths remain completely untouched.
 
+### Step F: PUI common search metadata preparation
+
+When testing `AppConfig[:rust_pui_common_metadata_enabled] = true`, verify that:
+1. The Rust sidecar prepares deterministic common PUI search metadata projections under
+   `_archivalist_pui_common` with capability marker `pui_common_metadata`.
+2. Covers exactly the seven native helpers (`add_subjects`, `add_agents`, `add_audit_info`,
+   `add_years`, `add_level`, `add_summary`, `add_extents`) when invoked by `PUIIndexer`.
+3. Input is the direct-only record seen by these helpers, never the fully inherited final candidate.
+4. Each helper patch is validated against independent native execution on a scratch doc and applied
+   at its original native call position, preserving plugin order, pre-existing doc fields, absence/no-write
+   semantics, and mutations made prior to that call.
+5. Incompatible combinations (`enrich`, `prepare_pui_auxiliary`, `prepare_pui_availability`) and
+   non-boolean capability values reject cleanly.
+6. Sidecar failure, outage, type mismatch (e.g. integer vs float, boolean vs integer), unknown keys,
+   or unexpected projections fall back cleanly to native execution without partial state or leaked markers.
+
 ## 9. Rollback
 
 Set all sidecar enable flags, including `rust_index_document_builder_enabled`,
 `rust_index_document_enrichment_enabled`, `rust_pui_document_preparation_enabled`,
 `rust_pui_availability_preparation_enabled`, `rust_pui_auxiliary_documents_enabled`,
-and `rust_pui_record_inheritance_candidate_enabled`, to `false` and restart Archivalist:
+`rust_pui_record_inheritance_candidate_enabled`, and `rust_pui_common_metadata_enabled`, to `false` and restart Archivalist:
 
 ```ruby
 AppConfig[:rust_index_document_builder_enabled] = false
@@ -468,6 +484,7 @@ AppConfig[:rust_pui_document_preparation_enabled] = false
 AppConfig[:rust_pui_availability_preparation_enabled] = false
 AppConfig[:rust_pui_auxiliary_documents_enabled] = false
 AppConfig[:rust_pui_record_inheritance_candidate_enabled] = false
+AppConfig[:rust_pui_common_metadata_enabled] = false
 ```
 
 The sidecar can then be stopped independently. Do not point the service at the primary

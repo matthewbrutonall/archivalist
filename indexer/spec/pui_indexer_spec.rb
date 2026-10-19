@@ -1732,4 +1732,936 @@ describe "PUI indexer" do
       AppConfig[:rust_pui_record_inheritance_candidate_enabled] = false
     end
   end
+
+  describe "PUI common search metadata preparation" do
+    let(:sample_common_record) do
+      {
+        'uri' => '/repositories/2/resources/99',
+        'jsonmodel_type' => 'resource',
+        'title' => 'Common Test Resource',
+        'publish' => true,
+        'suppressed' => false,
+        'created_by' => 'archivist',
+        'last_modified_by' => 'admin',
+        'user_mtime' => '2026-10-19T10:00:00Z',
+        'system_mtime' => '2026-10-19T10:00:01Z',
+        'create_time' => '2026-10-01T00:00:00Z',
+        'level' => 'subfonds',
+        'other_level' => 'subfonds',
+        'related_accessions' => [],
+        'classifications' => [],
+        'instances' => [],
+        'external_ids' => [],
+        'rights_statements' => [],
+        'lang_materials' => [],
+        'id_0' => 'RES',
+        'id_1' => '99',
+        'resource_type' => 'collection',
+        'restrictions' => false,
+        'ead_id' => nil,
+        'finding_aid_title' => nil,
+        'finding_aid_filing_title' => nil,
+        'finding_aid_status' => nil,
+        'slug' => nil,
+        'is_slug_auto' => false,
+        'subjects' => [
+          { 'ref' => '/subjects/10', '_resolved' => { 'title' => 'Church History' } },
+          { 'ref' => '/subjects/11', '_resolved' => { 'title' => nil } }, # compacted
+          { 'ref' => '/subjects/12', '_resolved' => { 'title' => 'Archives' } }
+        ],
+        'linked_agents' => [
+          {
+            'ref' => '/agents/people/5',
+            'role' => 'creator',
+            '_resolved' => {
+              'display_name' => { 'sort_name' => 'Doe, Jane' },
+              'publish' => true
+            }
+          },
+          {
+            'ref' => '/agents/corporate_entities/6',
+            'role' => 'subject',
+            '_resolved' => {
+              'display_name' => { 'sort_name' => 'Example Historical Society' },
+              'publish' => false
+            }
+          }
+        ],
+        'dates' => [
+          {
+            'date_type' => 'inclusive',
+            'begin' => '1900-01-01',
+            'end' => '1905-12-31'
+          },
+          {
+            'date_type' => 'single',
+            'begin' => '1920-01-01'
+          }
+        ],
+        'notes' => [
+          {
+            'type' => 'abstract',
+            'content' => ['Summary paragraph 1', 'Summary paragraph 2']
+          }
+        ],
+        'extents' => [
+          {
+            'portion' => 'part',
+            'number' => '10',
+            'extent_type' => 'files'
+          },
+          {
+            'portion' => 'whole',
+            'number' => '2',
+            'extent_type' => 'boxes'
+          }
+        ]
+      }
+    end
+
+    let(:valid_pui_common_projection) do
+      {
+        'marker' => 'pui_common_metadata',
+        'uri' => '/repositories/2/resources/99',
+        'primary_type' => 'resource',
+        'subjects' => {
+          'subjects' => ['Church History', 'Archives'],
+          'subject_uris' => ['/subjects/10', '/subjects/11', '/subjects/12']
+        },
+        'agents' => {
+          'agents' => ['Doe, Jane', 'Example Historical Society'],
+          'agent_uris' => ['/agents/people/5', '/agents/corporate_entities/6'],
+          'published_agents' => ['Doe, Jane'],
+          'published_agent_uris' => ['/agents/people/5'],
+          'creators' => ['Doe, Jane']
+        },
+        'audit_info' => {
+          'created_by' => 'archivist',
+          'last_modified_by' => 'admin',
+          'user_mtime' => '2026-10-19T10:00:00Z',
+          'system_mtime' => '2026-10-19T10:00:01Z',
+          'create_time' => '2026-10-01T00:00:00Z'
+        },
+        'years' => {
+          'years' => ['1900', '1901', '1902', '1903', '1904', '1905', '1920'],
+          'year_sort' => '19001920',
+          'dates' => ['1900-01-01 - 1905-12-31']
+        },
+        'level' => {
+          'level' => 'subfonds'
+        },
+        'summary' => {
+          'summary' => "Summary paragraph 1\nSummary paragraph 2"
+        },
+        'extents' => {
+          'extents' => ['2 --- boxes']
+        }
+      }
+    end
+
+    let(:valid_rust_envelope_doc) do
+      uri = sample_common_record['uri']
+      {
+        'id' => uri,
+        'uri' => uri,
+        'title' => sample_common_record['title'],
+        'primary_type' => 'resource',
+        'types' => ['resource'],
+        'json' => ASUtils.to_json(sample_common_record),
+        'suppressed' => false,
+        'publish' => true,
+        'system_generated' => 'false',
+        'repository' => 2,
+        '_archivalist_rust_fields' => ['pui_common_metadata'],
+        '_archivalist_pui_common' => valid_pui_common_projection.dup
+      }
+    end
+
+    it "honors disabled AppConfig[:rust_pui_common_metadata_enabled] and executes unchanged native helpers" do
+      AppConfig[:rust_pui_common_metadata_enabled] = false
+
+      doc = { 'id' => "#{sample_common_record['uri']}#pui", 'uri' => sample_common_record['uri'], 'primary_type' => 'resource' }
+      rec = { 'record' => sample_common_record, 'uri' => sample_common_record['uri'] }
+
+      # With flag disabled, helper runs native logic without using projections
+      indexer.instance_variable_set(:@pui_common_projections, { sample_common_record['uri'] => valid_pui_common_projection })
+      indexer.add_subjects(doc, rec)
+      indexer.add_agents(doc, rec)
+      indexer.add_audit_info(doc, rec)
+      indexer.add_years(doc, rec)
+      indexer.add_level(doc, rec)
+      indexer.add_summary(doc, rec)
+      indexer.add_extents(doc, rec)
+
+      expect(doc['subjects']).to eq(['Church History', 'Archives'])
+      expect(doc['level']).to eq('subfonds')
+      expect(doc['summary']).to eq("Summary paragraph 1\nSummary paragraph 2")
+      expect(doc['extents']).to eq(['2 --- boxes'])
+      # Projection cache remains untouched because accelerated helper was never entered
+      expect(indexer.instance_variable_get(:@pui_common_projections)[sample_common_record['uri']]).to eq(valid_pui_common_projection)
+    end
+
+    it "applies trusted PUI common metadata projections at original native call positions for all seven helpers" do
+      begin
+        AppConfig[:rust_pui_common_metadata_enabled] = true
+
+        doc = {
+          'id' => "#{sample_common_record['uri']}#pui",
+          'uri' => sample_common_record['uri'],
+          'primary_type' => 'resource',
+          'pre_existing' => 'preserved'
+        }
+        rec = { 'record' => sample_common_record, 'uri' => sample_common_record['uri'] }
+
+        indexer.instance_variable_set(:@pui_common_projections, { sample_common_record['uri'] => valid_pui_common_projection.dup })
+
+        indexer.add_subjects(doc, rec)
+        expect(doc['subjects']).to eq(['Church History', 'Archives'])
+        expect(doc['subject_uris']).to eq(['/subjects/10', '/subjects/11', '/subjects/12'])
+
+        indexer.add_agents(doc, rec)
+        expect(doc['agents']).to eq(['Doe, Jane', 'Example Historical Society'])
+        expect(doc['published_agents']).to eq(['Doe, Jane'])
+        expect(doc['creators']).to eq(['Doe, Jane'])
+
+        indexer.add_audit_info(doc, rec)
+        expect(doc['created_by']).to eq('archivist')
+        expect(doc['last_modified_by']).to eq('admin')
+
+        indexer.add_years(doc, rec)
+        expect(doc['years']).to eq(['1900', '1901', '1902', '1903', '1904', '1905', '1920'])
+        expect(doc['year_sort']).to eq('19001920')
+        expect(doc['dates']).to eq(['1900-01-01 - 1905-12-31'])
+
+        indexer.add_level(doc, rec)
+        expect(doc['level']).to eq('subfonds')
+
+        indexer.add_summary(doc, rec)
+        expect(doc['summary']).to eq("Summary paragraph 1\nSummary paragraph 2")
+
+        indexer.add_extents(doc, rec)
+        expect(doc['extents']).to eq(['2 --- boxes'])
+
+        # Pre-existing unrelated doc fields remain intact
+        expect(doc['pre_existing']).to eq('preserved')
+
+        # Assert the trusted projection cache survived validation and was not discarded
+        expect(indexer.instance_variable_get(:@pui_common_projections)[sample_common_record['uri']]).to eq(valid_pui_common_projection)
+      ensure
+        AppConfig[:rust_pui_common_metadata_enabled] = false
+      end
+    end
+
+    it "preserves absence semantics when helper fields are absent or falsey" do
+      begin
+        AppConfig[:rust_pui_common_metadata_enabled] = true
+
+        sparse_record = {
+          'uri' => '/repositories/2/resources/101',
+          'jsonmodel_type' => 'resource',
+          'title' => 'Sparse Resource',
+          'publish' => true,
+        }
+
+        empty_projection = {
+          'marker' => 'pui_common_metadata',
+          'uri' => '/repositories/2/resources/101',
+          'primary_type' => 'resource',
+          'subjects' => {},
+          'agents' => {},
+          'audit_info' => {},
+          'years' => {},
+          'level' => {},
+          'summary' => {},
+          'extents' => {}
+        }
+
+        doc = {
+          'id' => "#{sparse_record['uri']}#pui",
+          'uri' => sparse_record['uri'],
+          'primary_type' => 'resource'
+        }
+        rec = { 'record' => sparse_record, 'uri' => sparse_record['uri'] }
+
+        indexer.instance_variable_set(:@pui_common_projections, { sparse_record['uri'] => empty_projection })
+
+        indexer.add_subjects(doc, rec)
+        indexer.add_agents(doc, rec)
+        indexer.add_audit_info(doc, rec)
+        indexer.add_years(doc, rec)
+        indexer.add_level(doc, rec)
+        indexer.add_summary(doc, rec)
+        indexer.add_extents(doc, rec)
+
+        # In native, none of these fields are written when source keys are absent
+        expect(doc.has_key?('subjects')).to be(false)
+        expect(doc.has_key?('agents')).to be(false)
+        expect(doc.has_key?('created_by')).to be(false)
+        expect(doc.has_key?('years')).to be(false)
+        expect(doc.has_key?('level')).to be(false)
+        expect(doc.has_key?('summary')).to be(false)
+        expect(doc.has_key?('extents')).to be(false)
+
+        # Assert projection was accepted across all seven helpers rather than discarded via accidental fallback
+        expect(indexer.instance_variable_get(:@pui_common_projections)[sparse_record['uri']]).to eq(empty_projection)
+      ensure
+        AppConfig[:rust_pui_common_metadata_enabled] = false
+      end
+    end
+
+    it "maps otherlevel to other_level in add_level" do
+      begin
+        AppConfig[:rust_pui_common_metadata_enabled] = true
+        other_rec = sample_common_record.merge('level' => 'otherlevel', 'other_level' => 'fonds')
+        uri = other_rec['uri']
+        doc = { 'id' => uri, 'uri' => uri, 'primary_type' => 'resource' }
+        proj = valid_pui_common_projection.dup
+        proj['level'] = { 'level' => 'fonds' }
+        indexer.instance_variable_set(:@pui_common_projections, { uri => proj })
+
+        indexer.add_level(doc, { 'record' => other_rec, 'uri' => uri })
+        expect(doc['level']).to eq('fonds')
+        expect(indexer.instance_variable_get(:@pui_common_projections)[uri]).not_to be_nil
+      ensure
+        AppConfig[:rust_pui_common_metadata_enabled] = false
+      end
+    end
+
+    it "detects plugin input mutations before helpers and safely falls back to native helper execution" do
+      begin
+        AppConfig[:rust_pui_common_metadata_enabled] = true
+
+        doc = { 'id' => sample_common_record['uri'], 'uri' => sample_common_record['uri'], 'primary_type' => 'resource' }
+        mutated_record = sample_common_record.dup
+        rec = { 'record' => mutated_record, 'uri' => mutated_record['uri'] }
+
+        indexer.instance_variable_set(:@pui_common_projections, { mutated_record['uri'] => valid_pui_common_projection.dup })
+
+        # Simulate a plugin mutating the record in-memory before add_subjects runs
+        mutated_record['subjects'] = [
+          { 'ref' => '/subjects/mutated', '_resolved' => { 'title' => 'Mutated Subject' } }
+        ]
+
+        # add_subjects detects that the projection patch does not equal native execution on the mutated record,
+        # discards the projection, and falls back to native execution using the mutated record
+        indexer.add_subjects(doc, rec)
+
+        expect(doc['subjects']).to eq(['Mutated Subject'])
+        expect(doc['subject_uris']).to eq(['/subjects/mutated'])
+        # Projection was discarded for this URI
+        expect(indexer.instance_variable_get(:@pui_common_projections)[mutated_record['uri']]).to be_nil
+      ensure
+        AppConfig[:rust_pui_common_metadata_enabled] = false
+      end
+    end
+
+    it "safely detects identity mutations and prevents cross-record cache consumption across multiple records" do
+      begin
+        AppConfig[:rust_pui_common_metadata_enabled] = true
+
+        uri_a = '/repositories/2/resources/99'
+        uri_b = '/repositories/2/resources/102'
+
+        rec_a = { 'record' => sample_common_record.dup, 'uri' => uri_a }
+        rec_b_hash = sample_common_record.merge('uri' => uri_b, 'title' => 'Resource B')
+        rec_b = { 'record' => rec_b_hash, 'uri' => uri_b }
+
+        proj_a = valid_pui_common_projection.dup
+        proj_b = valid_pui_common_projection.merge('uri' => uri_b)
+
+        indexer.instance_variable_set(:@pui_common_projections, {
+          uri_a => proj_a,
+          uri_b => proj_b
+        })
+
+        # A plugin mutates record A's inner record['record']['uri'] to point to record B
+        rec_a['record']['uri'] = uri_b
+
+        # Note: doc['id'] may legitimately become "#{uri_a}#pui", but doc['uri'] is native uri_a
+        doc_a = { 'id' => "#{uri_a}#pui", 'uri' => uri_a, 'primary_type' => 'resource' }
+
+        # Hook detects inner URI vs doc/top URI mismatch
+        indexer.add_subjects(doc_a, rec_a)
+
+        # Both candidate URIs (uri_a and uri_b) are discarded from cache to prevent cross-record leakage
+        expect(indexer.instance_variable_get(:@pui_common_projections)[uri_a]).to be_nil
+        expect(indexer.instance_variable_get(:@pui_common_projections)[uri_b]).to be_nil
+
+        # doc_a fell back to native computation on its actual record
+        expect(doc_a['subjects']).to eq(['Church History', 'Archives'])
+      ensure
+        AppConfig[:rust_pui_common_metadata_enabled] = false
+      end
+    end
+
+    it "rejects invalid projection envelopes, unknown keys, mismatched URIs, and altered types without recursive re-entry" do
+      begin
+        AppConfig[:rust_pui_common_metadata_enabled] = true
+
+        uri = sample_common_record['uri']
+        rec = { 'record' => sample_common_record, 'uri' => uri }
+
+        # 1. Unknown extra key in projection envelope
+        doc1 = { 'id' => uri, 'uri' => uri, 'primary_type' => 'resource' }
+        bad_proj1 = valid_pui_common_projection.merge('unexpected_key' => 'evil')
+        indexer.instance_variable_set(:@pui_common_projections, { uri => bad_proj1 })
+        indexer.add_subjects(doc1, rec)
+        expect(doc1['subjects']).to eq(['Church History', 'Archives'])
+        expect(indexer.instance_variable_get(:@pui_common_projections)[uri]).to be_nil
+
+        # 2. Marker mismatch
+        doc2 = { 'id' => uri, 'uri' => uri, 'primary_type' => 'resource' }
+        bad_proj2 = valid_pui_common_projection.merge('marker' => 'wrong_marker')
+        indexer.instance_variable_set(:@pui_common_projections, { uri => bad_proj2 })
+        indexer.add_subjects(doc2, rec)
+        expect(doc2['subjects']).to eq(['Church History', 'Archives'])
+        expect(indexer.instance_variable_get(:@pui_common_projections)[uri]).to be_nil
+
+        # 3. Mismatched URI
+        doc3 = { 'id' => uri, 'uri' => uri, 'primary_type' => 'resource' }
+        bad_proj3 = valid_pui_common_projection.merge('uri' => '/repositories/2/resources/other')
+        indexer.instance_variable_set(:@pui_common_projections, { uri => bad_proj3 })
+        indexer.add_subjects(doc3, rec)
+        expect(doc3['subjects']).to eq(['Church History', 'Archives'])
+        expect(indexer.instance_variable_get(:@pui_common_projections)[uri]).to be_nil
+
+        # 4. Unknown key inside helper patch
+        doc4 = { 'id' => uri, 'uri' => uri, 'primary_type' => 'resource' }
+        bad_proj4 = valid_pui_common_projection.dup
+        bad_proj4['subjects'] = bad_proj4['subjects'].merge('unknown_helper_key' => 'leak')
+        indexer.instance_variable_set(:@pui_common_projections, { uri => bad_proj4 })
+        indexer.add_subjects(doc4, rec)
+        expect(doc4['subjects']).to eq(['Church History', 'Archives'])
+        expect(indexer.instance_variable_get(:@pui_common_projections)[uri]).to be_nil
+
+        # 5. Type alteration inside helper patch (level value is integer instead of string)
+        # Authoritative native check rejects integer level, discards cache, and does not re-enter recursively
+        doc5 = { 'id' => uri, 'uri' => uri, 'primary_type' => 'resource' }
+        bad_proj5 = valid_pui_common_projection.dup
+        bad_proj5['level'] = { 'level' => 123 }
+        indexer.instance_variable_set(:@pui_common_projections, { uri => bad_proj5 })
+        indexer.add_level(doc5, rec)
+        expect(doc5['level']).to eq('subfonds')
+        expect(indexer.instance_variable_get(:@pui_common_projections)[uri]).to be_nil
+      ensure
+        AppConfig[:rust_pui_common_metadata_enabled] = false
+      end
+    end
+
+    it "handles sidecar outage and resets projection caches per batch with multi-record isolation" do
+      begin
+        AppConfig[:rust_pui_common_metadata_enabled] = true
+
+        # 1. Sidecar outage (no entry in @pui_common_projections)
+        doc = { 'id' => sample_common_record['uri'], 'uri' => sample_common_record['uri'], 'primary_type' => 'resource' }
+        rec = { 'record' => sample_common_record, 'uri' => sample_common_record['uri'] }
+        indexer.instance_variable_set(:@pui_common_projections, {})
+
+        indexer.add_subjects(doc, rec)
+        expect(doc['subjects']).to eq(['Church History', 'Archives'])
+
+        # 2. Multi-record isolation: failure in record A does not corrupt record B
+        uri_a = '/repositories/2/resources/99'
+        uri_b = '/repositories/2/resources/102'
+
+        rec_b_hash = sample_common_record.merge('uri' => uri_b, 'title' => 'Resource B')
+        rec_b = { 'record' => rec_b_hash, 'uri' => uri_b }
+
+        proj_b = valid_pui_common_projection.merge('uri' => uri_b)
+
+        # Corrupt record A's projection
+        bad_proj_a = valid_pui_common_projection.merge('marker' => 'corrupted')
+
+        indexer.instance_variable_set(:@pui_common_projections, {
+          uri_a => bad_proj_a,
+          uri_b => proj_b
+        })
+
+        doc_a = { 'id' => uri_a, 'uri' => uri_a, 'primary_type' => 'resource' }
+        doc_b = { 'id' => uri_b, 'uri' => uri_b, 'primary_type' => 'resource' }
+
+        indexer.add_subjects(doc_a, rec)
+        indexer.add_subjects(doc_b, rec_b)
+
+        # Record A fell back natively
+        expect(doc_a['subjects']).to eq(['Church History', 'Archives'])
+        expect(indexer.instance_variable_get(:@pui_common_projections)[uri_a]).to be_nil
+
+        # Record B succeeded with trusted projection
+        expect(doc_b['subjects']).to eq(['Church History', 'Archives'])
+        expect(indexer.instance_variable_get(:@pui_common_projections)[uri_b]).to eq(proj_b)
+      ensure
+        AppConfig[:rust_pui_common_metadata_enabled] = false
+      end
+    end
+
+    it "exercises IndexerCommon#index_records with IndexBatch capture, helper ordering around add_notes, verified requested JSON, and helper acceptance" do
+      saved_inheritance_config = AppConfig[:record_inheritance]
+      begin
+        AppConfig[:rust_index_document_builder_enabled] = true
+        AppConfig[:rust_pui_common_metadata_enabled] = true
+        AppConfig[:rust_pui_document_preparation_enabled] = false
+        AppConfig[:record_inheritance] = (saved_inheritance_config || {}).merge(
+          :resource => {
+            :inherited_fields => [
+              { :property => 'title', :inherit_directly => true }
+            ]
+          }
+        )
+
+        test_indexer = PUIIndexer.new(AppConfig[:backend_url], nil, 'PUIIndexer')
+        captured_batch = []
+        test_indexer.define_singleton_method(:index_batch) do |batch, _timing = nil, _opts = {}|
+          batch.each { |doc| captured_batch << doc }
+        end
+
+        uri = sample_common_record['uri']
+        record_input = { 'record' => sample_common_record.dup, 'uri' => uri }
+
+        valid_rust_envelope_doc = {
+          'id' => uri,
+          'uri' => uri,
+          'title' => sample_common_record['title'],
+          'primary_type' => 'resource',
+          'types' => ['resource'],
+          'json' => ASUtils.to_json(sample_common_record),
+          'suppressed' => false,
+          'publish' => true,
+          'system_generated' => 'false',
+          'repository' => 2,
+          '_archivalist_rust_fields' => ['pui_common_metadata'],
+          '_archivalist_pui_common' => valid_pui_common_projection.dup
+        }
+
+        # 1. Capture perform_request and assert requested JSON payload
+        captured_request = nil
+        allow_any_instance_of(RustIndexDocumentBuilder).to receive(:perform_request) do |_builder, req|
+          captured_request = req
+          Struct.new(:code, :body).new('200', ASUtils.to_json(
+            'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+            'documents' => [valid_rust_envelope_doc]
+          ))
+        end
+
+        # 2. Instrument helper order covering all seven helpers plus add_notes
+        order_trail = []
+        [:add_subjects, :add_agents, :add_audit_info, :add_notes, :add_years, :add_level, :add_summary, :add_extents].each do |m|
+          orig_m = test_indexer.method(m)
+          test_indexer.define_singleton_method(m) do |doc, rec|
+            order_trail << m
+            orig_m.call(doc, rec)
+          end
+        end
+
+        # 3. Track helper acceptance before batch cleanup
+        accepted_helpers = []
+        orig_apply = test_indexer.method(:apply_rust_pui_common_helper)
+        test_indexer.define_singleton_method(:apply_rust_pui_common_helper) do |helper_name, doc, rec, &block|
+          res = orig_apply.call(helper_name, doc, rec, &block)
+          accepted_helpers << helper_name if res
+          res
+        end
+
+        projection_present_during_hooks = nil
+        plugin_saw_pui_common_marker = nil
+        plugin_hook = proc do |doc, rec|
+          projection_present_during_hooks = !test_indexer.instance_variable_get(:@pui_common_projections)[uri].nil?
+          plugin_saw_pui_common_marker = doc.has_key?('_archivalist_pui_common')
+        end
+
+        hooks = test_indexer.instance_variable_get(:@document_prepare_hooks)
+        final_hook = hooks.pop
+        hooks << plugin_hook
+        hooks << final_hook
+
+        # Execute real index_records
+        test_indexer.index_records([record_input])
+
+        # Assert perform_request was actually called with expected JSON
+        expect(captured_request).not_to be_nil
+        req_payload = ASUtils.json_parse(captured_request.body)
+        expect(req_payload['records'].length).to eq(1)
+        req_rec = req_payload['records'].first
+        expect(req_rec['prepare_pui_common_metadata']).to be(true)
+        expect(req_rec['prepare_pui_final']).to be_nil
+
+        # Assert helper call order matches original native sequence around add_notes
+        expect(order_trail).to eq([:add_subjects, :add_agents, :add_audit_info, :add_notes, :add_years, :add_level, :add_summary, :add_extents])
+
+        # Assert helper path accepted all seven projections before batch cleanup
+        expect(accepted_helpers).to eq(['subjects', 'agents', 'audit_info', 'years', 'level', 'summary', 'extents'])
+        expect(projection_present_during_hooks).to be(true)
+
+        expect(captured_batch.length).to eq(1)
+        final_doc = captured_batch.first
+
+        # Verify all common search fields applied at original positions
+        expect(final_doc['subjects']).to eq(['Church History', 'Archives'])
+        expect(final_doc['subject_uris']).to eq(['/subjects/10', '/subjects/11', '/subjects/12'])
+        expect(final_doc['agents']).to eq(['Doe, Jane', 'Example Historical Society'])
+        expect(final_doc['published_agents']).to eq(['Doe, Jane'])
+        expect(final_doc['creators']).to eq(['Doe, Jane'])
+        expect(final_doc['created_by']).to eq('archivist')
+        expect(final_doc['last_modified_by']).to eq('admin')
+        expect(final_doc['years']).to eq(['1900', '1901', '1902', '1903', '1904', '1905', '1920'])
+        expect(final_doc['year_sort']).to eq('19001920')
+        expect(final_doc['dates']).to eq(['1900-01-01 - 1905-12-31'])
+        expect(final_doc['level']).to eq('subfonds')
+        expect(final_doc['summary']).to eq("Summary paragraph 1\nSummary paragraph 2")
+        expect(final_doc['extents']).to eq(['2 --- boxes'])
+
+        # Verify no private handoff metadata reached plugins or final output
+        expect(plugin_saw_pui_common_marker).to be(false)
+        expect(final_doc.keys.none? { |k| k.to_s.start_with?('_archivalist_') }).to be(true)
+
+        # Batch cache is cleaned up to nil after index_records
+        expect(test_indexer.instance_variable_get(:@pui_common_projections)).to be_nil
+      ensure
+        AppConfig[:record_inheritance] = saved_inheritance_config
+        AppConfig[:rust_index_document_builder_enabled] = false
+        AppConfig[:rust_pui_common_metadata_enabled] = false
+        AppConfig[:rust_pui_document_preparation_enabled] = false
+      end
+    end
+
+    it "supports combined prepare_pui_final and prepare_pui_common_metadata in index_records" do
+      saved_inheritance_config = AppConfig[:record_inheritance]
+      begin
+        AppConfig[:rust_index_document_builder_enabled] = true
+        AppConfig[:rust_pui_common_metadata_enabled] = true
+        AppConfig[:rust_pui_document_preparation_enabled] = true
+        AppConfig[:record_inheritance] = (saved_inheritance_config || {}).merge(
+          :resource => {
+            :inherited_fields => [
+              { :property => 'title', :inherit_directly => true }
+            ]
+          }
+        )
+
+        test_indexer = PUIIndexer.new(AppConfig[:backend_url], nil, 'PUIIndexer')
+        combined_batch = []
+        test_indexer.define_singleton_method(:index_batch) do |batch, _timing = nil, _opts = {}|
+          batch.each { |doc| combined_batch << doc }
+        end
+
+        uri = sample_common_record['uri']
+        record_input = { 'record' => sample_common_record.dup, 'uri' => uri }
+
+        valid_rust_envelope_doc = {
+          'id' => uri,
+          'uri' => uri,
+          'title' => sample_common_record['title'],
+          'primary_type' => 'resource',
+          'types' => ['resource'],
+          'json' => ASUtils.to_json(sample_common_record),
+          'suppressed' => false,
+          'publish' => true,
+          'system_generated' => 'false',
+          'repository' => 2,
+          '_archivalist_rust_fields' => ['pui_common_metadata'],
+          '_archivalist_pui_common' => valid_pui_common_projection.dup
+        }
+
+        combined_envelope_doc = valid_rust_envelope_doc.merge(
+          '_archivalist_rust_fields' => [
+            'pui_final_document_metadata',
+            'pui_routing_metadata',
+            'pui_notes_metadata',
+            'pui_common_metadata'
+          ],
+          '_archivalist_pui_final' => {
+            'marker' => 'pui_final_document_metadata',
+            'json' => ASUtils.to_json(sample_common_record),
+            'fullrecord_published' => IndexerCommon.extract_string_values(sample_common_record, :published_only)
+          },
+          '_archivalist_pui_routing' => {
+            'marker' => 'pui_routing_metadata',
+            'id' => "#{uri}#pui",
+            'pui_parent_id' => uri,
+            'types' => ['pui', 'pui_resource', 'pui_record', 'pui_only']
+          },
+          '_archivalist_pui_notes' => {
+            'marker' => 'pui_notes_metadata',
+            'notes_published' => IndexerCommon.extract_string_values(sample_common_record['notes'], :published_only)
+          },
+          '_archivalist_pui_common' => valid_pui_common_projection.dup
+        )
+
+        combined_request = nil
+        allow_any_instance_of(RustIndexDocumentBuilder).to receive(:perform_request) do |_builder, req|
+          combined_request = req
+          Struct.new(:code, :body).new('200', ASUtils.to_json(
+            'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+            'documents' => [combined_envelope_doc]
+          ))
+        end
+
+        test_indexer.index_records([record_input])
+
+        expect(combined_request).not_to be_nil
+        comb_payload = ASUtils.json_parse(combined_request.body)
+        comb_rec = comb_payload['records'].first
+        expect(comb_rec['prepare_pui_common_metadata']).to be(true)
+        expect(comb_rec['prepare_pui_final']).to be(true)
+
+        expect(combined_batch.length).to eq(1)
+        comb_doc = combined_batch.first
+        expect(comb_doc['id']).to eq("#{uri}#pui")
+        expect(comb_doc['subjects']).to eq(['Church History', 'Archives'])
+        expect(comb_doc.keys.none? { |k| k.to_s.start_with?('_archivalist_') }).to be(true)
+        expect(test_indexer.instance_variable_get(:@pui_common_projections)).to be_nil
+      ensure
+        AppConfig[:record_inheritance] = saved_inheritance_config
+        AppConfig[:rust_index_document_builder_enabled] = false
+        AppConfig[:rust_pui_common_metadata_enabled] = false
+        AppConfig[:rust_pui_document_preparation_enabled] = false
+      end
+    end
+
+    it "falls back cleanly when sidecar perform_request raises transport outage error" do
+      saved_inheritance_config = AppConfig[:record_inheritance]
+      begin
+        AppConfig[:rust_index_document_builder_enabled] = true
+        AppConfig[:rust_pui_common_metadata_enabled] = true
+        AppConfig[:rust_pui_document_preparation_enabled] = false
+        AppConfig[:record_inheritance] = (saved_inheritance_config || {}).merge(
+          :resource => {
+            :inherited_fields => [
+              { :property => 'title', :inherit_directly => true }
+            ]
+          }
+        )
+
+        test_indexer = PUIIndexer.new(AppConfig[:backend_url], nil, 'PUIIndexer')
+        outage_batch = []
+        test_indexer.define_singleton_method(:index_batch) do |batch, _timing = nil, _opts = {}|
+          batch.each { |doc| outage_batch << doc }
+        end
+
+        uri = sample_common_record['uri']
+        record_input = { 'record' => sample_common_record.dup, 'uri' => uri }
+
+        outage_called = false
+        allow_any_instance_of(RustIndexDocumentBuilder).to receive(:perform_request) do |_builder, _req|
+          outage_called = true
+          raise "Connection refused - sidecar outage"
+        end
+
+        test_indexer.index_records([record_input])
+        expect(outage_called).to be(true)
+        expect(outage_batch.length).to eq(1)
+        fallback_doc = outage_batch.first
+        expect(fallback_doc['subjects']).to eq(['Church History', 'Archives'])
+        expect(test_indexer.instance_variable_get(:@pui_common_projections)).to be_nil
+      ensure
+        AppConfig[:record_inheritance] = saved_inheritance_config
+        AppConfig[:rust_index_document_builder_enabled] = false
+        AppConfig[:rust_pui_common_metadata_enabled] = false
+      end
+    end
+
+    it "detects pre-hook mutations in index_records and falls back to native helper execution" do
+      saved_inheritance_config = AppConfig[:record_inheritance]
+      begin
+        AppConfig[:rust_index_document_builder_enabled] = true
+        AppConfig[:rust_pui_common_metadata_enabled] = true
+        AppConfig[:rust_pui_document_preparation_enabled] = false
+        AppConfig[:record_inheritance] = (saved_inheritance_config || {}).merge(
+          :resource => {
+            :inherited_fields => [
+              { :property => 'title', :inherit_directly => true }
+            ]
+          }
+        )
+
+        test_indexer = PUIIndexer.new(AppConfig[:backend_url], nil, 'PUIIndexer')
+        mutated_batch = []
+        test_indexer.define_singleton_method(:index_batch) do |batch, _timing = nil, _opts = {}|
+          batch.each { |doc| mutated_batch << doc }
+        end
+
+        uri = sample_common_record['uri']
+        record_input = { 'record' => sample_common_record.dup, 'uri' => uri }
+
+        # Sidecar returns standard projection based on unmutated record
+        valid_rust_envelope_doc = {
+          'id' => uri,
+          'uri' => uri,
+          'title' => sample_common_record['title'],
+          'primary_type' => 'resource',
+          'types' => ['resource'],
+          'json' => ASUtils.to_json(sample_common_record),
+          'suppressed' => false,
+          'publish' => true,
+          'system_generated' => 'false',
+          'repository' => 2,
+          '_archivalist_rust_fields' => ['pui_common_metadata'],
+          '_archivalist_pui_common' => valid_pui_common_projection.dup
+        }
+
+        allow_any_instance_of(RustIndexDocumentBuilder).to receive(:perform_request) do |_builder, _req|
+          Struct.new(:code, :body).new('200', ASUtils.to_json(
+            'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+            'documents' => [valid_rust_envelope_doc]
+          ))
+        end
+
+        # Register a pre-hook BEFORE common helpers that mutates subjects in-memory
+        pre_hook = proc do |_doc, rec|
+          rec['record']['subjects'] = [
+            { 'ref' => '/subjects/pre_hook', '_resolved' => { 'title' => 'Pre-Hook Mutated Subject' } }
+          ]
+        end
+        test_indexer.instance_variable_get(:@document_prepare_hooks).unshift(pre_hook)
+
+        test_indexer.index_records([record_input])
+        expect(mutated_batch.length).to eq(1)
+        final_doc = mutated_batch.first
+        expect(final_doc['subjects']).to eq(['Pre-Hook Mutated Subject'])
+        expect(final_doc['subject_uris']).to eq(['/subjects/pre_hook'])
+        expect(test_indexer.instance_variable_get(:@pui_common_projections)).to be_nil
+      ensure
+        AppConfig[:record_inheritance] = saved_inheritance_config
+        AppConfig[:rust_index_document_builder_enabled] = false
+        AppConfig[:rust_pui_common_metadata_enabled] = false
+      end
+    end
+
+    it "preserves pre-existing doc values when helper patch fields are absent (no-write behavior)" do
+      saved_inheritance_config = AppConfig[:record_inheritance]
+      begin
+        AppConfig[:rust_index_document_builder_enabled] = true
+        AppConfig[:rust_pui_common_metadata_enabled] = true
+        AppConfig[:rust_pui_document_preparation_enabled] = false
+        AppConfig[:record_inheritance] = (saved_inheritance_config || {}).merge(
+          :resource => {
+            :inherited_fields => [
+              { :property => 'title', :inherit_directly => true }
+            ]
+          }
+        )
+
+        test_indexer = PUIIndexer.new(AppConfig[:backend_url], nil, 'PUIIndexer')
+        captured_batch = []
+        test_indexer.define_singleton_method(:index_batch) do |batch, _timing = nil, _opts = {}|
+          batch.each { |doc| captured_batch << doc }
+        end
+
+        sparse_record = sample_common_record.dup
+        sparse_record.delete('linked_agents') # no creators
+        sparse_record.delete('dates')         # no year_sort
+        sparse_record.delete('notes')         # no summary
+        uri = sparse_record['uri']
+        record_input = { 'record' => sparse_record, 'uri' => uri }
+
+        sparse_common_proj = valid_pui_common_projection.dup.merge(
+          'agents' => {},
+          'years' => {},
+          'summary' => {}
+        )
+
+        valid_rust_envelope_doc = {
+          'id' => uri,
+          'uri' => uri,
+          'title' => sparse_record['title'],
+          'primary_type' => 'resource',
+          'types' => ['resource'],
+          'json' => ASUtils.to_json(sparse_record),
+          'suppressed' => false,
+          'publish' => true,
+          'system_generated' => 'false',
+          'repository' => 2,
+          '_archivalist_rust_fields' => ['pui_common_metadata'],
+          '_archivalist_pui_common' => sparse_common_proj
+        }
+
+        allow_any_instance_of(RustIndexDocumentBuilder).to receive(:perform_request) do |_builder, _req|
+          Struct.new(:code, :body).new('200', ASUtils.to_json(
+            'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+            'documents' => [valid_rust_envelope_doc]
+          ))
+        end
+
+        # Pre-hook initializes pre-existing values in doc
+        pre_existing_hook = proc do |doc, _rec|
+          doc['creators'] = ['Pre-existing Creator']
+          doc['year_sort'] = '18501850'
+          doc['summary'] = 'Pre-existing Summary'
+        end
+        test_indexer.instance_variable_get(:@document_prepare_hooks).unshift(pre_existing_hook)
+
+        accepted_helpers = []
+        orig_apply = test_indexer.method(:apply_rust_pui_common_helper)
+        test_indexer.define_singleton_method(:apply_rust_pui_common_helper) do |helper_name, doc, rec, &block|
+          res = orig_apply.call(helper_name, doc, rec, &block)
+          accepted_helpers << helper_name if res
+          res
+        end
+
+        test_indexer.index_records([record_input])
+        expect(accepted_helpers).to eq(['subjects', 'agents', 'audit_info', 'years', 'level', 'summary', 'extents'])
+        expect(captured_batch.length).to eq(1)
+        final_doc = captured_batch.first
+
+        # No-write: pre-existing doc values preserved when patch has absent fields
+        expect(final_doc['creators']).to eq(['Pre-existing Creator'])
+        expect(final_doc['year_sort']).to eq('18501850')
+        expect(final_doc['summary']).to eq('Pre-existing Summary')
+        expect(test_indexer.instance_variable_get(:@pui_common_projections)).to be_nil
+      ensure
+        AppConfig[:record_inheritance] = saved_inheritance_config
+        AppConfig[:rust_index_document_builder_enabled] = false
+        AppConfig[:rust_pui_common_metadata_enabled] = false
+      end
+    end
+
+    it "cleans up batch cache even when document prepare hook raises exception" do
+      saved_inheritance_config = AppConfig[:record_inheritance]
+      begin
+        AppConfig[:rust_index_document_builder_enabled] = true
+        AppConfig[:rust_pui_common_metadata_enabled] = true
+        AppConfig[:record_inheritance] = (saved_inheritance_config || {}).merge(
+          :resource => {
+            :inherited_fields => [
+              { :property => 'title', :inherit_directly => true }
+            ]
+          }
+        )
+
+        exploding_indexer = PUIIndexer.new(AppConfig[:backend_url], nil, 'PUIIndexer')
+        uri = sample_common_record['uri']
+        record_input = { 'record' => sample_common_record.dup, 'uri' => uri }
+
+        valid_rust_envelope_doc = {
+          'id' => uri,
+          'uri' => uri,
+          'title' => sample_common_record['title'],
+          'primary_type' => 'resource',
+          'types' => ['resource'],
+          'json' => ASUtils.to_json(sample_common_record),
+          'suppressed' => false,
+          'publish' => true,
+          'system_generated' => 'false',
+          'repository' => 2,
+          '_archivalist_rust_fields' => ['pui_common_metadata'],
+          '_archivalist_pui_common' => valid_pui_common_projection.dup
+        }
+
+        allow_any_instance_of(RustIndexDocumentBuilder).to receive(:perform_request) do |_builder, _req|
+          Struct.new(:code, :body).new('200', ASUtils.to_json(
+            'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+            'documents' => [valid_rust_envelope_doc]
+          ))
+        end
+
+        exploding_indexer.instance_variable_get(:@document_prepare_hooks) << proc { raise "Boom inside hook" }
+        expect { exploding_indexer.index_records([record_input]) }.to raise_error(/Boom inside hook/)
+        expect(exploding_indexer.instance_variable_get(:@pui_common_projections)).to be_nil
+      ensure
+        AppConfig[:record_inheritance] = saved_inheritance_config
+        AppConfig[:rust_index_document_builder_enabled] = false
+        AppConfig[:rust_pui_common_metadata_enabled] = false
+      end
+    end
+  end
 end

@@ -16,6 +16,20 @@ pub const PUI_AUXILIARY_DOCUMENTS_KEY: &str = "_archivalist_pui_auxiliary";
 pub const PUI_RECORD_INHERITANCE_CANDIDATE_METADATA_MARKER: &str =
     "pui_record_inheritance_candidate_metadata";
 pub const PUI_CANDIDATE_DOCUMENTS_KEY: &str = "_archivalist_pui_candidate";
+pub const PUI_COMMON_METADATA_MARKER: &str = "pui_common_metadata";
+pub const PUI_COMMON_DOCUMENTS_KEY: &str = "_archivalist_pui_common";
+pub const PUI_COMMON_FIELDS: &[&str] = &[
+    "marker",
+    "uri",
+    "primary_type",
+    "subjects",
+    "agents",
+    "audit_info",
+    "years",
+    "level",
+    "summary",
+    "extents",
+];
 pub const PUI_AUXILIARY_TYPES: &[&str] = &[
     "resource_ordered_records",
     "tree_root",
@@ -93,6 +107,8 @@ pub struct IndexDocumentInput {
     pub pui_parent_id: Option<String>,
     #[serde(default)]
     pub pui_auxiliary_json: Option<String>,
+    #[serde(default)]
+    pub prepare_pui_common_metadata: bool,
 }
 
 impl Default for IndexDocumentInput {
@@ -115,6 +131,7 @@ impl Default for IndexDocumentInput {
             prepare_pui_auxiliary: false,
             pui_parent_id: None,
             pui_auxiliary_json: None,
+            prepare_pui_common_metadata: false,
         }
     }
 }
@@ -3374,6 +3391,299 @@ fn add_pui_availability_fields(
     Ok(())
 }
 
+fn build_pui_common_projection(
+    input: &IndexDocumentInput,
+    record: &Map<String, Value>,
+) -> Result<Value, IndexDocumentError> {
+    // 1. Subjects helper patch
+    let mut subjects_patch = Map::new();
+    if ruby_truthy(record.get("subjects")) {
+        let subjects_arr = record
+            .get("subjects")
+            .and_then(Value::as_array)
+            .ok_or_else(|| error("subjects must be an array"))?;
+        let mut titles = Vec::new();
+        let mut uris = Vec::new();
+        for subject in subjects_arr {
+            let subject_obj = subject
+                .as_object()
+                .ok_or_else(|| error("subjects entries must be objects"))?;
+            let resolved = subject_obj
+                .get("_resolved")
+                .and_then(Value::as_object)
+                .ok_or_else(|| error("subjects entries must contain _resolved object"))?;
+            if let Some(title) = resolved.get("title") {
+                if !title.is_null() {
+                    titles.push(title.clone());
+                }
+            }
+            uris.push(subject_obj.get("ref").cloned().unwrap_or(Value::Null));
+        }
+        subjects_patch.insert("subjects".to_string(), Value::Array(titles));
+        subjects_patch.insert("subject_uris".to_string(), Value::Array(uris));
+    }
+
+    // 2. Agents helper patch
+    let mut agents_patch = Map::new();
+    if ruby_truthy(record.get("linked_agents")) {
+        let agents_arr = record
+            .get("linked_agents")
+            .and_then(Value::as_array)
+            .ok_or_else(|| error("linked_agents must be an array"))?;
+        let mut titles = Vec::new();
+        let mut uris = Vec::new();
+        let mut published_titles = Vec::new();
+        let mut published_uris = Vec::new();
+        let mut creators = Vec::new();
+        for link in agents_arr {
+            let link_obj = link
+                .as_object()
+                .ok_or_else(|| error("linked_agents entries must be objects"))?;
+            let resolved = link_obj
+                .get("_resolved")
+                .and_then(Value::as_object)
+                .ok_or_else(|| error("linked_agents entries must contain _resolved object"))?;
+            let display_name = resolved
+                .get("display_name")
+                .and_then(Value::as_object)
+                .ok_or_else(|| error("linked_agents._resolved must contain display_name object"))?;
+            let sort_name = display_name
+                .get("sort_name")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let uri = link_obj.get("ref").cloned().unwrap_or(Value::Null);
+
+            titles.push(sort_name.clone());
+            uris.push(uri.clone());
+
+            if ruby_truthy(resolved.get("publish")) {
+                published_titles.push(sort_name.clone());
+                published_uris.push(uri);
+            }
+            if link_obj.get("role").and_then(Value::as_str) == Some("creator") {
+                creators.push(sort_name);
+            }
+        }
+        agents_patch.insert("agents".to_string(), Value::Array(titles));
+        agents_patch.insert("agent_uris".to_string(), Value::Array(uris));
+        agents_patch.insert(
+            "published_agents".to_string(),
+            Value::Array(published_titles),
+        );
+        agents_patch.insert(
+            "published_agent_uris".to_string(),
+            Value::Array(published_uris),
+        );
+        if !creators.is_empty() {
+            agents_patch.insert("creators".to_string(), Value::Array(creators));
+        }
+    }
+
+    // 3. Audit info helper patch
+    let mut audit_patch = Map::new();
+    for field in [
+        "created_by",
+        "last_modified_by",
+        "user_mtime",
+        "system_mtime",
+        "create_time",
+    ] {
+        if let Some(val) = record.get(field) {
+            audit_patch.insert(field.to_string(), val.clone());
+        }
+    }
+
+    // 4. Years helper patch
+    let mut years_patch = Map::new();
+    if ruby_truthy(record.get("dates")) {
+        let dates_arr = record
+            .get("dates")
+            .and_then(Value::as_array)
+            .ok_or_else(|| error("dates must be an array"))?;
+        let mut years = Vec::new();
+        for date in dates_arr {
+            let date_obj = date
+                .as_object()
+                .ok_or_else(|| error("dates entries must be objects"))?;
+            let begin_val = date_obj.get("begin");
+            let end_val = date_obj.get("end");
+            let generated = generate_years_for_date_range(begin_val, end_val);
+            for y in generated {
+                if let Value::String(s) = y {
+                    years.push(s);
+                }
+            }
+        }
+        if !years.is_empty() {
+            years.sort();
+            years.dedup();
+            let first = format!("{:0>4}", years.first().unwrap());
+            let last = format!("{:0>4}", years.last().unwrap());
+            years_patch.insert(
+                "years".to_string(),
+                Value::Array(years.into_iter().map(Value::String).collect()),
+            );
+            years_patch.insert(
+                "year_sort".to_string(),
+                Value::String(format!("{first}{last}")),
+            );
+        } else {
+            years_patch.insert("years".to_string(), Value::Array(Vec::new()));
+        }
+
+        let mut display_dates: Vec<&Value> = dates_arr
+            .iter()
+            .filter(|date| date.get("date_type").and_then(Value::as_str) == Some("inclusive"))
+            .collect();
+        if display_dates.is_empty() {
+            display_dates.extend(dates_arr.iter());
+        }
+        let mut output_dates = Vec::new();
+        for date in display_dates {
+            let date_obj = date
+                .as_object()
+                .ok_or_else(|| error("dates entries must be objects"))?;
+            if ruby_truthy(date_obj.get("expression")) {
+                output_dates.push(date_obj.get("expression").cloned().unwrap_or(Value::Null));
+            } else if date_obj.get("date_type").and_then(Value::as_str) == Some("single") {
+                output_dates.push(date_obj.get("begin").cloned().unwrap_or(Value::Null));
+            } else if ruby_truthy(date_obj.get("date_type")) {
+                let begin_str = ruby_string(date_obj.get("begin"));
+                let end_str = ruby_string(date_obj.get("end"));
+                output_dates.push(Value::String(format!("{begin_str} - {end_str}")));
+            }
+        }
+        years_patch.insert("dates".to_string(), Value::Array(output_dates));
+    }
+
+    // 5. Level helper patch
+    let mut level_patch = Map::new();
+    if let Some(level_val) = record.get("level") {
+        let effective = if level_val.as_str() == Some("otherlevel") {
+            record.get("other_level").cloned().unwrap_or(Value::Null)
+        } else {
+            level_val.clone()
+        };
+        level_patch.insert("level".to_string(), effective);
+    }
+
+    // 6. Summary helper patch
+    let mut summary_patch = Map::new();
+    if let Some(notes) = record.get("notes").and_then(Value::as_array) {
+        if let Some(abstract_note) = notes
+            .iter()
+            .find(|note| note.get("type").and_then(Value::as_str) == Some("abstract"))
+        {
+            if let Some(content) = abstract_note.get("content").and_then(Value::as_array) {
+                let mut strings = Vec::new();
+                for val in content {
+                    match val {
+                        Value::Null => strings.push(String::new()),
+                        Value::String(s) => strings.push(s.clone()),
+                        Value::Bool(b) => strings.push(b.to_string()),
+                        Value::Number(n) => strings.push(n.to_string()),
+                        _ => return Err(error("unsupported non-scalar content in abstract note")),
+                    }
+                }
+                summary_patch.insert("summary".to_string(), Value::String(strings.join("\n")));
+            }
+        } else if let Some(scope_note) = notes
+            .iter()
+            .find(|note| note.get("type").and_then(Value::as_str) == Some("scopecontent"))
+        {
+            if let Some(subnotes) = scope_note.get("subnotes").and_then(Value::as_array) {
+                let mut strings = Vec::new();
+                for sn in subnotes {
+                    let sn_obj = sn
+                        .as_object()
+                        .ok_or_else(|| error("subnotes entries must be objects"))?;
+                    match sn_obj.get("content") {
+                        None | Some(Value::Null) => strings.push(String::new()),
+                        Some(Value::String(s)) => strings.push(s.clone()),
+                        Some(Value::Bool(b)) => strings.push(b.to_string()),
+                        Some(Value::Number(n)) => strings.push(n.to_string()),
+                        _ => {
+                            return Err(error(
+                                "unsupported non-scalar content in scopecontent subnote",
+                            ))
+                        }
+                    }
+                }
+                summary_patch.insert("summary".to_string(), Value::String(strings.join("\n")));
+            }
+        }
+    }
+
+    // 7. Extents helper patch
+    let mut extents_patch = Map::new();
+    if ruby_truthy(record.get("extents")) {
+        let extents_arr = record
+            .get("extents")
+            .and_then(Value::as_array)
+            .ok_or_else(|| error("extents must be an array"))?;
+        let whole: Vec<&Value> = extents_arr
+            .iter()
+            .filter(|extent| extent.get("portion").and_then(Value::as_str) == Some("whole"))
+            .collect();
+        let display = if whole.is_empty() {
+            extents_arr.iter().collect::<Vec<_>>()
+        } else {
+            whole
+        };
+        let mut formatted = Vec::new();
+        for extent in display {
+            let extent_obj = extent
+                .as_object()
+                .ok_or_else(|| error("extents entries must be objects"))?;
+            let number_str = ruby_string(extent_obj.get("number"));
+            let type_str = ruby_string(extent_obj.get("extent_type"));
+            formatted.push(Value::String(format!("{number_str} --- {type_str}")));
+        }
+        extents_patch.insert("extents".to_string(), Value::Array(formatted));
+    }
+
+    let mut pui_common = Map::new();
+    pui_common.insert(
+        "marker".to_string(),
+        Value::String(PUI_COMMON_METADATA_MARKER.to_string()),
+    );
+    pui_common.insert("uri".to_string(), Value::String(input.uri.clone()));
+    pui_common.insert(
+        "primary_type".to_string(),
+        Value::String(input.record_type.clone()),
+    );
+    pui_common.insert("subjects".to_string(), Value::Object(subjects_patch));
+    pui_common.insert("agents".to_string(), Value::Object(agents_patch));
+    pui_common.insert("audit_info".to_string(), Value::Object(audit_patch));
+    pui_common.insert("years".to_string(), Value::Object(years_patch));
+    pui_common.insert("level".to_string(), Value::Object(level_patch));
+    pui_common.insert("summary".to_string(), Value::Object(summary_patch));
+    pui_common.insert("extents".to_string(), Value::Object(extents_patch));
+
+    Ok(Value::Object(pui_common))
+}
+
+fn add_pui_common_fields(
+    document: &mut Map<String, Value>,
+    input: &IndexDocumentInput,
+    record: &Map<String, Value>,
+) -> Result<(), IndexDocumentError> {
+    let pui_common = build_pui_common_projection(input, record)?;
+    document.insert(PUI_COMMON_DOCUMENTS_KEY.to_string(), pui_common);
+    match document.get_mut("_archivalist_rust_fields") {
+        Some(Value::Array(fields)) => {
+            fields.push(Value::String(PUI_COMMON_METADATA_MARKER.to_string()));
+        }
+        _ => {
+            document.insert(
+                "_archivalist_rust_fields".to_string(),
+                Value::Array(vec![Value::String(PUI_COMMON_METADATA_MARKER.to_string())]),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn json_type_name(val: &Value) -> &'static str {
     match val {
         Value::Null => "Null",
@@ -3663,13 +3973,27 @@ pub fn build_index_document(input: IndexDocumentInput) -> Result<Value, IndexDoc
             "cannot combine enrich (staff) and prepare_pui_final (pui) in same record",
         ));
     }
+    if input.enrich && input.prepare_pui_common_metadata {
+        return Err(error(
+            "cannot combine enrich (staff) and prepare_pui_common_metadata (pui) in same record",
+        ));
+    }
     if input.prepare_pui_final && input.prepare_pui_availability {
         return Err(error(
             "cannot combine prepare_pui_final (pui) and prepare_pui_availability in same record",
         ));
     }
+    if input.prepare_pui_availability && input.prepare_pui_common_metadata {
+        return Err(error(
+            "cannot combine prepare_pui_availability and prepare_pui_common_metadata in same record",
+        ));
+    }
     if input.prepare_pui_auxiliary {
-        if input.enrich || input.prepare_pui_final || input.prepare_pui_availability {
+        if input.enrich
+            || input.prepare_pui_final
+            || input.prepare_pui_availability
+            || input.prepare_pui_common_metadata
+        {
             return Err(error(
                 "cannot combine prepare_pui_auxiliary with other preparation modes",
             ));
@@ -3745,6 +4069,38 @@ pub fn build_index_document(input: IndexDocumentInput) -> Result<Value, IndexDoc
         if input.record_inheritance_has_type.is_none() {
             return Err(error("record_inheritance_has_type must be explicitly present and boolean when prepare_pui_availability is true"));
         }
+    } else if input.prepare_pui_common_metadata {
+        let uri_val = record.get("uri").ok_or_else(|| {
+            error("record.uri is required when prepare_pui_common_metadata is true")
+        })?;
+        let rec_uri = uri_val
+            .as_str()
+            .ok_or_else(|| error("record.uri must be a non-empty string"))?;
+        if rec_uri.trim().is_empty() {
+            return Err(error("record.uri must not be empty"));
+        }
+        if rec_uri != input.uri {
+            return Err(error(format!(
+                "record uri '{rec_uri}' does not match wrapper uri '{}'",
+                input.uri
+            )));
+        }
+
+        let type_val = record.get("jsonmodel_type").ok_or_else(|| {
+            error("record.jsonmodel_type is required when prepare_pui_common_metadata is true")
+        })?;
+        let rec_type = type_val
+            .as_str()
+            .ok_or_else(|| error("record.jsonmodel_type must be a non-empty string"))?;
+        if rec_type.trim().is_empty() {
+            return Err(error("record.jsonmodel_type must not be empty"));
+        }
+        if rec_type != input.record_type {
+            return Err(error(format!(
+                "record jsonmodel_type '{rec_type}' does not match wrapper record_type '{}'",
+                input.record_type
+            )));
+        }
     } else if let Some(record_uri) = record.get("uri").and_then(Value::as_str) {
         if record_uri != input.uri {
             return Err(error(format!(
@@ -3804,6 +4160,10 @@ pub fn build_index_document(input: IndexDocumentInput) -> Result<Value, IndexDoc
         add_enriched_fields(&mut document, &input, record)?;
     } else if input.prepare_pui_final {
         add_pui_final_fields(&mut document, &input)?;
+    }
+
+    if input.prepare_pui_common_metadata {
+        add_pui_common_fields(&mut document, &input, record)?;
     }
 
     if input.prepare_pui_availability {
@@ -11800,5 +12160,733 @@ mod tests {
         assert_eq!(anc_notes.len(), 1);
         let raw_note = anc_notes[0].as_object().unwrap();
         assert!(!raw_note.contains_key("_inherited"));
+    }
+
+    #[test]
+    fn test_pui_common_metadata_seven_groups() {
+        let record = json!({
+            "uri": "/repositories/2/resources/100",
+            "jsonmodel_type": "resource",
+            "title": "Resource 100",
+            "publish": true,
+            "created_by": "archivist",
+            "last_modified_by": "lead",
+            "user_mtime": "2026-10-19T12:00:00Z",
+            "system_mtime": "2026-10-19T12:00:01Z",
+            "create_time": "2026-10-01T00:00:00Z",
+            "level": "otherlevel",
+            "other_level": "subfonds",
+            "subjects": [
+                {
+                    "ref": "/subjects/1",
+                    "_resolved": {"title": "Local History"}
+                },
+                {
+                    "ref": "/subjects/2",
+                    "_resolved": {"title": null} // should be compacted out
+                },
+                {
+                    "ref": "/subjects/3",
+                    "_resolved": {"title": "Archives"}
+                }
+            ],
+            "linked_agents": [
+                {
+                    "ref": "/agents/people/1",
+                    "role": "creator",
+                    "_resolved": {
+                        "display_name": {"sort_name": "Doe, Jane"},
+                        "publish": true
+                    }
+                },
+                {
+                    "ref": "/agents/corporate_entities/2",
+                    "role": "subject",
+                    "_resolved": {
+                        "display_name": {"sort_name": "Example Historical Society"},
+                        "publish": false
+                    }
+                }
+            ],
+            "dates": [
+                {
+                    "date_type": "inclusive",
+                    "begin": "1920-01-01",
+                    "end": "1925-12-31"
+                },
+                {
+                    "date_type": "single",
+                    "begin": "1950-05-01"
+                }
+            ],
+            "notes": [
+                {
+                    "type": "abstract",
+                    "content": ["First paragraph", "Second paragraph"]
+                },
+                {
+                    "type": "scopecontent",
+                    "subnotes": [{"content": "Scope text"}]
+                }
+            ],
+            "extents": [
+                {
+                    "portion": "part",
+                    "number": "5",
+                    "extent_type": "boxes"
+                },
+                {
+                    "portion": "whole",
+                    "number": "1",
+                    "extent_type": "linear_metres"
+                }
+            ]
+        });
+
+        let inp = IndexDocumentInput {
+            uri: "/repositories/2/resources/100".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record,
+            prepare_pui_common_metadata: true,
+            ..Default::default()
+        };
+
+        let doc = build_index_document(inp).expect("should build common metadata document");
+        let doc_obj = doc.as_object().unwrap();
+
+        // Check markers
+        let rust_fields = doc_obj
+            .get("_archivalist_rust_fields")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(rust_fields, &vec![json!(PUI_COMMON_METADATA_MARKER)]);
+
+        // Check envelope
+        let pui_common = doc_obj
+            .get(PUI_COMMON_DOCUMENTS_KEY)
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            pui_common.get("marker").unwrap(),
+            PUI_COMMON_METADATA_MARKER
+        );
+        assert_eq!(
+            pui_common.get("uri").unwrap(),
+            "/repositories/2/resources/100"
+        );
+        assert_eq!(pui_common.get("primary_type").unwrap(), "resource");
+
+        // 1. Subjects
+        let subjects = pui_common.get("subjects").unwrap().as_object().unwrap();
+        assert_eq!(
+            subjects.get("subjects").unwrap(),
+            &json!(["Local History", "Archives"])
+        );
+        assert_eq!(
+            subjects.get("subject_uris").unwrap(),
+            &json!(["/subjects/1", "/subjects/2", "/subjects/3"])
+        );
+
+        // 2. Agents
+        let agents = pui_common.get("agents").unwrap().as_object().unwrap();
+        assert_eq!(
+            agents.get("agents").unwrap(),
+            &json!(["Doe, Jane", "Example Historical Society"])
+        );
+        assert_eq!(
+            agents.get("agent_uris").unwrap(),
+            &json!(["/agents/people/1", "/agents/corporate_entities/2"])
+        );
+        assert_eq!(
+            agents.get("published_agents").unwrap(),
+            &json!(["Doe, Jane"])
+        );
+        assert_eq!(
+            agents.get("published_agent_uris").unwrap(),
+            &json!(["/agents/people/1"])
+        );
+        assert_eq!(agents.get("creators").unwrap(), &json!(["Doe, Jane"]));
+
+        // 3. Audit info
+        let audit = pui_common.get("audit_info").unwrap().as_object().unwrap();
+        assert_eq!(audit.get("created_by").unwrap(), "archivist");
+        assert_eq!(audit.get("last_modified_by").unwrap(), "lead");
+        assert_eq!(audit.get("user_mtime").unwrap(), "2026-10-19T12:00:00Z");
+        assert_eq!(audit.get("system_mtime").unwrap(), "2026-10-19T12:00:01Z");
+        assert_eq!(audit.get("create_time").unwrap(), "2026-10-01T00:00:00Z");
+
+        // 4. Years
+        let years = pui_common.get("years").unwrap().as_object().unwrap();
+        assert_eq!(
+            years.get("years").unwrap(),
+            &json!(["1920", "1921", "1922", "1923", "1924", "1925", "1950"])
+        );
+        assert_eq!(years.get("year_sort").unwrap(), "19201950");
+        // Inclusive date preference: only inclusive date is displayed
+        assert_eq!(
+            years.get("dates").unwrap(),
+            &json!(["1920-01-01 - 1925-12-31"])
+        );
+
+        // 5. Level: otherlevel resolved to other_level
+        let level = pui_common.get("level").unwrap().as_object().unwrap();
+        assert_eq!(level.get("level").unwrap(), "subfonds");
+
+        // 6. Summary: abstract note joined with newline
+        let summary = pui_common.get("summary").unwrap().as_object().unwrap();
+        assert_eq!(
+            summary.get("summary").unwrap(),
+            "First paragraph\nSecond paragraph"
+        );
+
+        // 7. Extents: whole extent preference
+        let extents = pui_common.get("extents").unwrap().as_object().unwrap();
+        assert_eq!(
+            extents.get("extents").unwrap(),
+            &json!(["1 --- linear_metres"])
+        );
+    }
+
+    #[test]
+    fn test_pui_common_metadata_common_only_request() {
+        let record = json!({
+            "uri": "/repositories/2/resources/201",
+            "jsonmodel_type": "resource",
+            "title": "Resource 201",
+            "publish": true,
+            "level": "collection"
+        });
+
+        let inp = IndexDocumentInput {
+            uri: "/repositories/2/resources/201".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record,
+            prepare_pui_common_metadata: true,
+            prepare_pui_final: false,
+            ..Default::default()
+        };
+
+        let doc = build_index_document(inp).expect("should build common-only doc");
+        let doc_obj = doc.as_object().unwrap();
+
+        // Exact marker list: only pui_common_metadata
+        assert_eq!(
+            doc_obj.get("_archivalist_rust_fields").unwrap(),
+            &json!([PUI_COMMON_METADATA_MARKER])
+        );
+        assert!(doc_obj.contains_key(PUI_COMMON_DOCUMENTS_KEY));
+        assert!(!doc_obj.contains_key(PUI_FINAL_DOCUMENTS_KEY));
+        assert!(!doc_obj.contains_key(PUI_ROUTING_DOCUMENTS_KEY));
+        assert!(!doc_obj.contains_key(PUI_NOTES_DOCUMENTS_KEY));
+        // Verify no staff enrichment fields
+        assert!(!doc_obj.contains_key("fullrecord"));
+        assert!(!doc_obj.contains_key("fullrecord_published"));
+    }
+
+    #[test]
+    fn test_pui_common_metadata_combined_request() {
+        let record = json!({
+            "uri": "/repositories/2/resources/202",
+            "jsonmodel_type": "resource",
+            "title": "Resource 202",
+            "publish": true,
+            "level": "collection"
+        });
+
+        let inp = IndexDocumentInput {
+            uri: "/repositories/2/resources/202".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: record.clone(),
+            pui_candidate_record: Some(record),
+            prepare_pui_final: true,
+            prepare_pui_common_metadata: true,
+            ..Default::default()
+        };
+
+        let doc = build_index_document(inp).expect("should build combined doc");
+        let doc_obj = doc.as_object().unwrap();
+
+        let markers = doc_obj
+            .get("_archivalist_rust_fields")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            markers,
+            &vec![
+                json!(PUI_FINAL_DOCUMENT_METADATA_MARKER),
+                json!(PUI_ROUTING_METADATA_MARKER),
+                json!(PUI_NOTES_METADATA_MARKER),
+                json!(PUI_COMMON_METADATA_MARKER),
+            ]
+        );
+        assert!(doc_obj.contains_key(PUI_FINAL_DOCUMENTS_KEY));
+        assert!(doc_obj.contains_key(PUI_ROUTING_DOCUMENTS_KEY));
+        assert!(doc_obj.contains_key(PUI_NOTES_DOCUMENTS_KEY));
+        assert!(doc_obj.contains_key(PUI_COMMON_DOCUMENTS_KEY));
+    }
+
+    #[test]
+    fn test_pui_common_metadata_uses_direct_record_not_inherited_candidate() {
+        let direct_record = json!({
+            "uri": "/repositories/2/archival_objects/300",
+            "jsonmodel_type": "archival_object",
+            "title": "AO 300 Direct",
+            "publish": true,
+            "subjects": [
+                {
+                    "ref": "/subjects/direct",
+                    "_resolved": {"title": "Direct Subject"}
+                }
+            ],
+            "linked_agents": [
+                {
+                    "ref": "/agents/people/direct",
+                    "role": "creator",
+                    "_resolved": {
+                        "display_name": {"sort_name": "Direct Creator"},
+                        "publish": true
+                    }
+                }
+            ]
+        });
+
+        let candidate_record = json!({
+            "uri": "/repositories/2/archival_objects/300",
+            "jsonmodel_type": "archival_object",
+            "title": "AO 300 Candidate",
+            "publish": true,
+            "subjects": [
+                {
+                    "ref": "/subjects/direct",
+                    "_resolved": {"title": "Direct Subject"}
+                },
+                {
+                    "ref": "/subjects/inherited",
+                    "_resolved": {"title": "Inherited Subject"}
+                }
+            ],
+            "linked_agents": [
+                {
+                    "ref": "/agents/people/direct",
+                    "role": "creator",
+                    "_resolved": {
+                        "display_name": {"sort_name": "Direct Creator"},
+                        "publish": true
+                    }
+                },
+                {
+                    "ref": "/agents/people/inherited",
+                    "role": "creator",
+                    "_resolved": {
+                        "display_name": {"sort_name": "Inherited Creator"},
+                        "publish": true
+                    }
+                }
+            ]
+        });
+
+        let inp = IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/300".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: direct_record,
+            pui_candidate_record: Some(candidate_record),
+            prepare_pui_final: true,
+            prepare_pui_common_metadata: true,
+            ..Default::default()
+        };
+
+        let doc = build_index_document(inp).expect("should build doc");
+        let doc_obj = doc.as_object().unwrap();
+        let pui_common = doc_obj
+            .get(PUI_COMMON_DOCUMENTS_KEY)
+            .unwrap()
+            .as_object()
+            .unwrap();
+
+        // Subjects in common metadata must come from direct record ONLY
+        let subjects = pui_common.get("subjects").unwrap().as_object().unwrap();
+        assert_eq!(
+            subjects.get("subjects").unwrap(),
+            &json!(["Direct Subject"])
+        );
+        assert_eq!(
+            subjects.get("subject_uris").unwrap(),
+            &json!(["/subjects/direct"])
+        );
+
+        // Agents in common metadata must come from direct record ONLY
+        let agents = pui_common.get("agents").unwrap().as_object().unwrap();
+        assert_eq!(agents.get("agents").unwrap(), &json!(["Direct Creator"]));
+        assert_eq!(agents.get("creators").unwrap(), &json!(["Direct Creator"]));
+    }
+
+    #[test]
+    fn test_pui_common_metadata_mode_conflicts() {
+        let base_rec = json!({
+            "uri": "/repositories/2/resources/500",
+            "jsonmodel_type": "resource",
+            "title": "Resource 500"
+        });
+
+        // 1. enrich + prepare_pui_common_metadata
+        let inp1 = IndexDocumentInput {
+            uri: "/repositories/2/resources/500".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: base_rec.clone(),
+            enrich: true,
+            prepare_pui_common_metadata: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(inp1).is_err());
+
+        // 2. prepare_pui_availability + prepare_pui_common_metadata
+        let inp2 = IndexDocumentInput {
+            uri: "/repositories/2/resources/500".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: base_rec.clone(),
+            prepare_pui_availability: true,
+            prepare_pui_common_metadata: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(inp2).is_err());
+
+        // 3. prepare_pui_auxiliary + prepare_pui_common_metadata
+        let inp3 = IndexDocumentInput {
+            uri: "/repositories/2/resources/500/ordered_records".to_string(),
+            record_type: "resource_ordered_records".to_string(),
+            repository: json!(2),
+            record: base_rec,
+            pui_parent_id: Some("/repositories/2/resources/500".to_string()),
+            pui_auxiliary_json: Some("{}".to_string()),
+            prepare_pui_auxiliary: true,
+            prepare_pui_common_metadata: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(inp3).is_err());
+    }
+
+    #[test]
+    fn test_pui_common_metadata_exact_keys_and_non_mutation() {
+        let source_record = json!({
+            "uri": "/repositories/2/resources/600",
+            "jsonmodel_type": "resource",
+            "title": "Unmutated Test",
+            "level": "collection",
+            "dates": [{"date_type": "single", "begin": "1999"}]
+        });
+        let snapshot = source_record.clone();
+
+        let inp = IndexDocumentInput {
+            uri: "/repositories/2/resources/600".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: source_record,
+            prepare_pui_common_metadata: true,
+            ..Default::default()
+        };
+
+        let doc = build_index_document(inp).expect("should build doc");
+        let doc_obj = doc.as_object().unwrap();
+        let pui_common = doc_obj
+            .get(PUI_COMMON_DOCUMENTS_KEY)
+            .unwrap()
+            .as_object()
+            .unwrap();
+
+        // Exact keys
+        let mut keys: Vec<&str> = pui_common.keys().map(String::as_str).collect();
+        keys.sort();
+        let mut expected = PUI_COMMON_FIELDS.to_vec();
+        expected.sort();
+        assert_eq!(keys, expected);
+
+        // Meaningful non-mutation check: serialized record JSON in doc matches untouched snapshot
+        let doc_json_str = doc_obj.get("json").unwrap().as_str().unwrap();
+        let parsed_doc_json: Value = serde_json::from_str(doc_json_str).unwrap();
+        assert_eq!(parsed_doc_json, snapshot);
+    }
+
+    #[test]
+    fn test_pui_common_metadata_edge_cases_and_parity() {
+        // 1. Creator absence: when no creator role exists, creators key is completely absent
+        let no_creator_rec = json!({
+            "uri": "/repositories/2/resources/601",
+            "jsonmodel_type": "resource",
+            "title": "No Creators",
+            "linked_agents": [
+                {
+                    "ref": "/agents/people/9",
+                    "role": "subject",
+                    "_resolved": {
+                        "display_name": {"sort_name": "Subject Agent"},
+                        "publish": true
+                    }
+                }
+            ]
+        });
+        let inp_no_creator = IndexDocumentInput {
+            uri: "/repositories/2/resources/601".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: no_creator_rec,
+            prepare_pui_common_metadata: true,
+            ..Default::default()
+        };
+        let doc = build_index_document(inp_no_creator).unwrap();
+        let proj = doc
+            .as_object()
+            .unwrap()
+            .get(PUI_COMMON_DOCUMENTS_KEY)
+            .unwrap();
+        let agents = proj
+            .as_object()
+            .unwrap()
+            .get("agents")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert!(!agents.contains_key("creators"));
+        assert_eq!(agents.get("agents").unwrap(), &json!(["Subject Agent"]));
+        assert_eq!(
+            agents.get("published_agents").unwrap(),
+            &json!(["Subject Agent"])
+        );
+
+        // 2. Ruby truthiness in published agents: 0, "false", "" are truthy; false and null are falsy
+        let truthy_rec = json!({
+            "uri": "/repositories/2/resources/602",
+            "jsonmodel_type": "resource",
+            "title": "Truthiness Test",
+            "linked_agents": [
+                {
+                    "ref": "/agents/people/1",
+                    "role": "creator",
+                    "_resolved": {
+                        "display_name": {"sort_name": "Agent Zero"},
+                        "publish": 0
+                    }
+                },
+                {
+                    "ref": "/agents/people/2",
+                    "role": "creator",
+                    "_resolved": {
+                        "display_name": {"sort_name": "Agent StringFalse"},
+                        "publish": "false"
+                    }
+                },
+                {
+                    "ref": "/agents/people/3",
+                    "role": "creator",
+                    "_resolved": {
+                        "display_name": {"sort_name": "Agent BoolFalse"},
+                        "publish": false
+                    }
+                },
+                {
+                    "ref": "/agents/people/4",
+                    "role": "creator",
+                    "_resolved": {
+                        "display_name": {"sort_name": "Agent Null"},
+                        "publish": null
+                    }
+                }
+            ]
+        });
+        let inp_truthy = IndexDocumentInput {
+            uri: "/repositories/2/resources/602".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: truthy_rec,
+            prepare_pui_common_metadata: true,
+            ..Default::default()
+        };
+        let doc_truthy = build_index_document(inp_truthy).unwrap();
+        let agents_truthy = doc_truthy
+            .as_object()
+            .unwrap()
+            .get(PUI_COMMON_DOCUMENTS_KEY)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .get("agents")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            agents_truthy.get("published_agents").unwrap(),
+            &json!(["Agent Zero", "Agent StringFalse"])
+        );
+
+        // 3. Duplicate ordering preserved in subjects and agents
+        let dups_rec = json!({
+            "uri": "/repositories/2/resources/603",
+            "jsonmodel_type": "resource",
+            "title": "Duplicates Test",
+            "subjects": [
+                {"ref": "/subjects/1", "_resolved": {"title": "Topic A"}},
+                {"ref": "/subjects/2", "_resolved": {"title": "Topic B"}},
+                {"ref": "/subjects/1", "_resolved": {"title": "Topic A"}}
+            ],
+            "linked_agents": [
+                {
+                    "ref": "/agents/people/1",
+                    "role": "creator",
+                    "_resolved": {"display_name": {"sort_name": "Author 1"}, "publish": true}
+                },
+                {
+                    "ref": "/agents/people/1",
+                    "role": "subject",
+                    "_resolved": {"display_name": {"sort_name": "Author 1"}, "publish": true}
+                }
+            ]
+        });
+        let inp_dups = IndexDocumentInput {
+            uri: "/repositories/2/resources/603".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: dups_rec,
+            prepare_pui_common_metadata: true,
+            ..Default::default()
+        };
+        let doc_dups = build_index_document(inp_dups).unwrap();
+        let pui_dups = doc_dups
+            .as_object()
+            .unwrap()
+            .get(PUI_COMMON_DOCUMENTS_KEY)
+            .unwrap()
+            .as_object()
+            .unwrap();
+        let subs_dups = pui_dups.get("subjects").unwrap().as_object().unwrap();
+        assert_eq!(
+            subs_dups.get("subjects").unwrap(),
+            &json!(["Topic A", "Topic B", "Topic A"])
+        );
+        let ags_dups = pui_dups.get("agents").unwrap().as_object().unwrap();
+        assert_eq!(
+            ags_dups.get("agents").unwrap(),
+            &json!(["Author 1", "Author 1"])
+        );
+
+        // 4. Scopecontent missing subnote content: empty string in join preserves separator
+        let notes_rec = json!({
+            "uri": "/repositories/2/resources/604",
+            "jsonmodel_type": "resource",
+            "title": "Notes Test",
+            "notes": [
+                {
+                    "type": "scopecontent",
+                    "subnotes": [
+                        {"content": "Section 1"},
+                        {"other": "no content field"},
+                        {"content": "Section 2"}
+                    ]
+                }
+            ]
+        });
+        let inp_notes = IndexDocumentInput {
+            uri: "/repositories/2/resources/604".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: notes_rec,
+            prepare_pui_common_metadata: true,
+            ..Default::default()
+        };
+        let doc_notes = build_index_document(inp_notes).unwrap();
+        let summary_val = doc_notes
+            .as_object()
+            .unwrap()
+            .get(PUI_COMMON_DOCUMENTS_KEY)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .get("summary")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            summary_val.get("summary").unwrap(),
+            "Section 1\n\nSection 2"
+        );
+
+        // 5. Missing or invalid _resolved produces Err for fallback
+        let bad_sub_rec = json!({
+            "uri": "/repositories/2/resources/605",
+            "jsonmodel_type": "resource",
+            "title": "Bad Resolved",
+            "subjects": [
+                {"ref": "/subjects/1"} // missing _resolved
+            ]
+        });
+        let inp_bad_sub = IndexDocumentInput {
+            uri: "/repositories/2/resources/605".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: bad_sub_rec,
+            prepare_pui_common_metadata: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(inp_bad_sub).is_err());
+
+        // 6. Unsupported recursive content in notes summary produces Err for fallback
+        let bad_notes_rec = json!({
+            "uri": "/repositories/2/resources/606",
+            "jsonmodel_type": "resource",
+            "title": "Recursive Note",
+            "notes": [
+                {
+                    "type": "abstract",
+                    "content": [{"nested": "object"}]
+                }
+            ]
+        });
+        let inp_bad_notes = IndexDocumentInput {
+            uri: "/repositories/2/resources/606".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: bad_notes_rec,
+            prepare_pui_common_metadata: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(inp_bad_notes).is_err());
+    }
+
+    #[test]
+    fn test_pui_common_metadata_mismatched_and_malformed_identity() {
+        let record = json!({
+            "uri": "/repositories/2/resources/700",
+            "jsonmodel_type": "resource",
+            "title": "Resource 700"
+        });
+
+        // Mismatched URI
+        let inp1 = IndexDocumentInput {
+            uri: "/repositories/2/resources/999".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: record.clone(),
+            prepare_pui_common_metadata: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(inp1).is_err());
+
+        // Mismatched record_type
+        let inp2 = IndexDocumentInput {
+            uri: "/repositories/2/resources/700".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record,
+            prepare_pui_common_metadata: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(inp2).is_err());
     }
 }

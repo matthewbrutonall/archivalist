@@ -113,6 +113,42 @@ class RustIndexDocumentBuilder
     'tree_node_from_root',
   ].freeze
 
+  BASE_DOCUMENT_FIELDS = [
+    'id',
+    'uri',
+    'title',
+    'primary_type',
+    'types',
+    'json',
+    'suppressed',
+    'publish',
+    'system_generated',
+    'repository',
+  ].freeze
+
+  PUI_COMMON_FIELDS = [
+    'marker',
+    'uri',
+    'primary_type',
+    'subjects',
+    'agents',
+    'audit_info',
+    'years',
+    'level',
+    'summary',
+    'extents',
+  ].freeze
+
+  PUI_COMMON_HELPER_FIELDS = {
+    'subjects' => ['subjects', 'subject_uris'].freeze,
+    'agents' => ['agents', 'agent_uris', 'published_agents', 'published_agent_uris', 'creators'].freeze,
+    'audit_info' => ['created_by', 'last_modified_by', 'user_mtime', 'system_mtime', 'create_time'].freeze,
+    'years' => ['years', 'year_sort', 'dates'].freeze,
+    'level' => ['level'].freeze,
+    'summary' => ['summary'].freeze,
+    'extents' => ['extents'].freeze,
+  }.freeze
+
   def self.compute_pui_conditional_additions(primary_type, record_inheritance_has_type)
     additions = []
     if ['accession', 'digital_object', 'digital_object_component'].include?(primary_type)
@@ -283,6 +319,41 @@ class RustIndexDocumentBuilder
         raise "cannot combine prepare_pui_final and prepare_pui_availability in same input for #{uri}"
       end
 
+      if input.has_key?('prepare_pui_common_metadata')
+        unless input['prepare_pui_common_metadata'] == true || input['prepare_pui_common_metadata'] == false
+          raise "prepare_pui_common_metadata must be explicitly boolean for #{uri}"
+        end
+        if input['prepare_pui_common_metadata']
+          if input['enrich']
+            raise "cannot combine enrich and prepare_pui_common_metadata for #{uri}"
+          end
+          if input['prepare_pui_auxiliary']
+            raise "cannot combine prepare_pui_auxiliary and prepare_pui_common_metadata for #{uri}"
+          end
+          if input['prepare_pui_availability']
+            raise "cannot combine prepare_pui_availability and prepare_pui_common_metadata for #{uri}"
+          end
+        end
+      end
+
+      if input['prepare_pui_common_metadata']
+        unless record.is_a?(Hash)
+          raise "record must be a Hash for #{uri}"
+        end
+        unless record.has_key?('uri') && record['uri'].is_a?(String) && !record['uri'].strip.empty?
+          raise "record.uri must be a non-empty string for #{uri}"
+        end
+        unless record['uri'] == uri
+          raise "record uri mismatch for #{uri}"
+        end
+        unless record.has_key?('jsonmodel_type') && record['jsonmodel_type'].is_a?(String) && !record['jsonmodel_type'].strip.empty?
+          raise "record.jsonmodel_type must be a non-empty string for #{uri}"
+        end
+        unless record['jsonmodel_type'] == record_type
+          raise "record jsonmodel_type mismatch for #{uri}"
+        end
+      end
+
       if input['prepare_pui_final']
         unless record.is_a?(Hash)
           raise "record must be a Hash for #{uri}"
@@ -351,6 +422,41 @@ class RustIndexDocumentBuilder
       record = input['record']
       if input['prepare_pui_final'] && input['prepare_pui_availability']
         raise "cannot combine prepare_pui_final and prepare_pui_availability in same input for #{uri}"
+      end
+
+      if input.has_key?('prepare_pui_common_metadata')
+        unless input['prepare_pui_common_metadata'] == true || input['prepare_pui_common_metadata'] == false
+          raise "prepare_pui_common_metadata must be explicitly boolean for #{uri}"
+        end
+        if input['prepare_pui_common_metadata']
+          if input['enrich']
+            raise "cannot combine enrich and prepare_pui_common_metadata for #{uri}"
+          end
+          if input['prepare_pui_auxiliary']
+            raise "cannot combine prepare_pui_auxiliary and prepare_pui_common_metadata for #{uri}"
+          end
+          if input['prepare_pui_availability']
+            raise "cannot combine prepare_pui_availability and prepare_pui_common_metadata for #{uri}"
+          end
+        end
+      end
+
+      if input['prepare_pui_common_metadata']
+        unless record.is_a?(Hash)
+          raise "record must be a Hash for #{uri}"
+        end
+        unless record.has_key?('uri') && record['uri'].is_a?(String) && !record['uri'].strip.empty?
+          raise "record.uri must be a non-empty string for #{uri}"
+        end
+        unless record['uri'] == uri
+          raise "record uri mismatch for #{uri}"
+        end
+        unless record.has_key?('jsonmodel_type') && record['jsonmodel_type'].is_a?(String) && !record['jsonmodel_type'].strip.empty?
+          raise "record.jsonmodel_type must be a non-empty string for #{uri}"
+        end
+        unless record['jsonmodel_type'] == record_type
+          raise "record jsonmodel_type mismatch for #{uri}"
+        end
       end
       if input['prepare_pui_final']
         unless record.is_a?(Hash)
@@ -705,6 +811,9 @@ class RustIndexDocumentBuilder
         validate_pui_final_projection!(document, input)
         validate_pui_routing_projection!(document, input)
         validate_pui_notes_projection!(document, input)
+        validate_pui_common_projection!(document, input) if input['prepare_pui_common_metadata']
+      elsif input['prepare_pui_common_metadata']
+        validate_pui_common_projection!(document, input)
       elsif input['prepare_pui_availability']
         expected_fields = ['pui_availability_metadata']
         unless document['_archivalist_rust_fields'] == expected_fields
@@ -720,6 +829,10 @@ class RustIndexDocumentBuilder
                                          document.has_key?('_archivalist_pui_notes') ||
                                          document.has_key?('_archivalist_pui_candidate'))
         raise "unexpected response pui projection marker for #{uri}"
+      end
+
+      if !input['prepare_pui_common_metadata'] && document.has_key?('_archivalist_pui_common')
+        raise "unexpected response pui common projection marker for #{uri}"
       end
 
       if !input['prepare_pui_availability'] && document.has_key?('_archivalist_pui_availability')
@@ -1075,11 +1188,13 @@ class RustIndexDocumentBuilder
   def validate_pui_final_projection!(document, input)
     uri = input['uri']
     has_plan = input.has_key?('record_inheritance_plan')
+    has_common = !!input['prepare_pui_common_metadata']
     expected_markers = if has_plan
                          ['pui_final_document_metadata', 'pui_routing_metadata', 'pui_notes_metadata', 'pui_record_inheritance_candidate_metadata']
                        else
                          ['pui_final_document_metadata', 'pui_routing_metadata', 'pui_notes_metadata']
                        end
+    expected_markers << 'pui_common_metadata' if has_common
     unless document['_archivalist_rust_fields'] == expected_markers
       raise "response pui final marker mismatch for #{uri}"
     end
@@ -1292,6 +1407,218 @@ class RustIndexDocumentBuilder
       expected_notes = extract_published_strings(raw_notes)
       unless notes_proj['notes_published'] == expected_notes
         raise "pui notes_published mismatch for #{uri}: expected #{expected_notes.inspect}, got #{notes_proj['notes_published'].inspect}"
+      end
+    end
+  end
+
+  def validate_pui_common_projection!(document, input)
+    uri = input['uri']
+    has_final = !!input['prepare_pui_final']
+    has_plan = input.has_key?('record_inheritance_plan')
+
+    # Top-level document key set validation
+    if document.keys.any? { |k| !k.is_a?(String) }
+      raise "document contains non-string keys for #{uri}: #{document.keys.inspect}"
+    end
+
+    required_keys = BASE_DOCUMENT_FIELDS + ['_archivalist_pui_common', '_archivalist_rust_fields']
+    if has_final
+      required_keys += ['_archivalist_pui_final', '_archivalist_pui_routing', '_archivalist_pui_notes']
+      required_keys << '_archivalist_pui_candidate' if has_plan
+    end
+
+    missing_doc_keys = required_keys - document.keys
+    unless missing_doc_keys.empty?
+      raise "document missing required fields for #{uri}: #{missing_doc_keys.sort.join(', ')}"
+    end
+
+    allowed_doc_keys = required_keys.dup
+    extra_doc_keys = document.keys - allowed_doc_keys
+    unless extra_doc_keys.empty?
+      raise "document contains unexpected fields for #{uri}: #{extra_doc_keys.sort.join(', ')}"
+    end
+
+    if has_final
+      expected_markers = if has_plan
+                           ['pui_final_document_metadata', 'pui_routing_metadata', 'pui_notes_metadata', 'pui_record_inheritance_candidate_metadata', 'pui_common_metadata']
+                         else
+                           ['pui_final_document_metadata', 'pui_routing_metadata', 'pui_notes_metadata', 'pui_common_metadata']
+                         end
+      unless document['_archivalist_rust_fields'] == expected_markers
+        raise "response pui common marker mismatch for #{uri}"
+      end
+    else
+      unless document['_archivalist_rust_fields'] == ['pui_common_metadata']
+        raise "response pui common marker mismatch for #{uri}"
+      end
+    end
+
+    unless document.has_key?('_archivalist_pui_common') && document['_archivalist_pui_common'].is_a?(Hash)
+      raise "missing _archivalist_pui_common for #{uri}"
+    end
+    proj = document['_archivalist_pui_common']
+    if proj.keys.any? { |k| !k.is_a?(String) }
+      raise "pui common contains non-string keys for #{uri}: #{proj.keys.inspect}"
+    end
+    missing_keys = PUI_COMMON_FIELDS - proj.keys
+    unless missing_keys.empty?
+      raise "pui common missing required fields for #{uri}: #{missing_keys.sort.join(', ')}"
+    end
+    extra_keys = proj.keys - PUI_COMMON_FIELDS
+    unless extra_keys.empty?
+      raise "pui common contains unexpected fields for #{uri}: #{extra_keys.sort.join(', ')}"
+    end
+
+    unless proj['marker'] == 'pui_common_metadata'
+      raise "pui common marker mismatch for #{uri}"
+    end
+    unless proj['uri'] == uri
+      raise "pui common uri mismatch for #{uri}: expected #{uri}, got #{proj['uri']}"
+    end
+    unless proj['primary_type'] == input['record_type']
+      raise "pui common primary_type mismatch for #{uri}: expected #{input['record_type']}, got #{proj['primary_type']}"
+    end
+
+    # Check each helper patch envelope
+    PUI_COMMON_HELPER_FIELDS.each do |h_name, allowed_fields|
+      h_patch = proj[h_name]
+      unless h_patch.is_a?(Hash)
+        raise "pui common patch for #{h_name} must be a Hash for #{uri}"
+      end
+      if h_patch.keys.any? { |k| !k.is_a?(String) }
+        raise "pui common patch for #{h_name} contains non-string keys for #{uri}: #{h_patch.keys.inspect}"
+      end
+      extra_fields = h_patch.keys - allowed_fields
+      unless extra_fields.empty?
+        raise "pui common patch for #{h_name} contains unexpected fields for #{uri}: #{extra_fields.sort.join(', ')}"
+      end
+    end
+
+    # Native independent computation against input['record']
+    record = input['record']
+    raise "record must be a Hash for #{uri}" unless record.is_a?(Hash)
+
+    # 1. Subjects
+    expected_subjects = {}
+    compute_expected_pui_subjects(record, expected_subjects)
+    validate_json_equal!(expected_subjects, proj['subjects'], "pui_common.subjects")
+
+    # 2. Agents
+    expected_agents = {}
+    compute_expected_pui_agents(record, expected_agents)
+    validate_json_equal!(expected_agents, proj['agents'], "pui_common.agents")
+
+    # 3. Audit info
+    expected_audit = {}
+    compute_expected_pui_audit_info(record, expected_audit)
+    validate_json_equal!(expected_audit, proj['audit_info'], "pui_common.audit_info")
+
+    # 4. Years
+    expected_years = {}
+    compute_expected_pui_years(record, expected_years)
+    validate_json_equal!(expected_years, proj['years'], "pui_common.years")
+
+    # 5. Level
+    expected_level = {}
+    compute_expected_pui_level(record, expected_level)
+    validate_json_equal!(expected_level, proj['level'], "pui_common.level")
+
+    # 6. Summary
+    expected_summary = {}
+    compute_expected_pui_summary(record, expected_summary)
+    validate_json_equal!(expected_summary, proj['summary'], "pui_common.summary")
+
+    # 7. Extents
+    expected_extents = {}
+    compute_expected_pui_extents(record, expected_extents)
+    validate_json_equal!(expected_extents, proj['extents'], "pui_common.extents")
+  end
+
+  def compute_expected_pui_subjects(record, doc)
+    if record['subjects']
+      doc['subjects'] = record['subjects'].map { |s| s['_resolved']['title'] }.compact
+      doc['subject_uris'] = record['subjects'].collect { |link| link['ref'] }
+    end
+  end
+
+  def compute_expected_pui_agents(record, doc)
+    if record['linked_agents']
+      doc['agents'] = record['linked_agents'].collect { |link| link['_resolved']['display_name']['sort_name'] }
+      doc['agent_uris'] = record['linked_agents'].collect { |link| link['ref'] }
+      doc['published_agents'] = []
+      doc['published_agent_uris'] = []
+      record['linked_agents'].each do |link|
+        if link['_resolved']['publish']
+          doc['published_agents'] << link['_resolved']['display_name']['sort_name']
+          doc['published_agent_uris'] << link['ref']
+        end
+      end
+      creators = record['linked_agents'].select { |link| link['role'] === 'creator' }
+      doc['creators'] = creators.collect { |link| link['_resolved']['display_name']['sort_name'] } unless creators.empty?
+    end
+  end
+
+  def compute_expected_pui_audit_info(record, doc)
+    ['created_by', 'last_modified_by', 'user_mtime', 'system_mtime', 'create_time'].each do |f|
+      doc[f] = record[f] if record.has_key?(f)
+    end
+  end
+
+  def compute_expected_pui_years(record, doc)
+    if record['dates']
+      doc['years'] = []
+      record['dates'].each do |date|
+        doc['years'] += IndexerCommon.generate_years_for_date_range(date['begin'], date['end'])
+      end
+      unless doc['years'].empty?
+        doc['years'] = doc['years'].sort.uniq
+        doc['year_sort'] = doc['years'].first.rjust(4, '0') + doc['years'].last.rjust(4, '0')
+      end
+      dates = record['dates']
+      display_dates = dates.select { |date| date['date_type'] == 'inclusive' }
+      display_dates = dates if display_dates.empty?
+      doc['dates'] = []
+      display_dates.each do |date|
+        if date['expression']
+          doc['dates'] << date['expression']
+        elsif date['date_type'] === 'single'
+          doc['dates'] << date['begin']
+        elsif date['date_type']
+          doc['dates'] << "#{date['begin']} - #{date['end']}"
+        end
+      end
+    end
+  end
+
+  def compute_expected_pui_level(record, doc)
+    if record.has_key?('level')
+      doc['level'] = (record['level'] === 'otherlevel') ? record['other_level'] : record['level']
+    end
+  end
+
+  def compute_expected_pui_summary(record, doc)
+    if record.has_key?('notes') && record['notes'].is_a?(Array)
+      notes = record['notes']
+      abstract = notes.find { |note| note['type'] == 'abstract' }
+      if abstract
+        doc['summary'] = abstract['content'].join("\n")
+      else
+        scopecontent = notes.find { |note| note['type'] == 'scopecontent' }
+        if scopecontent && scopecontent.has_key?('subnotes')
+          doc['summary'] = scopecontent['subnotes'].map { |sn| sn['content'] }.join("\n")
+        end
+      end
+    end
+  end
+
+  def compute_expected_pui_extents(record, doc)
+    if record['extents']
+      extents = record['extents']
+      display_extents = extents.select { |extent| extent['portion'] == 'whole' }
+      display_extents = extents if display_extents.empty?
+      doc['extents'] = []
+      display_extents.each do |extent|
+        doc['extents'] << "#{extent['number']} --- #{extent['extent_type']}"
       end
     end
   end

@@ -658,6 +658,55 @@ class TestPuiParityComparator(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(any("candidate privacy leak" in r or "private handoff field" in r for r in reasons))
 
+    def test_pui_common_metadata_marker_leak_fails(self) -> None:
+        """Leaked _archivalist_pui_common handoff metadata in candidate fails parity immediately."""
+        doc = {
+            "id": "/repositories/2/resources/50",
+            "uri": "/repositories/2/resources/50",
+            "publish": True,
+            "primary_type": "resource",
+            "types": ["resource", "pui"],
+            "json": json.dumps({"title": "Resource 50"}),
+            "fullrecord_published": ["Resource 50"],
+        }
+        cand_leaked = dict(
+            doc,
+            _archivalist_pui_common={
+                "marker": "pui_common_metadata",
+                "uri": "/repositories/2/resources/50",
+                "primary_type": "resource",
+                "subjects": {},
+                "agents": {},
+                "audit_info": {},
+                "years": {},
+                "level": {},
+                "summary": {},
+                "extents": {},
+            },
+        )
+        ok, reasons = comparator.compare_pui_document(doc, cand_leaked, comparator.DEFAULT_IGNORED_FIELDS)
+        self.assertFalse(ok)
+        self.assertTrue(any("candidate privacy leak" in r or "private handoff field" in r for r in reasons))
+
+    def test_pui_common_metadata_rust_fields_marker_leak_fails(self) -> None:
+        """Leaked pui_common_metadata marker in _archivalist_rust_fields fails parity."""
+        doc = {
+            "id": "/repositories/2/resources/50",
+            "uri": "/repositories/2/resources/50",
+            "publish": True,
+            "primary_type": "resource",
+            "types": ["resource", "pui"],
+            "json": json.dumps({"title": "Resource 50"}),
+            "fullrecord_published": ["Resource 50"],
+        }
+        cand_leaked = dict(
+            doc,
+            _archivalist_rust_fields=["pui_common_metadata"],
+        )
+        ok, reasons = comparator.compare_pui_document(doc, cand_leaked, comparator.DEFAULT_IGNORED_FIELDS)
+        self.assertFalse(ok)
+        self.assertTrue(any("candidate privacy leak" in r or "private handoff field" in r for r in reasons))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1581,6 +1581,12 @@ class IndexerCommon
       rust_pui_document_preparation_enabled?
   end
 
+  def rust_pui_common_metadata_enabled?
+    AppConfig.has_key?(:rust_pui_common_metadata_enabled) &&
+      AppConfig[:rust_pui_common_metadata_enabled] &&
+      self.class.name == 'PUIIndexer'
+  end
+
   def rust_index_document_builder
     @rust_builder ||= RustIndexDocumentBuilder.new(
       AppConfig[:rust_index_document_builder_url] || 'http://127.0.0.1:4570',
@@ -1643,6 +1649,9 @@ class IndexerCommon
         input['prepare_pui_availability'] = true
         input['record_inheritance_has_type'] = RecordInheritance.has_type?(prepared[:record_type])
       end
+      if rust_pui_common_metadata_enabled?
+        input['prepare_pui_common_metadata'] = true
+      end
       if rust_index_document_enrichment_enabled?
         input['dynamic_enum_fields'] = enum_fields
         input['arks_enabled'] = !!AppConfig[:arks_enabled]
@@ -1676,109 +1685,119 @@ class IndexerCommon
     @pui_notes_projections = {}
     @pui_availability_projections = {}
     @pui_candidate_projections = {}
+    @pui_common_projections = {}
 
     records = dedupe_by_uri(records)
 
-    timing.time_block(:conversion_ms) do
-      prepared_records = []
-      records.each do |record|
-        values = record['record']
-        uri = record['uri']
+    begin
+      timing.time_block(:conversion_ms) do
+        prepared_records = []
+        records.each do |record|
+          values = record['record']
+          uri = record['uri']
 
-        reference = JSONModel.parse_reference(uri)
-        record_type = reference && reference[:type]
+          reference = JSONModel.parse_reference(uri)
+          record_type = reference && reference[:type]
 
-        if !record_type || skip_index_record?(record) || (record_type != 'repository' && !record_types.include?(record_type.intern))
-          next
+          if !record_type || skip_index_record?(record) || (record_type != 'repository' && !record_types.include?(record_type.intern))
+            next
+          end
+
+          prepared_records << {
+            :record => record,
+            :values => values,
+            :uri => uri,
+            :record_type => record_type,
+          }
         end
 
-        prepared_records << {
-          :record => record,
-          :values => values,
-          :uri => uri,
-          :record_type => record_type,
-        }
-      end
+        rust_documents = rust_index_documents(prepared_records)
 
-      rust_documents = rust_index_documents(prepared_records)
+        prepared_records.each do |prepared|
+          record = prepared[:record]
+          values = prepared[:values]
+          values = sanitize_json(values) unless prepared[:sanitized]
+          uri = prepared[:uri]
+          record_type = prepared[:record_type]
+          doc = rust_documents && rust_documents[uri]
+          doc ||= native_index_document(uri, record_type, values)
 
-      prepared_records.each do |prepared|
-        record = prepared[:record]
-        values = prepared[:values]
-        values = sanitize_json(values) unless prepared[:sanitized]
-        uri = prepared[:uri]
-        record_type = prepared[:record_type]
-        doc = rust_documents && rust_documents[uri]
-        doc ||= native_index_document(uri, record_type, values)
+          rust_cm_docs = doc.delete('_archivalist_collection_management_documents')
+          if rust_cm_docs
+            rust_cm_docs.each {|child| child.delete_if {|k, _| k.start_with?('_archivalist_')}}
+          end
 
-        rust_cm_docs = doc.delete('_archivalist_collection_management_documents')
-        if rust_cm_docs
-          rust_cm_docs.each {|child| child.delete_if {|k, _| k.start_with?('_archivalist_')}}
-        end
+          if doc.has_key?('_archivalist_pui_candidate')
+            pui_candidate = doc.delete('_archivalist_pui_candidate')
+            @pui_candidate_projections[uri] = pui_candidate if pui_candidate
+          end
+          if doc.has_key?('_archivalist_pui_final')
+            pui_final = doc.delete('_archivalist_pui_final')
+            @pui_final_projections[uri] = pui_final if pui_final
+          end
+          if doc.has_key?('_archivalist_pui_routing')
+            pui_routing = doc.delete('_archivalist_pui_routing')
+            @pui_routing_projections[uri] = pui_routing if pui_routing
+          end
+          if doc.has_key?('_archivalist_pui_notes')
+            pui_notes = doc.delete('_archivalist_pui_notes')
+            @pui_notes_projections[uri] = pui_notes if pui_notes
+          end
+          if doc.has_key?('_archivalist_pui_availability')
+            pui_availability = doc.delete('_archivalist_pui_availability')
+            @pui_availability_projections[uri] = pui_availability if pui_availability
+          end
+          if doc.has_key?('_archivalist_pui_common')
+            pui_common = doc.delete('_archivalist_pui_common')
+            @pui_common_projections[uri] = pui_common if pui_common
+          end
+          if doc['_archivalist_rust_fields'].is_a?(Array)
+            doc['_archivalist_rust_fields'].delete('pui_record_inheritance_candidate_metadata')
+            doc['_archivalist_rust_fields'].delete('pui_final_document_metadata')
+            doc['_archivalist_rust_fields'].delete('pui_routing_metadata')
+            doc['_archivalist_rust_fields'].delete('pui_notes_metadata')
+            doc['_archivalist_rust_fields'].delete('pui_availability_metadata')
+            doc['_archivalist_rust_fields'].delete('pui_common_metadata')
+            doc.delete('_archivalist_rust_fields') if doc['_archivalist_rust_fields'].empty?
+          elsif doc['_archivalist_rust_fields'] == ['pui_final_document_metadata'] || doc['_archivalist_rust_fields'] == ['pui_availability_metadata'] || doc['_archivalist_rust_fields'] == ['pui_common_metadata']
+            doc.delete('_archivalist_rust_fields')
+          end
 
-        if doc.has_key?('_archivalist_pui_candidate')
-          pui_candidate = doc.delete('_archivalist_pui_candidate')
-          @pui_candidate_projections[uri] = pui_candidate if pui_candidate
-        end
-        if doc.has_key?('_archivalist_pui_final')
-          pui_final = doc.delete('_archivalist_pui_final')
-          @pui_final_projections[uri] = pui_final if pui_final
-        end
-        if doc.has_key?('_archivalist_pui_routing')
-          pui_routing = doc.delete('_archivalist_pui_routing')
-          @pui_routing_projections[uri] = pui_routing if pui_routing
-        end
-        if doc.has_key?('_archivalist_pui_notes')
-          pui_notes = doc.delete('_archivalist_pui_notes')
-          @pui_notes_projections[uri] = pui_notes if pui_notes
-        end
-        if doc.has_key?('_archivalist_pui_availability')
-          pui_availability = doc.delete('_archivalist_pui_availability')
-          @pui_availability_projections[uri] = pui_availability if pui_availability
-        end
-        if doc['_archivalist_rust_fields'].is_a?(Array)
-          doc['_archivalist_rust_fields'].delete('pui_record_inheritance_candidate_metadata')
-          doc['_archivalist_rust_fields'].delete('pui_final_document_metadata')
-          doc['_archivalist_rust_fields'].delete('pui_routing_metadata')
-          doc['_archivalist_rust_fields'].delete('pui_notes_metadata')
-          doc['_archivalist_rust_fields'].delete('pui_availability_metadata')
-          doc.delete('_archivalist_rust_fields') if doc['_archivalist_rust_fields'].empty?
-        elsif doc['_archivalist_rust_fields'] == ['pui_final_document_metadata'] || doc['_archivalist_rust_fields'] == ['pui_availability_metadata']
-          doc.delete('_archivalist_rust_fields')
-        end
+          @document_prepare_hooks.each do |hook|
+            hook.call(doc, record)
+          end
 
-        @document_prepare_hooks.each do |hook|
-          hook.call(doc, record)
-        end
-
-        if ( !values["finding_aid_filing_title"].nil? && values["finding_aid_filing_title"].length > 0 )
-          doc['title_sort'] ||= clean_for_sort(values["finding_aid_filing_title"])
-        else
-          doc['title_sort'] ||= clean_for_sort(values['title'])
-        end
-
-        # do this last of all so we know for certain the doc is published
-        apply_pui_fields(doc, record)
-
-        next if skip_index_doc?(doc)
-
-        doc.delete_if {|k, _| k.to_s.start_with?('_archivalist_')}
-        batch << clean_whitespace(doc)
-
-        # Allow a single record to spawn multiple Solr documents if desired
-        @extra_documents_hooks.each do |hook|
-          if hook.equal?(@collection_management_extra_hook) && rust_cm_docs && !rust_cm_docs.empty?
-            batch.concat(rust_cm_docs)
+          if ( !values["finding_aid_filing_title"].nil? && values["finding_aid_filing_title"].length > 0 )
+            doc['title_sort'] ||= clean_for_sort(values["finding_aid_filing_title"])
           else
-            batch.concat(hook.call(record))
+            doc['title_sort'] ||= clean_for_sort(values['title'])
+          end
+
+          # do this last of all so we know for certain the doc is published
+          apply_pui_fields(doc, record)
+
+          next if skip_index_doc?(doc)
+
+          doc.delete_if {|k, _| k.to_s.start_with?('_archivalist_')}
+          batch << clean_whitespace(doc)
+
+          # Allow a single record to spawn multiple Solr documents if desired
+          @extra_documents_hooks.each do |hook|
+            if hook.equal?(@collection_management_extra_hook) && rust_cm_docs && !rust_cm_docs.empty?
+              batch.concat(rust_cm_docs)
+            else
+              batch.concat(hook.call(record))
+            end
           end
         end
       end
+    ensure
       @pui_final_projections = nil
       @pui_routing_projections = nil
       @pui_notes_projections = nil
       @pui_availability_projections = nil
       @pui_candidate_projections = nil
+      @pui_common_projections = nil
     end
 
     index_batch(batch, timing)

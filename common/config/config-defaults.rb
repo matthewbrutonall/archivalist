@@ -995,3 +995,4 @@ AppConfig[:rust_pui_document_preparation_enabled] = false
 AppConfig[:rust_pui_availability_preparation_enabled] = false
 AppConfig[:rust_pui_auxiliary_documents_enabled] = false
 AppConfig[:rust_pui_record_inheritance_candidate_enabled] = false
+AppConfig[:rust_pui_common_metadata_enabled] = false

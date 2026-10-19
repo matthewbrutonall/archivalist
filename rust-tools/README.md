@@ -189,6 +189,18 @@ feeds the existing PUI final privacy/fullrecord projection (`_archivalist_pui_fi
 type-strictly validates the Rust candidate; any mismatch, missing/extra key, or sidecar error falls back
 cleanly to native path with zero partial mutation or private marker leakage. Non-PUI/direct-only
 inheritance (`fetch_records`, backend/OAI, native `RecordInheritance.merge`) remains untouched.
+Deterministic common PUI search metadata preparation is gated separately under
+`AppConfig[:rust_pui_common_metadata_enabled]` (disabled by default). It migrates deterministic
+search metadata for the seven native helpers (`IndexerCommon#add_subjects`, `#add_agents`, `#add_audit_info`,
+`#add_years`, `#add_level`, `#add_summary`, `#add_extents`) when invoked by `PUIIndexer` into the existing
+batched Rust `POST /index/documents` path. The input is strictly the direct-only record seen by these helpers,
+never the fully inherited final candidate. Rust emits a narrow projection under `_archivalist_pui_common` with
+marker `pui_common_metadata` containing per-helper field patches across strictly enumerated keys. Ruby
+independently verifies wrapper identity, record identity/type, markers, recursive key sets, and type-strict
+JSON equality against native execution on a scratch doc at each helper's original native call position before
+applying the patch. Plugin hooks, pre-existing doc fields, absence/no-write semantics, and prior record
+mutations are strictly preserved. Any mismatch, unknown key, outage, or exception falls back cleanly to native
+helper execution without partial data or leaked markers.
 
 ## Test and benchmark helpers
 

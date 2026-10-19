@@ -4864,5 +4864,480 @@ describe RustIndexDocumentBuilder do
         expect(ao_source).to eq(source_snapshot)
       end
     end
+
+    describe "prepare_pui_common_metadata" do
+      let(:common_record) do
+        {
+          'uri' => '/repositories/2/resources/555',
+          'jsonmodel_type' => 'resource',
+          'title' => 'Common Builder Spec Resource',
+          'publish' => true,
+          'suppressed' => false,
+          'level' => 'collection',
+          'created_by' => 'archivist',
+          'subjects' => [
+            { 'ref' => '/subjects/1', '_resolved' => { 'title' => 'Local History' } }
+          ],
+          'linked_agents' => [
+            {
+              'ref' => '/agents/people/1',
+              'role' => 'creator',
+              '_resolved' => {
+                'display_name' => { 'sort_name' => 'Doe, Jane' },
+                'publish' => true
+              }
+            }
+          ],
+          'dates' => [
+            { 'date_type' => 'single', 'begin' => '1920' }
+          ],
+          'notes' => [
+            { 'type' => 'abstract', 'content' => ['Summary note'] }
+          ],
+          'extents' => [
+            { 'portion' => 'whole', 'number' => '1', 'extent_type' => 'box' }
+          ]
+        }
+      end
+
+      let(:valid_common_proj) do
+        {
+          'marker' => 'pui_common_metadata',
+          'uri' => '/repositories/2/resources/555',
+          'primary_type' => 'resource',
+          'subjects' => {
+            'subjects' => ['Local History'],
+            'subject_uris' => ['/subjects/1']
+          },
+          'agents' => {
+            'agents' => ['Doe, Jane'],
+            'agent_uris' => ['/agents/people/1'],
+            'published_agents' => ['Doe, Jane'],
+            'published_agent_uris' => ['/agents/people/1'],
+            'creators' => ['Doe, Jane']
+          },
+          'audit_info' => {
+            'created_by' => 'archivist'
+          },
+          'years' => {
+            'years' => ['1920'],
+            'year_sort' => '19201920',
+            'dates' => ['1920']
+          },
+          'level' => {
+            'level' => 'collection'
+          },
+          'summary' => {
+            'summary' => 'Summary note'
+          },
+          'extents' => {
+            'extents' => ['1 --- box']
+          }
+        }
+      end
+
+      it "validates and accepts trusted common metadata projection in common-only request" do
+        doc = {
+          'id' => '/repositories/2/resources/555',
+          'uri' => '/repositories/2/resources/555',
+          'publish' => true,
+          'suppressed' => false,
+          'primary_type' => 'resource',
+          'title' => 'Common Builder Spec Resource',
+          'types' => ['resource'],
+          'repository' => 2,
+          'system_generated' => 'false',
+          'json' => ASUtils.to_json(common_record),
+          '_archivalist_rust_fields' => ['pui_common_metadata'],
+          '_archivalist_pui_common' => valid_common_proj,
+        }
+
+        inp = {
+          'uri' => '/repositories/2/resources/555',
+          'record_type' => 'resource',
+          'repository' => 2,
+          'record' => common_record,
+          'prepare_pui_common_metadata' => true,
+        }
+
+        allow(builder).to receive(:perform_request).and_return(
+          response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                          'documents' => [doc])
+        )
+
+        res = builder.build([inp])
+        expect(res.length).to eq(1)
+        expect(res.first['_archivalist_pui_common']['marker']).to eq('pui_common_metadata')
+        expect(res.first['_archivalist_rust_fields']).to eq(['pui_common_metadata'])
+      end
+
+      it "validates and accepts combined prepare_pui_final and prepare_pui_common_metadata request" do
+        clean_rec = common_record.dup
+        doc = {
+          'id' => '/repositories/2/resources/555',
+          'uri' => '/repositories/2/resources/555',
+          'publish' => true,
+          'suppressed' => false,
+          'primary_type' => 'resource',
+          'title' => 'Common Builder Spec Resource',
+          'types' => ['resource'],
+          'repository' => 2,
+          'system_generated' => 'false',
+          'json' => ASUtils.to_json(clean_rec),
+          '_archivalist_rust_fields' => [
+            'pui_final_document_metadata',
+            'pui_routing_metadata',
+            'pui_notes_metadata',
+            'pui_common_metadata'
+          ],
+          '_archivalist_pui_final' => {
+            'marker' => 'pui_final_document_metadata',
+            'json' => ASUtils.to_json(clean_rec),
+            'fullrecord_published' => IndexerCommon.extract_string_values(clean_rec, :published_only)
+          },
+          '_archivalist_pui_routing' => {
+            'marker' => 'pui_routing_metadata',
+            'id' => '/repositories/2/resources/555#pui',
+            'pui_parent_id' => '/repositories/2/resources/555',
+            'types' => ['pui', 'pui_resource', 'pui_record', 'pui_only']
+          },
+          '_archivalist_pui_notes' => {
+            'marker' => 'pui_notes_metadata',
+            'notes_published' => IndexerCommon.extract_string_values(clean_rec['notes'], :published_only)
+          },
+          '_archivalist_pui_common' => valid_common_proj,
+        }
+
+        inp = {
+          'uri' => '/repositories/2/resources/555',
+          'record_type' => 'resource',
+          'repository' => 2,
+          'record' => common_record,
+          'pui_candidate_record' => common_record,
+          'prepare_pui_final' => true,
+          'prepare_pui_common_metadata' => true,
+        }
+
+        allow(builder).to receive(:perform_request).and_return(
+          response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                          'documents' => [doc])
+        )
+
+        res = builder.build([inp])
+        expect(res.length).to eq(1)
+        expect(res.first['_archivalist_pui_common']).to be_a(Hash)
+        expect(res.first['_archivalist_pui_final']).to be_a(Hash)
+      end
+
+      it "rejects incompatible mode combinations with prepare_pui_common_metadata" do
+        inp_enrich = {
+          'uri' => '/repositories/2/resources/555',
+          'record_type' => 'resource',
+          'repository' => 2,
+          'record' => common_record,
+          'enrich' => true,
+          'prepare_pui_common_metadata' => true,
+        }
+        expect { builder.build([inp_enrich]) }.to raise_error(/cannot combine enrich and prepare_pui_common_metadata/)
+
+        inp_avail = {
+          'uri' => '/repositories/2/resources/555',
+          'record_type' => 'resource',
+          'repository' => 2,
+          'record' => common_record,
+          'prepare_pui_availability' => true,
+          'record_inheritance_has_type' => false,
+          'prepare_pui_common_metadata' => true,
+        }
+        expect { builder.build([inp_avail]) }.to raise_error(/cannot combine prepare_pui_availability and prepare_pui_common_metadata/)
+
+        inp_aux = {
+          'uri' => '/repositories/2/resources/555/ordered_records',
+          'record_type' => 'resource_ordered_records',
+          'pui_parent_id' => '/repositories/2/resources/555',
+          'record' => common_record,
+          'pui_auxiliary_json' => '{}',
+          'prepare_pui_auxiliary' => true,
+          'prepare_pui_common_metadata' => true,
+        }
+        expect { builder.build([inp_aux]) }.to raise_error(/cannot combine prepare_pui_auxiliary and prepare_pui_common_metadata/)
+      end
+
+      it "rejects non-boolean prepare_pui_common_metadata capability flag" do
+        inp = {
+          'uri' => '/repositories/2/resources/555',
+          'record_type' => 'resource',
+          'repository' => 2,
+          'record' => common_record,
+          'prepare_pui_common_metadata' => 'true', # non-boolean
+        }
+        expect { builder.build([inp]) }.to raise_error(/prepare_pui_common_metadata must be explicitly boolean/)
+      end
+
+      it "rejects unexpected _archivalist_pui_common when capability is not requested" do
+        clean_rec = common_record.dup
+        doc = {
+          'id' => '/repositories/2/resources/555',
+          'uri' => '/repositories/2/resources/555',
+          'publish' => true,
+          'suppressed' => false,
+          'primary_type' => 'resource',
+          'title' => 'Common Builder Spec Resource',
+          'types' => ['resource'],
+          'repository' => 2,
+          'system_generated' => 'false',
+          'json' => ASUtils.to_json(clean_rec),
+          '_archivalist_rust_fields' => [
+            'pui_final_document_metadata',
+            'pui_routing_metadata',
+            'pui_notes_metadata',
+          ],
+          '_archivalist_pui_final' => {
+            'marker' => 'pui_final_document_metadata',
+            'json' => ASUtils.to_json(clean_rec),
+            'fullrecord_published' => IndexerCommon.extract_string_values(clean_rec, :published_only)
+          },
+          '_archivalist_pui_routing' => {
+            'marker' => 'pui_routing_metadata',
+            'id' => '/repositories/2/resources/555#pui',
+            'pui_parent_id' => '/repositories/2/resources/555',
+            'types' => ['pui', 'pui_resource', 'pui_record', 'pui_only']
+          },
+          '_archivalist_pui_notes' => {
+            'marker' => 'pui_notes_metadata',
+            'notes_published' => IndexerCommon.extract_string_values(clean_rec['notes'], :published_only)
+          },
+          '_archivalist_pui_common' => valid_common_proj, # unexpected
+        }
+
+        inp = {
+          'uri' => '/repositories/2/resources/555',
+          'record_type' => 'resource',
+          'repository' => 2,
+          'record' => common_record,
+          'pui_candidate_record' => common_record,
+          'prepare_pui_final' => true,
+          # prepare_pui_common_metadata NOT requested
+        }
+
+        allow(builder).to receive(:perform_request).and_return(
+          response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                          'documents' => [doc])
+        )
+
+        expect { builder.build([inp]) }.to raise_error(/unexpected response pui common projection marker/)
+      end
+
+      it "rejects missing required fields, unknown keys, or value mismatches in _archivalist_pui_common" do
+        doc_bad_marker = {
+          'id' => '/repositories/2/resources/555',
+          'uri' => '/repositories/2/resources/555',
+          'publish' => true,
+          'suppressed' => false,
+          'primary_type' => 'resource',
+          'title' => 'Common Builder Spec Resource',
+          'types' => ['resource'],
+          'repository' => 2,
+          'system_generated' => 'false',
+          'json' => ASUtils.to_json(common_record),
+          '_archivalist_rust_fields' => ['pui_common_metadata'],
+          '_archivalist_pui_common' => valid_common_proj.merge('marker' => 'corrupt_marker'),
+        }
+
+        inp = {
+          'uri' => '/repositories/2/resources/555',
+          'record_type' => 'resource',
+          'repository' => 2,
+          'record' => common_record,
+          'prepare_pui_common_metadata' => true,
+        }
+
+        allow(builder).to receive(:perform_request).and_return(
+          response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                          'documents' => [doc_bad_marker])
+        )
+        expect { builder.build([inp]) }.to raise_error(/pui common marker mismatch/)
+
+        # Unknown extra key
+        doc_extra_key = {
+          'id' => '/repositories/2/resources/555',
+          'uri' => '/repositories/2/resources/555',
+          'publish' => true,
+          'suppressed' => false,
+          'primary_type' => 'resource',
+          'title' => 'Common Builder Spec Resource',
+          'types' => ['resource'],
+          'repository' => 2,
+          'system_generated' => 'false',
+          'json' => ASUtils.to_json(common_record),
+          '_archivalist_rust_fields' => ['pui_common_metadata'],
+          '_archivalist_pui_common' => valid_common_proj.merge('evil_extra' => true),
+        }
+        allow(builder).to receive(:perform_request).and_return(
+          response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                          'documents' => [doc_extra_key])
+        )
+        expect { builder.build([inp]) }.to raise_error(/pui common contains unexpected fields/)
+      end
+
+      it "validates exact allowed top-level document key sets and rejects injected notes, fullrecord, extra fields, and missing base fields" do
+        base_valid_doc = {
+          'id' => '/repositories/2/resources/555',
+          'uri' => '/repositories/2/resources/555',
+          'publish' => true,
+          'suppressed' => false,
+          'primary_type' => 'resource',
+          'title' => 'Common Builder Spec Resource',
+          'types' => ['resource'],
+          'repository' => 2,
+          'system_generated' => 'false',
+          'json' => ASUtils.to_json(common_record),
+          '_archivalist_rust_fields' => ['pui_common_metadata'],
+          '_archivalist_pui_common' => valid_common_proj,
+        }
+
+        inp = {
+          'uri' => '/repositories/2/resources/555',
+          'record_type' => 'resource',
+          'repository' => 2,
+          'record' => common_record,
+          'prepare_pui_common_metadata' => true,
+        }
+
+        # 1. Fault injection: injected top-level notes
+        doc_with_notes = base_valid_doc.merge('notes' => ['injected note'])
+        allow(builder).to receive(:perform_request).and_return(
+          response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER, 'documents' => [doc_with_notes])
+        )
+        expect { builder.build([inp]) }.to raise_error(/document contains unexpected fields.*notes/)
+
+        # 2. Fault injection: injected top-level fullrecord
+        doc_with_fullrecord = base_valid_doc.merge('fullrecord' => ['injected fullrecord'])
+        allow(builder).to receive(:perform_request).and_return(
+          response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER, 'documents' => [doc_with_fullrecord])
+        )
+        expect { builder.build([inp]) }.to raise_error(/document contains unexpected fields.*fullrecord/)
+
+        # 3. Fault injection: injected arbitrary public field
+        doc_with_arbitrary = base_valid_doc.merge('arbitrary_public_field' => 'should_fail')
+        allow(builder).to receive(:perform_request).and_return(
+          response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER, 'documents' => [doc_with_arbitrary])
+        )
+        expect { builder.build([inp]) }.to raise_error(/document contains unexpected fields.*arbitrary_public_field/)
+
+        # 4. Fault injection: injected private marker
+        doc_with_marker = base_valid_doc.merge('_archivalist_private_data' => { 'leak' => true })
+        allow(builder).to receive(:perform_request).and_return(
+          response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER, 'documents' => [doc_with_marker])
+        )
+        expect { builder.build([inp]) }.to raise_error(/document contains unexpected fields.*_archivalist_private_data/)
+
+        # 5. Fault injection: missing base envelope field (e.g. types)
+        doc_missing_base = base_valid_doc.dup
+        doc_missing_base.delete('types')
+        allow(builder).to receive(:perform_request).and_return(
+          response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER, 'documents' => [doc_missing_base])
+        )
+        expect { builder.build([inp]) }.to raise_error(/document missing required fields.*types/)
+
+        # 6. Fault injection: common-only request containing unrequested pui_final projection
+        doc_unrequested_final = base_valid_doc.merge(
+          '_archivalist_pui_final' => { 'marker' => 'pui_final_document_metadata' }
+        )
+        allow(builder).to receive(:perform_request).and_return(
+          response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER, 'documents' => [doc_unrequested_final])
+        )
+        expect { builder.build([inp]) }.to raise_error(/document contains unexpected fields.*_archivalist_pui_final/)
+
+        # 7. Combined request missing required pui_final
+        combined_inp = {
+          'uri' => '/repositories/2/resources/555',
+          'record_type' => 'resource',
+          'repository' => 2,
+          'record' => common_record,
+          'pui_candidate_record' => common_record,
+          'prepare_pui_final' => true,
+          'prepare_pui_common_metadata' => true,
+        }
+        # In a combined request, base_valid_doc lacks pui_final/routing/notes
+        allow(builder).to receive(:perform_request).and_return(
+          response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER, 'documents' => [base_valid_doc])
+        )
+        expect { builder.build([combined_inp]) }.to raise_error(/document missing required fields.*_archivalist_pui_final/)
+
+        # 8. Combined request without inheritance plan containing unrequested pui_candidate
+        valid_combined_doc = {
+          'id' => '/repositories/2/resources/555',
+          'uri' => '/repositories/2/resources/555',
+          'publish' => true,
+          'suppressed' => false,
+          'primary_type' => 'resource',
+          'title' => 'Common Builder Spec Resource',
+          'types' => ['resource'],
+          'repository' => 2,
+          'system_generated' => 'false',
+          'json' => ASUtils.to_json(common_record),
+          '_archivalist_rust_fields' => [
+            'pui_final_document_metadata',
+            'pui_routing_metadata',
+            'pui_notes_metadata',
+            'pui_common_metadata'
+          ],
+          '_archivalist_pui_final' => {
+            'marker' => 'pui_final_document_metadata',
+            'json' => ASUtils.to_json(common_record),
+            'fullrecord_published' => IndexerCommon.extract_string_values(common_record, :published_only)
+          },
+          '_archivalist_pui_routing' => {
+            'marker' => 'pui_routing_metadata',
+            'id' => '/repositories/2/resources/555#pui',
+            'pui_parent_id' => '/repositories/2/resources/555',
+            'types' => ['pui', 'pui_resource', 'pui_record', 'pui_only']
+          },
+          '_archivalist_pui_notes' => {
+            'marker' => 'pui_notes_metadata',
+            'notes_published' => IndexerCommon.extract_string_values(common_record['notes'], :published_only)
+          },
+          '_archivalist_pui_common' => valid_common_proj,
+          '_archivalist_pui_candidate' => { 'marker' => 'pui_record_inheritance_candidate_metadata' } # unrequested!
+        }
+        allow(builder).to receive(:perform_request).and_return(
+          response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER, 'documents' => [valid_combined_doc])
+        )
+        expect { builder.build([combined_inp]) }.to raise_error(/document contains unexpected fields.*_archivalist_pui_candidate/)
+      end
+
+      it "strictly validates recursive JSON types including integer vs float, boolean vs int, ordering and duplicate keys" do
+        # 1 vs 1.0 (Integer vs Float)
+        expect {
+          RustIndexDocumentBuilder.validate_json_equal!({ 'count' => 1 }, { 'count' => 1.0 })
+        }.to raise_error(/type mismatch: expected (Integer|Fixnum), got Float/)
+
+        # false vs 0 (Boolean vs Integer)
+        expect {
+          RustIndexDocumentBuilder.validate_json_equal!({ 'flag' => false }, { 'flag' => 0 })
+        }.to raise_error(/type mismatch: expected Boolean, got (Integer|Fixnum)/)
+
+        # Array ordering mismatch
+        expect {
+          RustIndexDocumentBuilder.validate_json_equal!({ 'arr' => ['a', 'b'] }, { 'arr' => ['b', 'a'] })
+        }.to raise_error(/value mismatch/)
+
+        # Array duplicate mismatch
+        expect {
+          RustIndexDocumentBuilder.validate_json_equal!({ 'arr' => ['a', 'a'] }, { 'arr' => ['a'] })
+        }.to raise_error(/array length mismatch/)
+
+        # Missing recursive key
+        expect {
+          RustIndexDocumentBuilder.validate_json_equal!({ 'nested' => { 'k1' => 'v1', 'k2' => 'v2' } }, { 'nested' => { 'k1' => 'v1' } })
+        }.to raise_error(/keys mismatch.*missing: \["k2"\]/)
+
+        # Extra recursive key
+        expect {
+          RustIndexDocumentBuilder.validate_json_equal!({ 'nested' => { 'k1' => 'v1' } }, { 'nested' => { 'k1' => 'v1', 'k_extra' => 'v2' } })
+        }.to raise_error(/keys mismatch.*extra: \["k_extra"\]/)
+      end
+    end
   end
 end
