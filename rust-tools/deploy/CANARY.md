@@ -438,12 +438,28 @@ When testing `AppConfig[:rust_pui_auxiliary_documents_enabled] = true`, verify t
 5. Sidecar failure, timeout, or malformed responses cause immediate fallback to native
    document construction for the entire batch without partial application.
 
+### Step E: PUI record inheritance candidate preparation
+
+When testing `AppConfig[:rust_pui_record_inheritance_candidate_enabled] = true`, verify that:
+1. Ruby translates active `AppConfig[:record_inheritance]` into deterministic `record_inheritance_plan`
+   via `RecordInheritance.build_plan(record)`, evaluating all `skip_if`/`inherit_if` Procs and localized
+   levels in Ruby.
+2. The Rust sidecar executes the deterministic merge against a deep JSON copy, projecting the merged
+   candidate under `_archivalist_pui_candidate` with marker `pui_record_inheritance_candidate_metadata`.
+   Candidate retains `ancestors` while `_archivalist_pui_final` strips ancestors.
+3. Ruby independently computes native `RecordInheritance.merge(record)` and type-strictly validates the
+   Rust merged candidate before trusting it.
+4. Any missing/extra/malformed plan/result key, identity mismatch, type mismatch, sidecar error, or
+   parity mismatch immediately falls back to the complete native path with zero partial mutation or
+   private marker leakage.
+5. Direct-only inheritance (`fetch_records`), backend/OAI, and non-PUI paths remain completely untouched.
+
 ## 9. Rollback
 
 Set all sidecar enable flags, including `rust_index_document_builder_enabled`,
 `rust_index_document_enrichment_enabled`, `rust_pui_document_preparation_enabled`,
-`rust_pui_availability_preparation_enabled`, and `rust_pui_auxiliary_documents_enabled`,
-to `false` and restart Archivalist:
+`rust_pui_availability_preparation_enabled`, `rust_pui_auxiliary_documents_enabled`,
+and `rust_pui_record_inheritance_candidate_enabled`, to `false` and restart Archivalist:
 
 ```ruby
 AppConfig[:rust_index_document_builder_enabled] = false
@@ -451,6 +467,7 @@ AppConfig[:rust_index_document_enrichment_enabled] = false
 AppConfig[:rust_pui_document_preparation_enabled] = false
 AppConfig[:rust_pui_availability_preparation_enabled] = false
 AppConfig[:rust_pui_auxiliary_documents_enabled] = false
+AppConfig[:rust_pui_record_inheritance_candidate_enabled] = false
 ```
 
 The sidecar can then be stopped independently. Do not point the service at the primary

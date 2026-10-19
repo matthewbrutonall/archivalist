@@ -13,6 +13,9 @@ pub const PUI_AVAILABILITY_METADATA_MARKER: &str = "pui_availability_metadata";
 pub const PUI_AVAILABILITY_DOCUMENTS_KEY: &str = "_archivalist_pui_availability";
 pub const PUI_AUXILIARY_METADATA_MARKER: &str = "pui_auxiliary_document_metadata";
 pub const PUI_AUXILIARY_DOCUMENTS_KEY: &str = "_archivalist_pui_auxiliary";
+pub const PUI_RECORD_INHERITANCE_CANDIDATE_METADATA_MARKER: &str =
+    "pui_record_inheritance_candidate_metadata";
+pub const PUI_CANDIDATE_DOCUMENTS_KEY: &str = "_archivalist_pui_candidate";
 pub const PUI_AUXILIARY_TYPES: &[&str] = &[
     "resource_ordered_records",
     "tree_root",
@@ -20,6 +23,43 @@ pub const PUI_AUXILIARY_TYPES: &[&str] = &[
     "tree_node",
     "tree_node_from_root",
 ];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RecordInheritancePlan {
+    pub record_type: String,
+    pub rules: Vec<RecordInheritanceRulePlan>,
+    #[serde(default)]
+    pub composite_identifiers: Option<CompositeIdentifierPlan>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RecordInheritanceRulePlan {
+    pub property: String,
+    pub inherit_directly: bool,
+    pub ancestor_index: usize,
+    #[serde(default)]
+    pub ancestor_element_indices: Option<Vec<usize>>,
+    pub inherited_value: Value,
+    pub inherited_props: InheritanceProps,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct InheritanceProps {
+    #[serde(rename = "ref")]
+    pub ref_val: Value,
+    pub level: Value,
+    pub direct: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CompositeIdentifierPlan {
+    pub pieces: Vec<String>,
+    pub delimiter: String,
+}
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Clone)]
 pub struct IndexDocumentInput {
@@ -41,6 +81,8 @@ pub struct IndexDocumentInput {
     pub prepare_pui_final: bool,
     #[serde(default)]
     pub pui_candidate_record: Option<Value>,
+    #[serde(default)]
+    pub record_inheritance_plan: Option<RecordInheritancePlan>,
     #[serde(default)]
     pub prepare_pui_availability: bool,
     #[serde(default)]
@@ -67,6 +109,7 @@ impl Default for IndexDocumentInput {
             parsed_accession_date_year: None,
             prepare_pui_final: false,
             pui_candidate_record: None,
+            record_inheritance_plan: None,
             prepare_pui_availability: false,
             record_inheritance_has_type: None,
             prepare_pui_auxiliary: false,
@@ -2806,48 +2849,238 @@ fn clean_pui_candidate_instances(instances: &mut [Value]) {
     }
 }
 
+fn flatten_json_array(arr: &mut Vec<Value>) {
+    let mut flattened = Vec::with_capacity(arr.len());
+    for item in arr.drain(..) {
+        flatten_json_item(item, &mut flattened);
+    }
+    *arr = flattened;
+}
+
+fn flatten_json_item(item: Value, dest: &mut Vec<Value>) {
+    if let Value::Array(sub_arr) = item {
+        for sub_item in sub_arr {
+            flatten_json_item(sub_item, dest);
+        }
+    } else {
+        dest.push(item);
+    }
+}
+
+fn execute_record_inheritance_merge(
+    record_val: &Value,
+    plan: &RecordInheritancePlan,
+) -> Result<Map<String, Value>, IndexDocumentError> {
+    let mut record = record_val
+        .as_object()
+        .cloned()
+        .ok_or_else(|| error("record must be a JSON object for inheritance merge"))?;
+
+    for rule in &plan.rules {
+        if rule.property.trim().is_empty() {
+            return Err(error("rule.property must not be empty"));
+        }
+        if rule.inherited_value.is_null() {
+            return Err(error(format!(
+                "rule.inherited_value must not be null for property '{}'",
+                rule.property
+            )));
+        }
+
+        let mut props_map = Map::new();
+        props_map.insert("ref".to_string(), rule.inherited_props.ref_val.clone());
+        props_map.insert("level".to_string(), rule.inherited_props.level.clone());
+        props_map.insert(
+            "direct".to_string(),
+            Value::Bool(rule.inherited_props.direct),
+        );
+        let props_val = Value::Object(props_map);
+
+        // 1. In-place mutation of the selected ancestor in record["ancestors"]
+        let ancestors = record
+            .get_mut("ancestors")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                error(format!(
+                    "ancestors array missing or not an array for rule on property '{}'",
+                    rule.property
+                ))
+            })?;
+
+        if rule.ancestor_index >= ancestors.len() {
+            return Err(error(format!(
+                "rule.ancestor_index {} out of bounds (ancestors count {}) for property '{}'",
+                rule.ancestor_index,
+                ancestors.len(),
+                rule.property
+            )));
+        }
+
+        let ancestor = ancestors[rule.ancestor_index]
+            .as_object_mut()
+            .ok_or_else(|| {
+                error(format!(
+                    "ancestor at index {} must be an object",
+                    rule.ancestor_index
+                ))
+            })?;
+
+        let resolved = ancestor
+            .get_mut("_resolved")
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                error(format!(
+                    "ancestor at index {} missing '_resolved' object",
+                    rule.ancestor_index
+                ))
+            })?;
+
+        let ancestor_prop_val = resolved.get_mut(&rule.property);
+
+        if let Some(ref elem_indices) = rule.ancestor_element_indices {
+            let ancestor_arr = match ancestor_prop_val {
+                Some(Value::Array(arr)) => arr,
+                _ => {
+                    return Err(error(format!(
+                        "ancestor at index {} property '{}' must be an array",
+                        rule.ancestor_index, rule.property
+                    )));
+                }
+            };
+
+            for &idx in elem_indices {
+                if idx >= ancestor_arr.len() {
+                    return Err(error(format!(
+                        "ancestor_element_indices index {} out of bounds (length {}) for property '{}'",
+                        idx,
+                        ancestor_arr.len(),
+                        rule.property
+                    )));
+                }
+                if let Value::Object(item_obj) = &mut ancestor_arr[idx] {
+                    item_obj.insert("_inherited".to_string(), props_val.clone());
+                }
+            }
+        } else if let Some(Value::Object(item_obj)) = ancestor_prop_val {
+            item_obj.insert("_inherited".to_string(), props_val.clone());
+        }
+
+        // 2. Destination record update
+        let mut val = rule.inherited_value.clone();
+        if let Value::Array(items) = &mut val {
+            let mut has_non_object = false;
+            for item in items.iter_mut() {
+                if let Value::Object(item_obj) = item {
+                    item_obj.insert("_inherited".to_string(), props_val.clone());
+                } else {
+                    has_non_object = true;
+                }
+            }
+            if has_non_object {
+                record.insert(format!("{}_inherited", rule.property), props_val.clone());
+            }
+
+            let target_arr = match record.get_mut(&rule.property) {
+                Some(Value::Array(existing)) => existing,
+                _ => {
+                    record.insert(rule.property.clone(), Value::Array(Vec::new()));
+                    record
+                        .get_mut(&rule.property)
+                        .unwrap()
+                        .as_array_mut()
+                        .unwrap()
+                }
+            };
+            target_arr.extend(items.clone());
+            flatten_json_array(target_arr);
+        } else {
+            if let Value::Object(val_obj) = &mut val {
+                val_obj.insert("_inherited".to_string(), props_val);
+            } else {
+                record.insert(format!("{}_inherited", rule.property), props_val);
+            }
+            record.insert(rule.property.clone(), val);
+        }
+    }
+
+    if let Some(ref ci_plan) = plan.composite_identifiers {
+        let joined = ci_plan.pieces.join(&ci_plan.delimiter);
+        record.insert("_composite_identifier".to_string(), Value::String(joined));
+    }
+
+    Ok(record)
+}
+
 fn add_pui_final_fields(
     document: &mut Map<String, Value>,
     input: &IndexDocumentInput,
 ) -> Result<(), IndexDocumentError> {
-    // 1. Strict validation of candidate record identity
-    let candidate_val = input
-        .pui_candidate_record
-        .as_ref()
-        .ok_or_else(|| error("pui_candidate_record is required when prepare_pui_final is true"))?;
-    let candidate_obj = candidate_val
-        .as_object()
-        .ok_or_else(|| error("pui_candidate_record must be a JSON object"))?;
-
-    let cand_uri = candidate_obj
-        .get("uri")
-        .and_then(Value::as_str)
-        .ok_or_else(|| error("pui_candidate_record.uri must be a string"))?;
-    if cand_uri.trim().is_empty() {
-        return Err(error("pui_candidate_record.uri must not be empty"));
-    }
-    if cand_uri != input.uri {
-        return Err(error(format!(
-            "pui_candidate_record uri '{cand_uri}' does not match wrapper uri '{}'",
-            input.uri
-        )));
-    }
-
-    let cand_type = candidate_obj
-        .get("jsonmodel_type")
-        .and_then(Value::as_str)
-        .ok_or_else(|| error("pui_candidate_record.jsonmodel_type must be a string"))?;
-    if cand_type.trim().is_empty() {
+    // 1. Candidate record: either merged via plan in Rust or passed as pui_candidate_record
+    if input.record_inheritance_plan.is_some() && input.pui_candidate_record.is_some() {
         return Err(error(
-            "pui_candidate_record.jsonmodel_type must not be empty",
+            "cannot provide both record_inheritance_plan and pui_candidate_record",
         ));
     }
-    if cand_type != input.record_type {
-        return Err(error(format!(
-            "pui_candidate_record jsonmodel_type '{cand_type}' does not match wrapper record_type '{}'",
-            input.record_type
-        )));
-    }
+
+    let (candidate_obj, rust_candidate_map) = if let Some(ref plan) = input.record_inheritance_plan
+    {
+        if plan.record_type != input.record_type {
+            return Err(error(format!(
+                "record_inheritance_plan record_type '{}' does not match wrapper record_type '{}'",
+                plan.record_type, input.record_type
+            )));
+        }
+        let merged = execute_record_inheritance_merge(&input.record, plan)?;
+        let cand_uri = merged
+            .get("uri")
+            .and_then(Value::as_str)
+            .ok_or_else(|| error("merged candidate uri must be a string"))?;
+        if cand_uri != input.uri {
+            return Err(error(format!(
+                "merged candidate uri '{cand_uri}' does not match wrapper uri '{}'",
+                input.uri
+            )));
+        }
+        (merged.clone(), Some(merged))
+    } else {
+        let candidate_val = input.pui_candidate_record.as_ref().ok_or_else(|| {
+            error("pui_candidate_record is required when prepare_pui_final is true")
+        })?;
+        let candidate_obj = candidate_val
+            .as_object()
+            .ok_or_else(|| error("pui_candidate_record must be a JSON object"))?;
+
+        let cand_uri = candidate_obj
+            .get("uri")
+            .and_then(Value::as_str)
+            .ok_or_else(|| error("pui_candidate_record.uri must be a string"))?;
+        if cand_uri.trim().is_empty() {
+            return Err(error("pui_candidate_record.uri must not be empty"));
+        }
+        if cand_uri != input.uri {
+            return Err(error(format!(
+                "pui_candidate_record uri '{cand_uri}' does not match wrapper uri '{}'",
+                input.uri
+            )));
+        }
+
+        let cand_type = candidate_obj
+            .get("jsonmodel_type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| error("pui_candidate_record.jsonmodel_type must be a string"))?;
+        if cand_type.trim().is_empty() {
+            return Err(error(
+                "pui_candidate_record.jsonmodel_type must not be empty",
+            ));
+        }
+        if cand_type != input.record_type {
+            return Err(error(format!(
+                "pui_candidate_record jsonmodel_type '{cand_type}' does not match wrapper record_type '{}'",
+                input.record_type
+            )));
+        }
+        (candidate_obj.clone(), None)
+    };
 
     // 2. Strict validation of direct record identity
     let record_obj = input
@@ -2940,7 +3173,7 @@ fn add_pui_final_fields(
     );
 
     // 5. Prepare final PUI document privacy and fullrecord projection
-    let mut clean_candidate = candidate_obj.clone();
+    let mut clean_candidate = candidate_obj;
 
     // Remove ancestors from the final PUI JSON candidate
     clean_candidate.remove("ancestors");
@@ -2958,13 +3191,29 @@ fn add_pui_final_fields(
     let (published_strings, _unpublished) = extract_string_values(&Value::Object(clean_candidate));
 
     // Capability markers and PUI final payload
+    let mut rust_fields = vec![
+        Value::String(PUI_FINAL_DOCUMENT_METADATA_MARKER.to_string()),
+        Value::String(PUI_ROUTING_METADATA_MARKER.to_string()),
+        Value::String(PUI_NOTES_METADATA_MARKER.to_string()),
+    ];
+    if let Some(ref cand_map) = rust_candidate_map {
+        rust_fields.push(Value::String(
+            PUI_RECORD_INHERITANCE_CANDIDATE_METADATA_MARKER.to_string(),
+        ));
+        let mut cand_proj = Map::new();
+        cand_proj.insert(
+            "marker".to_string(),
+            Value::String(PUI_RECORD_INHERITANCE_CANDIDATE_METADATA_MARKER.to_string()),
+        );
+        cand_proj.insert("record".to_string(), Value::Object(cand_map.clone()));
+        document.insert(
+            PUI_CANDIDATE_DOCUMENTS_KEY.to_string(),
+            Value::Object(cand_proj),
+        );
+    }
     document.insert(
         "_archivalist_rust_fields".to_string(),
-        Value::Array(vec![
-            Value::String(PUI_FINAL_DOCUMENT_METADATA_MARKER.to_string()),
-            Value::String(PUI_ROUTING_METADATA_MARKER.to_string()),
-            Value::String(PUI_NOTES_METADATA_MARKER.to_string()),
-        ]),
+        Value::Array(rust_fields),
     );
 
     let mut pui_final_map = Map::new();
@@ -3431,12 +3680,18 @@ pub fn build_index_document(input: IndexDocumentInput) -> Result<Value, IndexDoc
             || input.parsed_accession_date_year.is_some()
             || input.pui_candidate_record.is_some()
             || input.record_inheritance_has_type.is_some()
+            || input.record_inheritance_plan.is_some()
         {
             return Err(error(
                 "cannot set staff enrichment or pui final/availability fields when prepare_pui_auxiliary is true",
             ));
         }
         return build_pui_auxiliary_document(&input);
+    }
+    if !input.prepare_pui_final && input.record_inheritance_plan.is_some() {
+        return Err(error(
+            "record_inheritance_plan is only allowed when prepare_pui_final is true",
+        ));
     }
     if input.pui_parent_id.is_some() {
         return Err(error(
@@ -9618,5 +9873,1932 @@ mod tests {
             ..Default::default()
         };
         assert!(build_index_document(str_int_mismatch).is_err());
+    }
+
+    #[test]
+    fn test_record_inheritance_candidate_default_ao_rules() {
+        let plan = RecordInheritancePlan {
+            record_type: "archival_object".to_string(),
+            rules: vec![
+                RecordInheritanceRulePlan {
+                    property: "notes".to_string(),
+                    inherit_directly: false,
+                    ancestor_index: 0,
+                    ancestor_element_indices: Some(vec![0]),
+                    inherited_value: json!([
+                        {
+                            "jsonmodel_type": "note_singlepart",
+                            "type": "accessrestrict",
+                            "publish": true,
+                            "content": ["Inherited access restriction from series"]
+                        }
+                    ]),
+                    inherited_props: InheritanceProps {
+                        ref_val: json!("/repositories/2/archival_objects/99"),
+                        level: json!("Serie"),
+                        direct: false,
+                    },
+                },
+                RecordInheritanceRulePlan {
+                    property: "linked_agents".to_string(),
+                    inherit_directly: false,
+                    ancestor_index: 1,
+                    ancestor_element_indices: Some(vec![0]),
+                    inherited_value: json!([
+                        {
+                            "role": "creator",
+                            "ref": "/agents/people/1",
+                            "terms": []
+                        }
+                    ]),
+                    inherited_props: InheritanceProps {
+                        ref_val: json!("/repositories/2/resources/1"),
+                        level: json!("Fondo"),
+                        direct: false,
+                    },
+                },
+                RecordInheritanceRulePlan {
+                    property: "language".to_string(),
+                    inherit_directly: false,
+                    ancestor_index: 1,
+                    ancestor_element_indices: None,
+                    inherited_value: json!("spa"),
+                    inherited_props: InheritanceProps {
+                        ref_val: json!("/repositories/2/resources/1"),
+                        level: json!("Fondo"),
+                        direct: false,
+                    },
+                },
+            ],
+            composite_identifiers: Some(CompositeIdentifierPlan {
+                pieces: vec![
+                    "MS-01".to_string(),
+                    "Serie S1".to_string(),
+                    "Unidad item-100".to_string(),
+                ],
+                delimiter: ". ".to_string(),
+            }),
+        };
+
+        let ao_record = json!({
+            "uri": "/repositories/2/archival_objects/100",
+            "jsonmodel_type": "archival_object",
+            "title": "Item 100 with Inheritance",
+            "publish": true,
+            "suppressed": false,
+            "component_id": "item-100",
+            "level": "item",
+            "ancestors": [
+                {
+                    "ref": "/repositories/2/archival_objects/99",
+                    "level": "series",
+                    "_resolved": {
+                        "component_id": "S1",
+                        "notes": [
+                            {
+                                "jsonmodel_type": "note_singlepart",
+                                "type": "accessrestrict",
+                                "publish": true,
+                                "content": ["Inherited access restriction from series"]
+                            }
+                        ]
+                    }
+                },
+                {
+                    "ref": "/repositories/2/resources/1",
+                    "level": "collection",
+                    "_resolved": {
+                        "id_0": "MS-01",
+                        "language": "spa",
+                        "linked_agents": [
+                            {
+                                "role": "creator",
+                                "ref": "/agents/people/1",
+                                "terms": []
+                            }
+                        ]
+                    }
+                }
+            ],
+            "notes": [
+                {
+                    "jsonmodel_type": "note_singlepart",
+                    "type": "scopecontent",
+                    "publish": true,
+                    "content": ["Direct AO scopecontent"]
+                }
+            ],
+            "linked_agents": []
+        });
+
+        let input = IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/100".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: ao_record,
+            prepare_pui_final: true,
+            record_inheritance_plan: Some(plan),
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input).expect("should build document with inheritance plan");
+        let doc_obj = doc.as_object().unwrap();
+
+        let rust_fields = doc_obj
+            .get("_archivalist_rust_fields")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(rust_fields.contains(&Value::String(
+            PUI_RECORD_INHERITANCE_CANDIDATE_METADATA_MARKER.to_string()
+        )));
+
+        let cand_proj = doc_obj
+            .get(PUI_CANDIDATE_DOCUMENTS_KEY)
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            cand_proj.get("marker").unwrap().as_str().unwrap(),
+            PUI_RECORD_INHERITANCE_CANDIDATE_METADATA_MARKER
+        );
+        let cand_record = cand_proj.get("record").unwrap().as_object().unwrap();
+
+        // Candidate retains ancestors
+        assert!(cand_record.contains_key("ancestors"));
+
+        // CRITICAL aliasing parity: ancestor 0 notes[0] mutated in place with _inherited
+        let anc0 = &cand_record.get("ancestors").unwrap().as_array().unwrap()[0];
+        let anc0_notes = anc0
+            .get("_resolved")
+            .unwrap()
+            .get("notes")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        let anc0_inh = anc0_notes[0]
+            .get("_inherited")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(anc0_inh.get("level").unwrap().as_str(), Some("Serie"));
+        assert_eq!(anc0_inh.get("direct").unwrap().as_bool(), Some(false));
+        assert_eq!(
+            anc0_inh.get("ref").unwrap().as_str(),
+            Some("/repositories/2/archival_objects/99")
+        );
+
+        // Ancestor 1 linked_agents[0] mutated in place with _inherited
+        let anc1 = &cand_record.get("ancestors").unwrap().as_array().unwrap()[1];
+        let anc1_agents = anc1
+            .get("_resolved")
+            .unwrap()
+            .get("linked_agents")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        let anc1_inh = anc1_agents[0]
+            .get("_inherited")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(anc1_inh.get("level").unwrap().as_str(), Some("Fondo"));
+        assert_eq!(anc1_inh.get("direct").unwrap().as_bool(), Some(false));
+        assert_eq!(
+            anc1_inh.get("ref").unwrap().as_str(),
+            Some("/repositories/2/resources/1")
+        );
+
+        // Notes: direct note does NOT have _inherited, inherited note DOES have _inherited
+        let notes = cand_record.get("notes").unwrap().as_array().unwrap();
+        assert_eq!(notes.len(), 2);
+        assert!(!notes[0].as_object().unwrap().contains_key("_inherited"));
+        let inherited_note = notes[1].as_object().unwrap();
+        let note_inh = inherited_note
+            .get("_inherited")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            note_inh.get("ref").unwrap().as_str(),
+            Some("/repositories/2/archival_objects/99")
+        );
+        assert_eq!(note_inh.get("level").unwrap().as_str(), Some("Serie"));
+        assert_eq!(note_inh.get("direct").unwrap().as_bool(), Some(false));
+
+        // Linked agents: creator agent has _inherited
+        let agents = cand_record
+            .get("linked_agents")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(agents.len(), 1);
+        let agent_inh = agents[0]
+            .as_object()
+            .unwrap()
+            .get("_inherited")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            agent_inh.get("ref").unwrap().as_str(),
+            Some("/repositories/2/resources/1")
+        );
+        assert_eq!(agent_inh.get("level").unwrap().as_str(), Some("Fondo"));
+
+        // Language: scalar has language_inherited
+        assert_eq!(cand_record.get("language").unwrap().as_str(), Some("spa"));
+        let lang_inh = cand_record
+            .get("language_inherited")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            lang_inh.get("ref").unwrap().as_str(),
+            Some("/repositories/2/resources/1")
+        );
+        assert_eq!(lang_inh.get("level").unwrap().as_str(), Some("Fondo"));
+
+        // Composite identifier
+        assert_eq!(
+            cand_record.get("_composite_identifier").unwrap().as_str(),
+            Some("MS-01. Serie S1. Unidad item-100")
+        );
+
+        // Final PUI document json stripped ancestors
+        let final_proj = doc_obj
+            .get(PUI_FINAL_DOCUMENTS_KEY)
+            .unwrap()
+            .as_object()
+            .unwrap();
+        let final_json_str = final_proj.get("json").unwrap().as_str().unwrap();
+        let final_json: Value = serde_json::from_str(final_json_str).unwrap();
+        assert!(!final_json.as_object().unwrap().contains_key("ancestors"));
+    }
+
+    #[test]
+    fn test_record_inheritance_candidate_repeated_notes_rules() {
+        let plan = RecordInheritancePlan {
+            record_type: "archival_object".to_string(),
+            rules: vec![
+                // Rule 1: accessrestrict note (child lacks it -> inherits from ancestor 0)
+                RecordInheritanceRulePlan {
+                    property: "notes".to_string(),
+                    inherit_directly: true,
+                    ancestor_index: 0,
+                    ancestor_element_indices: Some(vec![0]),
+                    inherited_value: json!([
+                        {
+                            "jsonmodel_type": "note_singlepart",
+                            "type": "accessrestrict",
+                            "publish": true,
+                            "content": ["Series accessrestrict"]
+                        }
+                    ]),
+                    inherited_props: InheritanceProps {
+                        ref_val: json!("/repositories/2/archival_objects/99"),
+                        level: json!("series"),
+                        direct: true,
+                    },
+                },
+                // Rule 2: langmaterial note (child lacks it -> inherits from ancestor 1)
+                RecordInheritanceRulePlan {
+                    property: "notes".to_string(),
+                    inherit_directly: false,
+                    ancestor_index: 1,
+                    ancestor_element_indices: Some(vec![0]),
+                    inherited_value: json!([
+                        {
+                            "jsonmodel_type": "note_singlepart",
+                            "type": "langmaterial",
+                            "publish": true,
+                            "content": ["Collection langmaterial"]
+                        }
+                    ]),
+                    inherited_props: InheritanceProps {
+                        ref_val: json!("/repositories/2/resources/1"),
+                        level: json!("collection"),
+                        direct: false,
+                    },
+                },
+            ],
+            composite_identifiers: None,
+        };
+
+        let ao_record = json!({
+            "uri": "/repositories/2/archival_objects/105",
+            "jsonmodel_type": "archival_object",
+            "title": "Item 105 Repeated Notes",
+            "publish": true,
+            "suppressed": false,
+            "ancestors": [
+                {
+                    "ref": "/repositories/2/archival_objects/99",
+                    "level": "series",
+                    "_resolved": {
+                        "notes": [
+                            {
+                                "jsonmodel_type": "note_singlepart",
+                                "type": "accessrestrict",
+                                "publish": true,
+                                "content": ["Series accessrestrict"]
+                            }
+                        ]
+                    }
+                },
+                {
+                    "ref": "/repositories/2/resources/1",
+                    "level": "collection",
+                    "_resolved": {
+                        "notes": [
+                            {
+                                "jsonmodel_type": "note_singlepart",
+                                "type": "langmaterial",
+                                "publish": true,
+                                "content": ["Collection langmaterial"]
+                            }
+                        ]
+                    }
+                }
+            ],
+            "notes": [
+                {
+                    "jsonmodel_type": "note_singlepart",
+                    "type": "scopecontent",
+                    "publish": true,
+                    "content": ["Direct child scopecontent"]
+                }
+            ]
+        });
+
+        let input = IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/105".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: ao_record,
+            prepare_pui_final: true,
+            record_inheritance_plan: Some(plan),
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input).unwrap();
+        let cand_record = doc
+            .get(PUI_CANDIDATE_DOCUMENTS_KEY)
+            .unwrap()
+            .get("record")
+            .unwrap()
+            .as_object()
+            .unwrap();
+
+        // Check ancestor mutations
+        let anc0 = &cand_record.get("ancestors").unwrap().as_array().unwrap()[0];
+        let anc0_notes = anc0
+            .get("_resolved")
+            .unwrap()
+            .get("notes")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            anc0_notes[0]
+                .get("_inherited")
+                .unwrap()
+                .get("direct")
+                .unwrap()
+                .as_bool(),
+            Some(true)
+        );
+
+        let anc1 = &cand_record.get("ancestors").unwrap().as_array().unwrap()[1];
+        let anc1_notes = anc1
+            .get("_resolved")
+            .unwrap()
+            .get("notes")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            anc1_notes[0]
+                .get("_inherited")
+                .unwrap()
+                .get("direct")
+                .unwrap()
+                .as_bool(),
+            Some(false)
+        );
+
+        let notes = cand_record.get("notes").unwrap().as_array().unwrap();
+        assert_eq!(notes.len(), 3);
+
+        // 1. Direct scopecontent note (no _inherited)
+        assert_eq!(notes[0].get("type").unwrap().as_str(), Some("scopecontent"));
+        assert!(!notes[0].as_object().unwrap().contains_key("_inherited"));
+
+        // 2. Inherited accessrestrict note from series (direct: true)
+        assert_eq!(
+            notes[1].get("type").unwrap().as_str(),
+            Some("accessrestrict")
+        );
+        let inh1 = notes[1].get("_inherited").unwrap().as_object().unwrap();
+        assert_eq!(
+            inh1.get("ref").unwrap().as_str(),
+            Some("/repositories/2/archival_objects/99")
+        );
+        assert_eq!(inh1.get("direct").unwrap().as_bool(), Some(true));
+
+        // 3. Inherited langmaterial note from collection (direct: false)
+        assert_eq!(notes[2].get("type").unwrap().as_str(), Some("langmaterial"));
+        let inh2 = notes[2].get("_inherited").unwrap().as_object().unwrap();
+        assert_eq!(
+            inh2.get("ref").unwrap().as_str(),
+            Some("/repositories/2/resources/1")
+        );
+        assert_eq!(inh2.get("direct").unwrap().as_bool(), Some(false));
+    }
+
+    #[test]
+    fn test_record_inheritance_candidate_direct_scalar_array_flattening() {
+        let ao_record = json!({
+            "uri": "/repositories/2/archival_objects/101",
+            "jsonmodel_type": "archival_object",
+            "title": "Item 101 Direct & Flattening",
+            "publish": true,
+            "suppressed": false,
+            "flag_scalar": false,
+            "ancestors": [
+                {
+                    "ref": "/repositories/2/archival_objects/98",
+                    "level": "subseries",
+                    "_resolved": {
+                        "nested_notes": [
+                            [
+                                {"type": "note1", "content": "N1"},
+                                {"type": "note2", "content": "N2"}
+                            ],
+                            {"type": "note3", "content": "N3"}
+                        ],
+                        "tags": ["tagA", "tagB"],
+                        "flag_scalar": "active"
+                    }
+                }
+            ],
+            "nested_notes": []
+        });
+
+        let plan = RecordInheritancePlan {
+            record_type: "archival_object".to_string(),
+            rules: vec![
+                RecordInheritanceRulePlan {
+                    property: "nested_notes".to_string(),
+                    inherit_directly: true,
+                    ancestor_index: 0,
+                    ancestor_element_indices: Some(vec![0, 1]),
+                    inherited_value: json!([
+                        [
+                            {"type": "note1", "content": "N1"},
+                            {"type": "note2", "content": "N2"}
+                        ],
+                        {"type": "note3", "content": "N3"}
+                    ]),
+                    inherited_props: InheritanceProps {
+                        ref_val: json!("/repositories/2/archival_objects/98"),
+                        level: json!("subseries"),
+                        direct: true,
+                    },
+                },
+                RecordInheritanceRulePlan {
+                    property: "tags".to_string(),
+                    inherit_directly: false,
+                    ancestor_index: 0,
+                    ancestor_element_indices: Some(vec![0, 1]),
+                    inherited_value: json!(["tagA", "tagB"]),
+                    inherited_props: InheritanceProps {
+                        ref_val: json!("/repositories/2/archival_objects/98"),
+                        level: json!("subseries"),
+                        direct: false,
+                    },
+                },
+                RecordInheritanceRulePlan {
+                    property: "flag_scalar".to_string(),
+                    inherit_directly: true,
+                    ancestor_index: 0,
+                    ancestor_element_indices: None,
+                    inherited_value: json!("active"),
+                    inherited_props: InheritanceProps {
+                        ref_val: json!("/repositories/2/archival_objects/98"),
+                        level: json!("subseries"),
+                        direct: true,
+                    },
+                },
+            ],
+            composite_identifiers: None,
+        };
+
+        let input = IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/101".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: ao_record,
+            prepare_pui_final: true,
+            record_inheritance_plan: Some(plan),
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input).unwrap();
+        let cand_record = doc
+            .get(PUI_CANDIDATE_DOCUMENTS_KEY)
+            .unwrap()
+            .get("record")
+            .unwrap()
+            .as_object()
+            .unwrap();
+
+        // nested_notes should be recursively flattened from [[N1, N2], N3] to [N1, N2, N3]
+        let notes = cand_record.get("nested_notes").unwrap().as_array().unwrap();
+        assert_eq!(notes.len(), 3);
+        assert_eq!(notes[0].get("type").unwrap().as_str(), Some("note1"));
+        assert_eq!(notes[1].get("type").unwrap().as_str(), Some("note2"));
+        assert_eq!(notes[2].get("type").unwrap().as_str(), Some("note3"));
+        // inherit_directly was true -> note3 had _inherited with direct: true
+        assert_eq!(
+            notes[2]
+                .get("_inherited")
+                .unwrap()
+                .get("direct")
+                .unwrap()
+                .as_bool(),
+            Some(true)
+        );
+        // The nested array in ancestor_val triggers nested_notes_inherited on record
+        assert!(cand_record.contains_key("nested_notes_inherited"));
+
+        // tags: scalar strings in array -> tags_inherited on record
+        let tags = cand_record.get("tags").unwrap().as_array().unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].as_str(), Some("tagA"));
+        assert_eq!(tags[1].as_str(), Some("tagB"));
+        assert!(cand_record.contains_key("tags_inherited"));
+
+        // flag_scalar: was false on record -> inherited "active" with direct: true
+        assert_eq!(
+            cand_record.get("flag_scalar").unwrap().as_str(),
+            Some("active")
+        );
+        let flag_inh = cand_record
+            .get("flag_scalar_inherited")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(flag_inh.get("direct").unwrap().as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_record_inheritance_candidate_first_qualifying_ancestor() {
+        // Ancestor 1 has no qualifying note; Ancestor 2 has qualifying note
+        let ao_record = json!({
+            "uri": "/repositories/2/archival_objects/102",
+            "jsonmodel_type": "archival_object",
+            "title": "Item 102 First Qualifying",
+            "publish": true,
+            "suppressed": false,
+            "ancestors": [
+                {
+                    "ref": "/repositories/2/archival_objects/90",
+                    "level": "series",
+                    "_resolved": {}
+                },
+                {
+                    "ref": "/repositories/2/resources/2",
+                    "level": "collection",
+                    "_resolved": {
+                        "language": "fre"
+                    }
+                }
+            ]
+        });
+
+        let plan = RecordInheritancePlan {
+            record_type: "archival_object".to_string(),
+            rules: vec![RecordInheritanceRulePlan {
+                property: "language".to_string(),
+                inherit_directly: false,
+                ancestor_index: 1,
+                ancestor_element_indices: None,
+                inherited_value: json!("fre"),
+                inherited_props: InheritanceProps {
+                    ref_val: json!("/repositories/2/resources/2"),
+                    level: json!("collection"),
+                    direct: false,
+                },
+            }],
+            composite_identifiers: None,
+        };
+
+        let input = IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/102".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: ao_record,
+            prepare_pui_final: true,
+            record_inheritance_plan: Some(plan),
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input).unwrap();
+        let cand_record = doc
+            .get(PUI_CANDIDATE_DOCUMENTS_KEY)
+            .unwrap()
+            .get("record")
+            .unwrap()
+            .as_object()
+            .unwrap();
+
+        assert_eq!(cand_record.get("language").unwrap().as_str(), Some("fre"));
+        let lang_inh = cand_record
+            .get("language_inherited")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(
+            lang_inh.get("ref").unwrap().as_str(),
+            Some("/repositories/2/resources/2")
+        );
+    }
+
+    #[test]
+    fn test_record_inheritance_candidate_composite_identifier_variations() {
+        // 1. Delimiter "/" with include_level: true -> "/ "
+        let ao_record = json!({
+            "uri": "/repositories/2/archival_objects/103",
+            "jsonmodel_type": "archival_object",
+            "title": "Item 103 Composite Id",
+            "publish": true,
+            "suppressed": false,
+            "component_id": "c103",
+            "level": "item",
+            "ancestors": [
+                {
+                    "ref": "/repositories/2/archival_objects/91",
+                    "level": "series",
+                    "_resolved": {
+                        "component_id": "s91"
+                    }
+                },
+                {
+                    "ref": "/repositories/2/resources/3",
+                    "level": "collection",
+                    "_resolved": {
+                        "id_0": "COLL",
+                        "id_1": "2026",
+                        "id_2": "B"
+                    }
+                }
+            ]
+        });
+
+        let plan = RecordInheritancePlan {
+            record_type: "archival_object".to_string(),
+            rules: vec![],
+            composite_identifiers: Some(CompositeIdentifierPlan {
+                pieces: vec![
+                    "COLL/2026/B".to_string(),
+                    "series s91".to_string(),
+                    "item c103".to_string(),
+                ],
+                delimiter: "/ ".to_string(),
+            }),
+        };
+
+        let input = IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/103".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: ao_record,
+            prepare_pui_final: true,
+            record_inheritance_plan: Some(plan),
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input).unwrap();
+        let cand_record = doc
+            .get(PUI_CANDIDATE_DOCUMENTS_KEY)
+            .unwrap()
+            .get("record")
+            .unwrap()
+            .as_object()
+            .unwrap();
+
+        assert_eq!(
+            cand_record.get("_composite_identifier").unwrap().as_str(),
+            Some("COLL/2026/B/ series s91/ item c103")
+        );
+
+        // 2. Delimiter " " with include_level: true -> " "
+        let plan_space = RecordInheritancePlan {
+            record_type: "archival_object".to_string(),
+            rules: vec![],
+            composite_identifiers: Some(CompositeIdentifierPlan {
+                pieces: vec!["collection r3".to_string(), "item c103".to_string()],
+                delimiter: " ".to_string(),
+            }),
+        };
+        let input_space = IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/103".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/103",
+                "jsonmodel_type": "archival_object",
+                "publish": true,
+                "component_id": "c103",
+                "level": "item"
+            }),
+            prepare_pui_final: true,
+            record_inheritance_plan: Some(plan_space),
+            ..Default::default()
+        };
+        let doc_space = build_index_document(input_space).unwrap();
+        let cand_space = doc_space
+            .get(PUI_CANDIDATE_DOCUMENTS_KEY)
+            .unwrap()
+            .get("record")
+            .unwrap();
+        assert_eq!(
+            cand_space.get("_composite_identifier").unwrap().as_str(),
+            Some("collection r3 item c103")
+        );
+
+        // 3. Exclude own component_id when component_id_inherited: true
+        let plan_exclude = RecordInheritancePlan {
+            record_type: "archival_object".to_string(),
+            rules: vec![],
+            composite_identifiers: Some(CompositeIdentifierPlan {
+                pieces: vec!["r3".to_string()],
+                delimiter: ".".to_string(),
+            }),
+        };
+        let input_exclude = IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/103".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/103",
+                "jsonmodel_type": "archival_object",
+                "publish": true,
+                "component_id": "c103"
+            }),
+            prepare_pui_final: true,
+            record_inheritance_plan: Some(plan_exclude),
+            ..Default::default()
+        };
+        let doc_exclude = build_index_document(input_exclude).unwrap();
+        let cand_exclude = doc_exclude
+            .get(PUI_CANDIDATE_DOCUMENTS_KEY)
+            .unwrap()
+            .get("record")
+            .unwrap();
+        assert_eq!(
+            cand_exclude.get("_composite_identifier").unwrap().as_str(),
+            Some("r3")
+        );
+    }
+
+    #[test]
+    fn test_record_inheritance_candidate_unicode_duplicates_and_numbers() {
+        let ao_record = json!({
+            "uri": "/repositories/2/archival_objects/104",
+            "jsonmodel_type": "archival_object",
+            "title": "Unicodé — 📁 Papeles de Ramón Gómez 🚀",
+            "publish": true,
+            "suppressed": false,
+            "int_val": 42,
+            "float_val": 12.345,
+            "bool_val": true,
+            "tags": ["dupe", "dupe"],
+            "ancestors": [
+                {
+                    "ref": "/repositories/2/resources/4",
+                    "level": "collection",
+                    "_resolved": {
+                        "tags": ["dupe", "extra_utf8_🔥"]
+                    }
+                }
+            ]
+        });
+
+        let plan = RecordInheritancePlan {
+            record_type: "archival_object".to_string(),
+            rules: vec![RecordInheritanceRulePlan {
+                property: "tags".to_string(),
+                inherit_directly: false,
+                ancestor_index: 0,
+                ancestor_element_indices: Some(vec![0, 1]),
+                inherited_value: json!(["dupe", "extra_utf8_🔥"]),
+                inherited_props: InheritanceProps {
+                    ref_val: json!("/repositories/2/resources/4"),
+                    level: json!("collection"),
+                    direct: false,
+                },
+            }],
+            composite_identifiers: None,
+        };
+
+        let input = IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/104".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: ao_record,
+            prepare_pui_final: true,
+            record_inheritance_plan: Some(plan),
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input).unwrap();
+        let cand_record = doc
+            .get(PUI_CANDIDATE_DOCUMENTS_KEY)
+            .unwrap()
+            .get("record")
+            .unwrap()
+            .as_object()
+            .unwrap();
+
+        // Check Unicode title
+        assert_eq!(
+            cand_record.get("title").unwrap().as_str(),
+            Some("Unicodé — 📁 Papeles de Ramón Gómez 🚀")
+        );
+
+        // Check integer remains integer
+        let int_val = cand_record.get("int_val").unwrap().as_i64();
+        assert_eq!(int_val, Some(42));
+
+        // Check float remains float
+        let float_val = cand_record.get("float_val").unwrap().as_f64();
+        assert_eq!(float_val, Some(12.345));
+
+        // Check bool remains bool
+        assert_eq!(cand_record.get("bool_val").unwrap().as_bool(), Some(true));
+
+        // Tags had 2 dupes, inherited 2 more -> total 4 items, duplicates preserved
+        let tags = cand_record.get("tags").unwrap().as_array().unwrap();
+        assert_eq!(tags.len(), 4);
+        assert_eq!(tags[0].as_str(), Some("dupe"));
+        assert_eq!(tags[1].as_str(), Some("dupe"));
+        assert_eq!(tags[2].as_str(), Some("dupe"));
+        assert_eq!(tags[3].as_str(), Some("extra_utf8_🔥"));
+    }
+
+    #[test]
+    fn test_record_inheritance_candidate_batch_isolation() {
+        let plan = RecordInheritancePlan {
+            record_type: "archival_object".to_string(),
+            rules: vec![],
+            composite_identifiers: None,
+        };
+
+        let req = IndexDocumentBatchRequest {
+            records: vec![
+                IndexDocumentInput {
+                    uri: "/repositories/2/resources/1".to_string(),
+                    record_type: "resource".to_string(),
+                    repository: json!(2),
+                    record: json!({
+                        "uri": "/repositories/2/resources/1",
+                        "jsonmodel_type": "resource",
+                        "publish": true
+                    }),
+                    prepare_pui_final: true,
+                    pui_candidate_record: Some(json!({
+                        "uri": "/repositories/2/resources/1",
+                        "jsonmodel_type": "resource",
+                        "publish": true
+                    })),
+                    ..Default::default()
+                },
+                IndexDocumentInput {
+                    uri: "/repositories/2/archival_objects/2".to_string(),
+                    record_type: "archival_object".to_string(),
+                    repository: json!(2),
+                    record: json!({
+                        "uri": "/repositories/2/archival_objects/2",
+                        "jsonmodel_type": "archival_object",
+                        "publish": true
+                    }),
+                    prepare_pui_final: true,
+                    record_inheritance_plan: Some(plan),
+                    ..Default::default()
+                },
+                IndexDocumentInput {
+                    uri: "/repositories/2/resources/3".to_string(),
+                    record_type: "resource".to_string(),
+                    repository: json!(2),
+                    record: json!({
+                        "uri": "/repositories/2/resources/3",
+                        "jsonmodel_type": "resource",
+                        "publish": true
+                    }),
+                    enrich: true,
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let resp = build_index_document_batch(req).unwrap();
+        assert_eq!(resp.documents.len(), 3);
+
+        // Record 1: has PUI_FINAL and PUI_NOTES but NO candidate marker
+        let doc1 = resp.documents[0].as_object().unwrap();
+        let fields1 = doc1
+            .get("_archivalist_rust_fields")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(!fields1.contains(&Value::String(
+            PUI_RECORD_INHERITANCE_CANDIDATE_METADATA_MARKER.to_string()
+        )));
+        assert!(!doc1.contains_key(PUI_CANDIDATE_DOCUMENTS_KEY));
+
+        // Record 2: has candidate marker and candidate document
+        let doc2 = resp.documents[1].as_object().unwrap();
+        let fields2 = doc2
+            .get("_archivalist_rust_fields")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(fields2.contains(&Value::String(
+            PUI_RECORD_INHERITANCE_CANDIDATE_METADATA_MARKER.to_string()
+        )));
+        assert!(doc2.contains_key(PUI_CANDIDATE_DOCUMENTS_KEY));
+
+        // Record 3: staff enrich
+        let doc3 = resp.documents[2].as_object().unwrap();
+        assert!(!doc3.contains_key(PUI_CANDIDATE_DOCUMENTS_KEY));
+        assert!(!doc3.contains_key(PUI_FINAL_DOCUMENTS_KEY));
+    }
+
+    #[test]
+    fn test_record_inheritance_candidate_validation_rejections() {
+        let valid_plan = RecordInheritancePlan {
+            record_type: "archival_object".to_string(),
+            rules: vec![],
+            composite_identifiers: None,
+        };
+
+        // 1. Both plan and candidate provided
+        let err1 = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/1".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/1",
+                "jsonmodel_type": "archival_object",
+                "publish": true
+            }),
+            prepare_pui_final: true,
+            pui_candidate_record: Some(json!({
+                "uri": "/repositories/2/archival_objects/1",
+                "jsonmodel_type": "archival_object"
+            })),
+            record_inheritance_plan: Some(valid_plan.clone()),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err1
+            .to_string()
+            .contains("cannot provide both record_inheritance_plan and pui_candidate_record"));
+
+        // 2. Plan provided with prepare_pui_final: false
+        let err2 = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/1".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/1",
+                "jsonmodel_type": "archival_object",
+                "publish": true
+            }),
+            prepare_pui_final: false,
+            record_inheritance_plan: Some(valid_plan.clone()),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err2
+            .to_string()
+            .contains("record_inheritance_plan is only allowed when prepare_pui_final is true"));
+
+        // 3. Plan provided with prepare_pui_auxiliary: true
+        let err3 = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/resources/1/tree/root".to_string(),
+            record_type: "tree_root".to_string(),
+            pui_parent_id: Some("/repositories/2/resources/1".to_string()),
+            record: json!({}),
+            pui_auxiliary_json: Some("{}".to_string()),
+            prepare_pui_auxiliary: true,
+            record_inheritance_plan: Some(valid_plan.clone()),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err3.to_string().contains("cannot set staff enrichment or pui final/availability fields when prepare_pui_auxiliary is true"));
+
+        // 4. Plan record_type mismatch
+        let err4 = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/resources/1".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/1",
+                "jsonmodel_type": "resource",
+                "publish": true
+            }),
+            prepare_pui_final: true,
+            record_inheritance_plan: Some(valid_plan),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err4
+            .to_string()
+            .contains("record_inheritance_plan record_type 'archival_object' does not match wrapper record_type 'resource'"));
+    }
+
+    #[test]
+    fn test_record_inheritance_candidate_duplicate_refs_with_different_levels_and_values() {
+        let plan = RecordInheritancePlan {
+            record_type: "archival_object".to_string(),
+            rules: vec![
+                RecordInheritanceRulePlan {
+                    property: "notes".to_string(),
+                    inherit_directly: true,
+                    ancestor_index: 0,
+                    ancestor_element_indices: Some(vec![0]),
+                    inherited_value: json!([
+                        {
+                            "jsonmodel_type": "note_singlepart",
+                            "type": "scopecontent",
+                            "content": ["First note from dupe ref"]
+                        }
+                    ]),
+                    inherited_props: InheritanceProps {
+                        ref_val: json!("/repositories/2/resources/dupe"),
+                        level: json!("collection_level_A"),
+                        direct: true,
+                    },
+                },
+                RecordInheritanceRulePlan {
+                    property: "notes".to_string(),
+                    inherit_directly: false,
+                    ancestor_index: 0,
+                    ancestor_element_indices: Some(vec![1]),
+                    inherited_value: json!([
+                        {
+                            "jsonmodel_type": "note_singlepart",
+                            "type": "accessrestrict",
+                            "content": ["Second note from same dupe ref"]
+                        }
+                    ]),
+                    inherited_props: InheritanceProps {
+                        ref_val: json!("/repositories/2/resources/dupe"),
+                        level: json!("series_level_B"),
+                        direct: false,
+                    },
+                },
+            ],
+            composite_identifiers: None,
+        };
+
+        let input = IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/200".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/200",
+                "jsonmodel_type": "archival_object",
+                "publish": true,
+                "notes": [],
+                "ancestors": [
+                    {
+                        "ref": "/repositories/2/resources/dupe",
+                        "level": "collection_level_A",
+                        "_resolved": {
+                            "notes": [
+                                {
+                                    "jsonmodel_type": "note_singlepart",
+                                    "type": "scopecontent",
+                                    "content": ["First note from dupe ref"]
+                                },
+                                {
+                                    "jsonmodel_type": "note_singlepart",
+                                    "type": "accessrestrict",
+                                    "content": ["Second note from same dupe ref"]
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }),
+            prepare_pui_final: true,
+            record_inheritance_plan: Some(plan),
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input).unwrap();
+        let cand_record = doc
+            .get(PUI_CANDIDATE_DOCUMENTS_KEY)
+            .unwrap()
+            .get("record")
+            .unwrap()
+            .as_object()
+            .unwrap();
+
+        let notes = cand_record.get("notes").unwrap().as_array().unwrap();
+        assert_eq!(notes.len(), 2);
+
+        // First note: level collection_level_A, direct: true
+        assert_eq!(notes[0].get("type").unwrap().as_str(), Some("scopecontent"));
+        let inh0 = notes[0].get("_inherited").unwrap().as_object().unwrap();
+        assert_eq!(
+            inh0.get("ref").unwrap().as_str(),
+            Some("/repositories/2/resources/dupe")
+        );
+        assert_eq!(
+            inh0.get("level").unwrap().as_str(),
+            Some("collection_level_A")
+        );
+        assert_eq!(inh0.get("direct").unwrap().as_bool(), Some(true));
+
+        // Second note: level series_level_B, direct: false (NOT overwritten by collection_level_A!)
+        assert_eq!(
+            notes[1].get("type").unwrap().as_str(),
+            Some("accessrestrict")
+        );
+        let inh1 = notes[1].get("_inherited").unwrap().as_object().unwrap();
+        assert_eq!(
+            inh1.get("ref").unwrap().as_str(),
+            Some("/repositories/2/resources/dupe")
+        );
+        assert_eq!(inh1.get("level").unwrap().as_str(), Some("series_level_B"));
+        assert_eq!(inh1.get("direct").unwrap().as_bool(), Some(false));
+
+        // Selected ancestor in-place mutations
+        let anc0 = &cand_record.get("ancestors").unwrap().as_array().unwrap()[0];
+        let anc0_notes = anc0
+            .get("_resolved")
+            .unwrap()
+            .get("notes")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            anc0_notes[0]
+                .get("_inherited")
+                .unwrap()
+                .get("level")
+                .unwrap()
+                .as_str(),
+            Some("collection_level_A")
+        );
+        assert_eq!(
+            anc0_notes[1]
+                .get("_inherited")
+                .unwrap()
+                .get("level")
+                .unwrap()
+                .as_str(),
+            Some("series_level_B")
+        );
+    }
+
+    #[test]
+    fn test_record_inheritance_candidate_null_and_missing_and_non_string_ref() {
+        let plan = RecordInheritancePlan {
+            record_type: "archival_object".to_string(),
+            rules: vec![
+                // 1. Null ref, null level
+                RecordInheritanceRulePlan {
+                    property: "language".to_string(),
+                    inherit_directly: false,
+                    ancestor_index: 0,
+                    ancestor_element_indices: None,
+                    inherited_value: json!("lat"),
+                    inherited_props: InheritanceProps {
+                        ref_val: Value::Null,
+                        level: Value::Null,
+                        direct: false,
+                    },
+                },
+                // 2. Integer ref (non-string JSON ref)
+                RecordInheritanceRulePlan {
+                    property: "edition".to_string(),
+                    inherit_directly: true,
+                    ancestor_index: 0,
+                    ancestor_element_indices: None,
+                    inherited_value: json!("1st ed"),
+                    inherited_props: InheritanceProps {
+                        ref_val: json!(12345),
+                        level: json!("item"),
+                        direct: true,
+                    },
+                },
+            ],
+            composite_identifiers: None,
+        };
+
+        let input = IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/201".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/201",
+                "jsonmodel_type": "archival_object",
+                "publish": true,
+                "ancestors": [
+                    {
+                        "ref": null,
+                        "level": null,
+                        "_resolved": {
+                            "language": "lat",
+                            "edition": "1st ed"
+                        }
+                    }
+                ]
+            }),
+            prepare_pui_final: true,
+            record_inheritance_plan: Some(plan),
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input).unwrap();
+        let cand_record = doc
+            .get(PUI_CANDIDATE_DOCUMENTS_KEY)
+            .unwrap()
+            .get("record")
+            .unwrap()
+            .as_object()
+            .unwrap();
+
+        // Language: ref is null, level is null
+        assert_eq!(cand_record.get("language").unwrap().as_str(), Some("lat"));
+        let lang_inh = cand_record
+            .get("language_inherited")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert!(lang_inh.get("ref").unwrap().is_null());
+        assert!(lang_inh.get("level").unwrap().is_null());
+        assert_eq!(lang_inh.get("direct").unwrap().as_bool(), Some(false));
+
+        // Edition: ref is integer 12345
+        assert_eq!(cand_record.get("edition").unwrap().as_str(), Some("1st ed"));
+        let ed_inh = cand_record
+            .get("edition_inherited")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(ed_inh.get("ref").unwrap().as_i64(), Some(12345));
+        assert_eq!(ed_inh.get("level").unwrap().as_str(), Some("item"));
+        assert_eq!(ed_inh.get("direct").unwrap().as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_record_inheritance_candidate_serde_exact_keys_and_types() {
+        // 1. Extra field in RecordInheritancePlan
+        let extra_plan_field = json!({
+            "record_type": "archival_object",
+            "rules": [],
+            "unknown_field": 123
+        });
+        assert!(serde_json::from_value::<RecordInheritancePlan>(extra_plan_field).is_err());
+
+        // 2. Extra field in RecordInheritanceRulePlan
+        let extra_rule_field = json!({
+            "record_type": "archival_object",
+            "rules": [
+                {
+                    "property": "notes",
+                    "inherit_directly": true,
+                    "ancestor_index": 0,
+                    "inherited_value": [],
+                    "inherited_props": {
+                        "ref": "/res/1",
+                        "level": "collection",
+                        "direct": true
+                    },
+                    "extra_key": "not_allowed"
+                }
+            ]
+        });
+        assert!(serde_json::from_value::<RecordInheritancePlan>(extra_rule_field).is_err());
+
+        // 3. Extra field in InheritanceProps
+        let extra_props_field = json!({
+            "record_type": "archival_object",
+            "rules": [
+                {
+                    "property": "notes",
+                    "inherit_directly": true,
+                    "ancestor_index": 0,
+                    "inherited_value": [],
+                    "inherited_props": {
+                        "ref": "/res/1",
+                        "level": "collection",
+                        "direct": true,
+                        "extra_props": true
+                    }
+                }
+            ]
+        });
+        assert!(serde_json::from_value::<RecordInheritancePlan>(extra_props_field).is_err());
+
+        // 4. Extra field in CompositeIdentifierPlan
+        let extra_composite_field = json!({
+            "record_type": "archival_object",
+            "rules": [],
+            "composite_identifiers": {
+                "pieces": ["a", "b"],
+                "delimiter": ".",
+                "extra": 999
+            }
+        });
+        assert!(serde_json::from_value::<RecordInheritancePlan>(extra_composite_field).is_err());
+
+        // 5. Missing required boolean field inherit_directly
+        let missing_inherit_directly = json!({
+            "record_type": "archival_object",
+            "rules": [
+                {
+                    "property": "notes",
+                    "ancestor_index": 0,
+                    "inherited_value": [],
+                    "inherited_props": {
+                        "ref": "/res/1",
+                        "level": "collection",
+                        "direct": true
+                    }
+                }
+            ]
+        });
+        assert!(serde_json::from_value::<RecordInheritancePlan>(missing_inherit_directly).is_err());
+
+        // 6. Missing required boolean field direct in inherited_props
+        let missing_direct = json!({
+            "record_type": "archival_object",
+            "rules": [
+                {
+                    "property": "notes",
+                    "inherit_directly": true,
+                    "ancestor_index": 0,
+                    "inherited_value": [],
+                    "inherited_props": {
+                        "ref": "/res/1",
+                        "level": "collection"
+                    }
+                }
+            ]
+        });
+        assert!(serde_json::from_value::<RecordInheritancePlan>(missing_direct).is_err());
+
+        // 7. Type mismatch: inherit_directly as string instead of bool
+        let type_mismatch_rule = json!({
+            "record_type": "archival_object",
+            "rules": [
+                {
+                    "property": "notes",
+                    "inherit_directly": "true",
+                    "ancestor_index": 0,
+                    "inherited_value": [],
+                    "inherited_props": {
+                        "ref": "/res/1",
+                        "level": "collection",
+                        "direct": true
+                    }
+                }
+            ]
+        });
+        assert!(serde_json::from_value::<RecordInheritancePlan>(type_mismatch_rule).is_err());
+
+        // 8. Type mismatch: pieces as string instead of array of strings
+        let type_mismatch_composite = json!({
+            "record_type": "archival_object",
+            "rules": [],
+            "composite_identifiers": {
+                "pieces": "not_an_array",
+                "delimiter": "."
+            }
+        });
+        assert!(serde_json::from_value::<RecordInheritancePlan>(type_mismatch_composite).is_err());
+
+        // 9. Missing required field ancestor_index in RecordInheritanceRulePlan
+        let missing_ancestor_index = json!({
+            "record_type": "archival_object",
+            "rules": [
+                {
+                    "property": "notes",
+                    "inherit_directly": true,
+                    "inherited_value": [],
+                    "inherited_props": {
+                        "ref": "/res/1",
+                        "level": "collection",
+                        "direct": true
+                    }
+                }
+            ]
+        });
+        assert!(serde_json::from_value::<RecordInheritancePlan>(missing_ancestor_index).is_err());
+    }
+
+    #[test]
+    fn test_record_inheritance_candidate_scalar_hash_values() {
+        // Scalar Hash property (not array) mutated in both destination and ancestor
+        let ao_record = json!({
+            "uri": "/repositories/2/archival_objects/301",
+            "jsonmodel_type": "archival_object",
+            "publish": true,
+            "ancestors": [
+                {
+                    "ref": "/repositories/2/resources/10",
+                    "level": "collection",
+                    "_resolved": {
+                        "custom_metadata": {
+                            "scope_summary": "High-level summary",
+                            "code": 42
+                        }
+                    }
+                }
+            ]
+        });
+
+        let plan = RecordInheritancePlan {
+            record_type: "archival_object".to_string(),
+            rules: vec![RecordInheritanceRulePlan {
+                property: "custom_metadata".to_string(),
+                inherit_directly: true,
+                ancestor_index: 0,
+                ancestor_element_indices: None,
+                inherited_value: json!({
+                    "scope_summary": "High-level summary",
+                    "code": 42
+                }),
+                inherited_props: InheritanceProps {
+                    ref_val: json!("/repositories/2/resources/10"),
+                    level: json!("collection"),
+                    direct: true,
+                },
+            }],
+            composite_identifiers: None,
+        };
+
+        let input = IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/301".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: ao_record,
+            prepare_pui_final: true,
+            record_inheritance_plan: Some(plan),
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input).unwrap();
+        let cand = doc
+            .get(PUI_CANDIDATE_DOCUMENTS_KEY)
+            .unwrap()
+            .get("record")
+            .unwrap()
+            .as_object()
+            .unwrap();
+
+        // Destination has custom_metadata with _inherited inside the Hash, and custom_metadata_inherited on root
+        let meta = cand.get("custom_metadata").unwrap().as_object().unwrap();
+        assert_eq!(meta.get("code").unwrap().as_i64(), Some(42));
+        let dest_inh = meta.get("_inherited").unwrap().as_object().unwrap();
+        assert_eq!(
+            dest_inh.get("ref").unwrap().as_str(),
+            Some("/repositories/2/resources/10")
+        );
+        assert_eq!(dest_inh.get("direct").unwrap().as_bool(), Some(true));
+
+        assert!(!cand.contains_key("custom_metadata_inherited"));
+
+        // Selected ancestor in cand also has _inherited inside its custom_metadata hash!
+        let anc0 = &cand.get("ancestors").unwrap().as_array().unwrap()[0];
+        let anc_meta = anc0
+            .get("_resolved")
+            .unwrap()
+            .get("custom_metadata")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        let anc_inh = anc_meta.get("_inherited").unwrap().as_object().unwrap();
+        assert_eq!(
+            anc_inh.get("ref").unwrap().as_str(),
+            Some("/repositories/2/resources/10")
+        );
+        assert_eq!(anc_inh.get("direct").unwrap().as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_record_inheritance_candidate_mixed_array_values() {
+        // Array property containing both Hash objects and scalar values
+        let ao_record = json!({
+            "uri": "/repositories/2/archival_objects/302",
+            "jsonmodel_type": "archival_object",
+            "publish": true,
+            "mixed_items": [],
+            "ancestors": [
+                {
+                    "ref": "/repositories/2/resources/11",
+                    "level": "collection",
+                    "_resolved": {
+                        "mixed_items": [
+                            {"type": "item_obj", "val": 100},
+                            "scalar_entry_string"
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let plan = RecordInheritancePlan {
+            record_type: "archival_object".to_string(),
+            rules: vec![RecordInheritanceRulePlan {
+                property: "mixed_items".to_string(),
+                inherit_directly: true,
+                ancestor_index: 0,
+                ancestor_element_indices: Some(vec![0, 1]),
+                inherited_value: json!([
+                    {"type": "item_obj", "val": 100},
+                    "scalar_entry_string"
+                ]),
+                inherited_props: InheritanceProps {
+                    ref_val: json!("/repositories/2/resources/11"),
+                    level: json!("collection"),
+                    direct: true,
+                },
+            }],
+            composite_identifiers: None,
+        };
+
+        let input = IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/302".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: ao_record,
+            prepare_pui_final: true,
+            record_inheritance_plan: Some(plan),
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input).unwrap();
+        let cand = doc
+            .get(PUI_CANDIDATE_DOCUMENTS_KEY)
+            .unwrap()
+            .get("record")
+            .unwrap()
+            .as_object()
+            .unwrap();
+
+        let items = cand.get("mixed_items").unwrap().as_array().unwrap();
+        assert_eq!(items.len(), 2);
+
+        // Object item has _inherited
+        let item0 = items[0].as_object().unwrap();
+        assert_eq!(item0.get("val").unwrap().as_i64(), Some(100));
+        assert!(item0.contains_key("_inherited"));
+
+        // Scalar item does not have _inherited, but presence of scalar triggers mixed_items_inherited on root
+        assert_eq!(items[1].as_str(), Some("scalar_entry_string"));
+        assert!(cand.contains_key("mixed_items_inherited"));
+
+        // Ancestor 0 object item also mutated in-place with _inherited
+        let anc0 = &cand.get("ancestors").unwrap().as_array().unwrap()[0];
+        let anc_items = anc0
+            .get("_resolved")
+            .unwrap()
+            .get("mixed_items")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(anc_items[0].as_object().unwrap().contains_key("_inherited"));
+        assert_eq!(anc_items[1].as_str(), Some("scalar_entry_string"));
+    }
+
+    #[test]
+    fn test_record_inheritance_candidate_repeated_rules_same_ancestor_and_property() {
+        // Two rules targeting the same ancestor index and same property
+        let ao_record = json!({
+            "uri": "/repositories/2/archival_objects/303",
+            "jsonmodel_type": "archival_object",
+            "publish": true,
+            "notes": [],
+            "ancestors": [
+                {
+                    "ref": "/repositories/2/resources/12",
+                    "level": "collection",
+                    "_resolved": {
+                        "notes": [
+                            {"type": "rule1_note", "content": ["Content 1"]},
+                            {"type": "rule2_note", "content": ["Content 2"]}
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let plan = RecordInheritancePlan {
+            record_type: "archival_object".to_string(),
+            rules: vec![
+                RecordInheritanceRulePlan {
+                    property: "notes".to_string(),
+                    inherit_directly: true,
+                    ancestor_index: 0,
+                    ancestor_element_indices: Some(vec![0]),
+                    inherited_value: json!([
+                        {"type": "rule1_note", "content": ["Content 1"]}
+                    ]),
+                    inherited_props: InheritanceProps {
+                        ref_val: json!("/repositories/2/resources/12"),
+                        level: json!("collection"),
+                        direct: true,
+                    },
+                },
+                RecordInheritanceRulePlan {
+                    property: "notes".to_string(),
+                    inherit_directly: false,
+                    ancestor_index: 0,
+                    ancestor_element_indices: Some(vec![1]),
+                    inherited_value: json!([
+                        {"type": "rule2_note", "content": ["Content 2"]}
+                    ]),
+                    inherited_props: InheritanceProps {
+                        ref_val: json!("/repositories/2/resources/12"),
+                        level: json!("collection"),
+                        direct: false,
+                    },
+                },
+            ],
+            composite_identifiers: None,
+        };
+
+        let input = IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/303".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: ao_record,
+            prepare_pui_final: true,
+            record_inheritance_plan: Some(plan),
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input).unwrap();
+        let cand = doc
+            .get(PUI_CANDIDATE_DOCUMENTS_KEY)
+            .unwrap()
+            .get("record")
+            .unwrap()
+            .as_object()
+            .unwrap();
+
+        let notes = cand.get("notes").unwrap().as_array().unwrap();
+        assert_eq!(notes.len(), 2);
+        assert_eq!(
+            notes[0]
+                .get("_inherited")
+                .unwrap()
+                .get("direct")
+                .unwrap()
+                .as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            notes[1]
+                .get("_inherited")
+                .unwrap()
+                .get("direct")
+                .unwrap()
+                .as_bool(),
+            Some(false)
+        );
+
+        let anc0 = &cand.get("ancestors").unwrap().as_array().unwrap()[0];
+        let anc_notes = anc0
+            .get("_resolved")
+            .unwrap()
+            .get("notes")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            anc_notes[0]
+                .get("_inherited")
+                .unwrap()
+                .get("direct")
+                .unwrap()
+                .as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            anc_notes[1]
+                .get("_inherited")
+                .unwrap()
+                .get("direct")
+                .unwrap()
+                .as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_record_inheritance_candidate_progressive_rules_see_prior_inherited_metadata() {
+        // First rule inherits linked_agents and mutates ancestor 0.
+        // Second rule inherits notes from ancestor 0. Ancestor 0 retains linked_agents mutation.
+        let ao_record = json!({
+            "uri": "/repositories/2/archival_objects/304",
+            "jsonmodel_type": "archival_object",
+            "publish": true,
+            "linked_agents": [],
+            "notes": [],
+            "ancestors": [
+                {
+                    "ref": "/repositories/2/resources/13",
+                    "level": "collection",
+                    "_resolved": {
+                        "linked_agents": [
+                            {"ref": "/agents/people/1", "role": "creator"}
+                        ],
+                        "notes": [
+                            {"type": "abstract", "content": ["Abstract text"]}
+                        ]
+                    }
+                }
+            ]
+        });
+
+        let plan = RecordInheritancePlan {
+            record_type: "archival_object".to_string(),
+            rules: vec![
+                RecordInheritanceRulePlan {
+                    property: "linked_agents".to_string(),
+                    inherit_directly: true,
+                    ancestor_index: 0,
+                    ancestor_element_indices: Some(vec![0]),
+                    inherited_value: json!([
+                        {"ref": "/agents/people/1", "role": "creator"}
+                    ]),
+                    inherited_props: InheritanceProps {
+                        ref_val: json!("/repositories/2/resources/13"),
+                        level: json!("collection"),
+                        direct: true,
+                    },
+                },
+                RecordInheritanceRulePlan {
+                    property: "notes".to_string(),
+                    inherit_directly: true,
+                    ancestor_index: 0,
+                    ancestor_element_indices: Some(vec![0]),
+                    inherited_value: json!([
+                        {"type": "abstract", "content": ["Abstract text"]}
+                    ]),
+                    inherited_props: InheritanceProps {
+                        ref_val: json!("/repositories/2/resources/13"),
+                        level: json!("collection"),
+                        direct: true,
+                    },
+                },
+            ],
+            composite_identifiers: None,
+        };
+
+        let input = IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/304".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: ao_record,
+            prepare_pui_final: true,
+            record_inheritance_plan: Some(plan),
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input).unwrap();
+        let cand = doc
+            .get(PUI_CANDIDATE_DOCUMENTS_KEY)
+            .unwrap()
+            .get("record")
+            .unwrap()
+            .as_object()
+            .unwrap();
+
+        // Both properties inherited in cand
+        assert_eq!(
+            cand.get("linked_agents").unwrap().as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(cand.get("notes").unwrap().as_array().unwrap().len(), 1);
+
+        // Ancestor has both properties mutated with _inherited
+        let anc0 = &cand.get("ancestors").unwrap().as_array().unwrap()[0];
+        let anc_res = anc0.get("_resolved").unwrap().as_object().unwrap();
+        let anc_agents = anc_res.get("linked_agents").unwrap().as_array().unwrap();
+        let anc_notes = anc_res.get("notes").unwrap().as_array().unwrap();
+        assert!(anc_agents[0]
+            .as_object()
+            .unwrap()
+            .contains_key("_inherited"));
+        assert!(anc_notes[0].as_object().unwrap().contains_key("_inherited"));
+    }
+
+    #[test]
+    fn test_record_inheritance_candidate_custom_inherit_if_deep_copied_hashes() {
+        let ao_record = json!({
+            "uri": "/repositories/2/archival_objects/999",
+            "jsonmodel_type": "archival_object",
+            "publish": true,
+            "notes": [],
+            "ancestors": [
+                {
+                    "ref": "/repositories/2/resources/55",
+                    "level": "collection",
+                    "_resolved": {
+                        "notes": [
+                            {
+                                "jsonmodel_type": "note_singlepart",
+                                "type": "scopecontent",
+                                "publish": true,
+                                "content": ["Scope content from ancestor"]
+                            }
+                        ]
+                    }
+                }
+            ]
+        });
+
+        // Exact plan shape from custom inherit_if returning deep-copied equal Hashes:
+        // ancestor_element_indices is Some(vec![]) because identity matching did not find the same object references
+        let plan = RecordInheritancePlan {
+            record_type: "archival_object".to_string(),
+            rules: vec![RecordInheritanceRulePlan {
+                property: "notes".to_string(),
+                inherit_directly: true,
+                ancestor_index: 0,
+                ancestor_element_indices: Some(vec![]),
+                inherited_value: json!([
+                    {
+                        "jsonmodel_type": "note_singlepart",
+                        "type": "scopecontent",
+                        "publish": true,
+                        "content": ["Scope content from ancestor"]
+                    }
+                ]),
+                inherited_props: InheritanceProps {
+                    ref_val: json!("/repositories/2/resources/55"),
+                    level: json!("collection_translated_1"),
+                    direct: true,
+                },
+            }],
+            composite_identifiers: None,
+        };
+
+        let input = IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/999".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: ao_record,
+            prepare_pui_final: true,
+            record_inheritance_plan: Some(plan),
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input).unwrap();
+        let cand = doc
+            .get(PUI_CANDIDATE_DOCUMENTS_KEY)
+            .unwrap()
+            .get("record")
+            .unwrap()
+            .as_object()
+            .unwrap();
+
+        // Destination copies MUST have _inherited with exact translated level and ref
+        let notes = cand.get("notes").unwrap().as_array().unwrap();
+        assert_eq!(notes.len(), 1);
+        let dest_note = notes[0].as_object().unwrap();
+        assert!(dest_note.contains_key("_inherited"));
+        let dest_inherited = dest_note.get("_inherited").unwrap().as_object().unwrap();
+        assert_eq!(
+            dest_inherited.get("ref").unwrap(),
+            "/repositories/2/resources/55"
+        );
+        assert_eq!(
+            dest_inherited.get("level").unwrap(),
+            "collection_translated_1"
+        );
+        assert_eq!(
+            dest_inherited.get("direct").unwrap(),
+            &serde_json::Value::Bool(true)
+        );
+
+        // Ancestor _resolved MUST NOT have _inherited!
+        let anc0 = &cand.get("ancestors").unwrap().as_array().unwrap()[0];
+        let anc_res = anc0.get("_resolved").unwrap().as_object().unwrap();
+        let anc_notes = anc_res.get("notes").unwrap().as_array().unwrap();
+        assert_eq!(anc_notes.len(), 1);
+        let raw_note = anc_notes[0].as_object().unwrap();
+        assert!(!raw_note.contains_key("_inherited"));
     }
 }

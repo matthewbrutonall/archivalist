@@ -617,6 +617,47 @@ class TestPuiParityComparator(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(any("publish: type mismatch" in r for r in reasons))
 
+    def test_pui_record_inheritance_candidate_marker_leak_fails(self) -> None:
+        """Leaked _archivalist_pui_candidate handoff metadata in candidate fails parity immediately."""
+        doc = {
+            "id": "/repositories/2/archival_objects/50",
+            "uri": "/repositories/2/archival_objects/50",
+            "publish": True,
+            "primary_type": "archival_object",
+            "types": ["archival_object", "pui"],
+            "json": json.dumps({"title": "Item 50"}),
+            "fullrecord_published": ["Item 50"],
+        }
+        cand_leaked = dict(
+            doc,
+            _archivalist_pui_candidate={
+                "marker": "pui_record_inheritance_candidate_metadata",
+                "record": {"title": "Item 50"},
+            },
+        )
+        ok, reasons = comparator.compare_pui_document(doc, cand_leaked, comparator.DEFAULT_IGNORED_FIELDS)
+        self.assertFalse(ok)
+        self.assertTrue(any("candidate privacy leak" in r or "private handoff field" in r for r in reasons))
+
+    def test_pui_record_inheritance_candidate_rust_fields_marker_leak_fails(self) -> None:
+        """Leaked pui_record_inheritance_candidate_metadata marker in _archivalist_rust_fields fails parity."""
+        doc = {
+            "id": "/repositories/2/archival_objects/50",
+            "uri": "/repositories/2/archival_objects/50",
+            "publish": True,
+            "primary_type": "archival_object",
+            "types": ["archival_object", "pui"],
+            "json": json.dumps({"title": "Item 50"}),
+            "fullrecord_published": ["Item 50"],
+        }
+        cand_leaked = dict(
+            doc,
+            _archivalist_rust_fields=["pui_record_inheritance_candidate_metadata"],
+        )
+        ok, reasons = comparator.compare_pui_document(doc, cand_leaked, comparator.DEFAULT_IGNORED_FIELDS)
+        self.assertFalse(ok)
+        self.assertTrue(any("candidate privacy leak" in r or "private handoff field" in r for r in reasons))
+
 
 if __name__ == "__main__":
     unittest.main()

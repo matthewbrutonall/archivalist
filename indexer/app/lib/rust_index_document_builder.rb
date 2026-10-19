@@ -45,6 +45,37 @@ class RustIndexDocumentBuilder
     'notes_published',
   ].freeze
 
+  PUI_CANDIDATE_FIELDS = [
+    'marker',
+    'record',
+  ].freeze
+
+  RECORD_INHERITANCE_PLAN_FIELDS = [
+    'composite_identifiers',
+    'record_type',
+    'rules',
+  ].freeze
+
+  RECORD_INHERITANCE_RULE_FIELDS = [
+    'ancestor_element_indices',
+    'ancestor_index',
+    'inherit_directly',
+    'inherited_props',
+    'inherited_value',
+    'property',
+  ].freeze
+
+  RECORD_INHERITANCE_PROPS_FIELDS = [
+    'direct',
+    'level',
+    'ref',
+  ].freeze
+
+  RECORD_INHERITANCE_COMPOSITE_FIELDS = [
+    'delimiter',
+    'pieces',
+  ].freeze
+
   PUI_AVAILABILITY_FIELDS = [
     'marker',
     'uri',
@@ -252,6 +283,29 @@ class RustIndexDocumentBuilder
         raise "cannot combine prepare_pui_final and prepare_pui_availability in same input for #{uri}"
       end
 
+      if input['prepare_pui_final']
+        unless record.is_a?(Hash)
+          raise "record must be a Hash for #{uri}"
+        end
+        unless record.has_key?('uri') && record['uri'].is_a?(String) && !record['uri'].strip.empty?
+          raise "record.uri must be a non-empty string for #{uri}"
+        end
+        unless record['uri'] == uri
+          raise "record uri mismatch for #{uri}"
+        end
+        unless record.has_key?('jsonmodel_type') && record['jsonmodel_type'].is_a?(String) && !record['jsonmodel_type'].strip.empty?
+          raise "record.jsonmodel_type must be a non-empty string for #{uri}"
+        end
+        unless record['jsonmodel_type'] == record_type
+          raise "record jsonmodel_type mismatch for #{uri}"
+        end
+        if input.has_key?('record_inheritance_plan')
+          validate_record_inheritance_plan!(input['record_inheritance_plan'], record_type, uri)
+        elsif !input.has_key?('pui_candidate_record')
+          raise "either record_inheritance_plan or pui_candidate_record is required when prepare_pui_final is true for #{uri}"
+        end
+      end
+
       if input['prepare_pui_availability']
         unless record.is_a?(Hash)
           raise "record must be a Hash for #{uri}"
@@ -297,6 +351,28 @@ class RustIndexDocumentBuilder
       record = input['record']
       if input['prepare_pui_final'] && input['prepare_pui_availability']
         raise "cannot combine prepare_pui_final and prepare_pui_availability in same input for #{uri}"
+      end
+      if input['prepare_pui_final']
+        unless record.is_a?(Hash)
+          raise "record must be a Hash for #{uri}"
+        end
+        unless record.has_key?('uri') && record['uri'].is_a?(String) && !record['uri'].strip.empty?
+          raise "record.uri must be a non-empty string for #{uri}"
+        end
+        unless record['uri'] == uri
+          raise "record uri mismatch for #{uri}"
+        end
+        unless record.has_key?('jsonmodel_type') && record['jsonmodel_type'].is_a?(String) && !record['jsonmodel_type'].strip.empty?
+          raise "record.jsonmodel_type must be a non-empty string for #{uri}"
+        end
+        unless record['jsonmodel_type'] == record_type
+          raise "record jsonmodel_type mismatch for #{uri}"
+        end
+        if input.has_key?('record_inheritance_plan')
+          validate_record_inheritance_plan!(input['record_inheritance_plan'], record_type, uri)
+        elsif !input.has_key?('pui_candidate_record')
+          raise "either record_inheritance_plan or pui_candidate_record is required when prepare_pui_final is true for #{uri}"
+        end
       end
       if input['prepare_pui_availability']
         unless record.is_a?(Hash)
@@ -641,7 +717,8 @@ class RustIndexDocumentBuilder
 
       if !input['prepare_pui_final'] && (document.has_key?('_archivalist_pui_final') ||
                                          document.has_key?('_archivalist_pui_routing') ||
-                                         document.has_key?('_archivalist_pui_notes'))
+                                         document.has_key?('_archivalist_pui_notes') ||
+                                         document.has_key?('_archivalist_pui_candidate'))
         raise "unexpected response pui projection marker for #{uri}"
       end
 
@@ -771,7 +848,7 @@ class RustIndexDocumentBuilder
     end
   end
 
-  def validate_json_equal!(expected, actual, path = 'child json')
+  def self.validate_json_equal!(expected, actual, path = 'child json')
     if expected.is_a?(TrueClass) || expected.is_a?(FalseClass)
       unless actual.is_a?(TrueClass) || actual.is_a?(FalseClass)
         raise "#{path} type mismatch: expected Boolean, got #{actual.class}"
@@ -808,6 +885,10 @@ class RustIndexDocumentBuilder
         raise "#{path} value mismatch: expected #{expected.inspect}, got #{actual.inspect}"
       end
     end
+  end
+
+  def validate_json_equal!(expected, actual, path = 'child json')
+    self.class.validate_json_equal!(expected, actual, path)
   end
 
   def clean_for_sort(value)
@@ -993,7 +1074,13 @@ class RustIndexDocumentBuilder
 
   def validate_pui_final_projection!(document, input)
     uri = input['uri']
-    unless document['_archivalist_rust_fields'] == ['pui_final_document_metadata', 'pui_routing_metadata', 'pui_notes_metadata']
+    has_plan = input.has_key?('record_inheritance_plan')
+    expected_markers = if has_plan
+                         ['pui_final_document_metadata', 'pui_routing_metadata', 'pui_notes_metadata', 'pui_record_inheritance_candidate_metadata']
+                       else
+                         ['pui_final_document_metadata', 'pui_routing_metadata', 'pui_notes_metadata']
+                       end
+    unless document['_archivalist_rust_fields'] == expected_markers
       raise "response pui final marker mismatch for #{uri}"
     end
     unless document.has_key?('_archivalist_pui_final') && document['_archivalist_pui_final'].is_a?(Hash)
@@ -1030,22 +1117,61 @@ class RustIndexDocumentBuilder
       raise "record jsonmodel_type mismatch for #{uri}: expected #{input['record_type']}, got #{rec_type}"
     end
 
-    candidate = input['pui_candidate_record']
-    raise "missing pui_candidate_record for #{uri}" unless candidate.is_a?(Hash)
-    cand_uri = candidate['uri']
-    unless cand_uri.is_a?(String) && !cand_uri.empty?
-      raise "pui_candidate_record.uri must be a non-empty string for #{uri}"
-    end
-    unless cand_uri == input['uri']
-      raise "pui_candidate_record uri mismatch for #{uri}: expected #{input['uri']}, got #{cand_uri}"
-    end
-    cand_type = candidate['jsonmodel_type']
-    unless cand_type.is_a?(String) && !cand_type.empty?
-      raise "pui_candidate_record.jsonmodel_type must be a non-empty string for #{uri}"
-    end
-    unless cand_type == input['record_type']
-      raise "pui_candidate_record jsonmodel_type mismatch for #{uri}: expected #{input['record_type']}, got #{cand_type}"
-    end
+    candidate = if has_plan
+                  unless document.has_key?('_archivalist_pui_candidate') && document['_archivalist_pui_candidate'].is_a?(Hash)
+                    raise "missing _archivalist_pui_candidate for #{uri}"
+                  end
+                  pui_cand = document['_archivalist_pui_candidate']
+                  if pui_cand.keys.any? { |k| !k.is_a?(String) }
+                    raise "pui candidate contains non-string keys for #{uri}: #{pui_cand.keys.inspect}"
+                  end
+                  missing_cand_keys = PUI_CANDIDATE_FIELDS - pui_cand.keys
+                  unless missing_cand_keys.empty?
+                    raise "pui candidate missing required fields for #{uri}: #{missing_cand_keys.sort.join(', ')}"
+                  end
+                  extra_cand_keys = pui_cand.keys - PUI_CANDIDATE_FIELDS
+                  unless extra_cand_keys.empty?
+                    raise "pui candidate contains unexpected fields for #{uri}: #{extra_cand_keys.sort.join(', ')}"
+                  end
+                  unless pui_cand['marker'] == 'pui_record_inheritance_candidate_metadata'
+                    raise "pui candidate payload marker mismatch for #{uri}"
+                  end
+                  cand_rec = pui_cand['record']
+                  unless cand_rec.is_a?(Hash)
+                    raise "pui candidate record must be a Hash for #{uri}"
+                  end
+                  unless cand_rec['uri'] == uri
+                    raise "pui candidate record uri mismatch for #{uri}: expected #{uri}, got #{cand_rec['uri']}"
+                  end
+                  unless cand_rec['jsonmodel_type'] == input['record_type']
+                    raise "pui candidate record jsonmodel_type mismatch for #{uri}: expected #{input['record_type']}, got #{cand_rec['jsonmodel_type']}"
+                  end
+
+                  expected_merged = RecordInheritance.merge(deep_copy_json_value(record))
+                  validate_json_equal!(expected_merged, cand_rec, "pui candidate record for #{uri}")
+                  cand_rec
+                else
+                  if document.has_key?('_archivalist_pui_candidate')
+                    raise "unexpected _archivalist_pui_candidate when record_inheritance_plan is absent for #{uri}"
+                  end
+                  cand = input['pui_candidate_record']
+                  raise "missing pui_candidate_record for #{uri}" unless cand.is_a?(Hash)
+                  cand_uri = cand['uri']
+                  unless cand_uri.is_a?(String) && !cand_uri.empty?
+                    raise "pui_candidate_record.uri must be a non-empty string for #{uri}"
+                  end
+                  unless cand_uri == input['uri']
+                    raise "pui_candidate_record uri mismatch for #{uri}: expected #{input['uri']}, got #{cand_uri}"
+                  end
+                  cand_type = cand['jsonmodel_type']
+                  unless cand_type.is_a?(String) && !cand_type.empty?
+                    raise "pui_candidate_record.jsonmodel_type must be a non-empty string for #{uri}"
+                  end
+                  unless cand_type == input['record_type']
+                    raise "pui_candidate_record jsonmodel_type mismatch for #{uri}: expected #{input['record_type']}, got #{cand_type}"
+                  end
+                  cand
+                end
 
     parsed_json = ASUtils.json_parse(pui_final['json'])
     raise "pui final json must parse to a Hash for #{uri}" unless parsed_json.is_a?(Hash)
@@ -1240,6 +1366,115 @@ class RustIndexDocumentBuilder
     else
       unless proj['top_container_override'].nil?
         raise "pui availability top_container_override must be nil for non-top_container #{uri}"
+      end
+    end
+  end
+
+  def validate_record_inheritance_plan!(plan, record_type, uri)
+    unless plan.is_a?(Hash)
+      raise "record_inheritance_plan must be a Hash for #{uri}"
+    end
+    if plan.keys.any? { |k| !k.is_a?(String) }
+      raise "record_inheritance_plan contains non-string keys for #{uri}: #{plan.keys.inspect}"
+    end
+    missing_plan_keys = RECORD_INHERITANCE_PLAN_FIELDS - plan.keys
+    unless missing_plan_keys.empty?
+      raise "record_inheritance_plan missing required fields for #{uri}: #{missing_plan_keys.sort.join(', ')}"
+    end
+    extra_plan_keys = plan.keys - RECORD_INHERITANCE_PLAN_FIELDS
+    unless extra_plan_keys.empty?
+      raise "record_inheritance_plan contains unexpected fields for #{uri}: #{extra_plan_keys.sort.join(', ')}"
+    end
+
+    unless plan['record_type'].is_a?(String) && !plan['record_type'].strip.empty?
+      raise "record_inheritance_plan.record_type must be a non-empty string for #{uri}"
+    end
+    unless plan['record_type'] == record_type
+      raise "record_inheritance_plan.record_type '#{plan['record_type']}' does not match input.record_type '#{record_type}' for #{uri}"
+    end
+
+    unless plan['rules'].is_a?(Array)
+      raise "record_inheritance_plan.rules must be an Array for #{uri}"
+    end
+
+    plan['rules'].each do |rule|
+      unless rule.is_a?(Hash)
+        raise "rule in record_inheritance_plan.rules must be a Hash for #{uri}"
+      end
+      if rule.keys.any? { |k| !k.is_a?(String) }
+        raise "rule in record_inheritance_plan.rules contains non-string keys for #{uri}: #{rule.keys.inspect}"
+      end
+      missing_rule_keys = RECORD_INHERITANCE_RULE_FIELDS - rule.keys
+      unless missing_rule_keys.empty?
+        raise "rule in record_inheritance_plan.rules missing required fields for #{uri}: #{missing_rule_keys.sort.join(', ')}"
+      end
+      extra_rule_keys = rule.keys - RECORD_INHERITANCE_RULE_FIELDS
+      unless extra_rule_keys.empty?
+        raise "rule in record_inheritance_plan.rules contains unexpected fields for #{uri}: #{extra_rule_keys.sort.join(', ')}"
+      end
+
+      unless rule['property'].is_a?(String) && !rule['property'].strip.empty?
+        raise "rule.property must be a non-empty string for #{uri}"
+      end
+      unless rule['inherit_directly'] == true || rule['inherit_directly'] == false
+        raise "rule.inherit_directly must be a Boolean for #{uri}"
+      end
+      unless rule['ancestor_index'].is_a?(Integer) && rule['ancestor_index'] >= 0
+        raise "rule.ancestor_index must be a non-negative Integer for #{uri}"
+      end
+      unless rule['ancestor_element_indices'].nil? || (rule['ancestor_element_indices'].is_a?(Array) && rule['ancestor_element_indices'].all? { |i| i.is_a?(Integer) && i >= 0 })
+        raise "rule.ancestor_element_indices must be nil or an Array of non-negative Integers for #{uri}"
+      end
+      if rule['inherited_value'].nil?
+        raise "rule.inherited_value must not be nil for #{uri}"
+      end
+
+      props = rule['inherited_props']
+      unless props.is_a?(Hash)
+        raise "rule.inherited_props must be a Hash for #{uri}"
+      end
+      if props.keys.any? { |k| !k.is_a?(String) }
+        raise "rule.inherited_props contains non-string keys for #{uri}: #{props.keys.inspect}"
+      end
+      missing_props_keys = RECORD_INHERITANCE_PROPS_FIELDS - props.keys
+      unless missing_props_keys.empty?
+        raise "rule.inherited_props missing required fields for #{uri}: #{missing_props_keys.sort.join(', ')}"
+      end
+      extra_props_keys = props.keys - RECORD_INHERITANCE_PROPS_FIELDS
+      unless extra_props_keys.empty?
+        raise "rule.inherited_props contains unexpected fields for #{uri}: #{extra_props_keys.sort.join(', ')}"
+      end
+
+      unless props['direct'] == true || props['direct'] == false
+        raise "rule.inherited_props.direct must be a Boolean for #{uri}"
+      end
+    end
+
+    if plan['composite_identifiers']
+      comp = plan['composite_identifiers']
+      unless comp.is_a?(Hash)
+        raise "composite_identifiers must be a Hash for #{uri}"
+      end
+      if comp.keys.any? { |k| !k.is_a?(String) }
+        raise "composite_identifiers contains non-string keys for #{uri}: #{comp.keys.inspect}"
+      end
+      missing_comp_keys = RECORD_INHERITANCE_COMPOSITE_FIELDS - comp.keys
+      unless missing_comp_keys.empty?
+        raise "composite_identifiers missing required fields for #{uri}: #{missing_comp_keys.sort.join(', ')}"
+      end
+      extra_comp_keys = comp.keys - RECORD_INHERITANCE_COMPOSITE_FIELDS
+      unless extra_comp_keys.empty?
+        raise "composite_identifiers contains unexpected fields for #{uri}: #{extra_comp_keys.sort.join(', ')}"
+      end
+
+      unless comp['delimiter'].is_a?(String)
+        raise "composite_identifiers.delimiter must be a string for #{uri}"
+      end
+      unless comp['pieces'].is_a?(Array)
+        raise "composite_identifiers.pieces must be an Array for #{uri}"
+      end
+      unless comp['pieces'].all? { |p| p.is_a?(String) }
+        raise "composite_identifiers.pieces must contain only strings for #{uri}"
       end
     end
   end

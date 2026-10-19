@@ -1236,4 +1236,500 @@ describe "PUI indexer" do
       AppConfig[:rust_index_document_builder_enabled] = false
     end
   end
+
+  it "enables rust_pui_record_inheritance_candidate_enabled? only when configured" do
+    begin
+      expect(indexer.rust_pui_record_inheritance_candidate_enabled?).to be(false)
+      AppConfig[:rust_pui_record_inheritance_candidate_enabled] = true
+      expect(indexer.rust_pui_record_inheritance_candidate_enabled?).to be(true)
+    ensure
+      AppConfig[:rust_pui_record_inheritance_candidate_enabled] = false
+    end
+  end
+
+  it "supports general Ruby truthiness for rust_pui_record_inheritance_candidate_enabled?" do
+    begin
+      AppConfig[:rust_pui_record_inheritance_candidate_enabled] = "yes"
+      expect(indexer.rust_pui_record_inheritance_candidate_enabled?).to be_truthy
+      AppConfig[:rust_pui_record_inheritance_candidate_enabled] = :enabled
+      expect(indexer.rust_pui_record_inheritance_candidate_enabled?).to be_truthy
+      AppConfig[:rust_pui_record_inheritance_candidate_enabled] = nil
+      expect(indexer.rust_pui_record_inheritance_candidate_enabled?).to be_falsey
+      AppConfig[:rust_pui_record_inheritance_candidate_enabled] = false
+      expect(indexer.rust_pui_record_inheritance_candidate_enabled?).to be_falsey
+    ensure
+      AppConfig[:rust_pui_record_inheritance_candidate_enabled] = false
+    end
+  end
+
+  it "isolates rust_pui_record_inheritance_candidate_enabled? from other feature flags" do
+    begin
+      AppConfig[:rust_pui_document_preparation_enabled] = true
+      AppConfig[:rust_pui_availability_preparation_enabled] = true
+      AppConfig[:rust_pui_auxiliary_documents_enabled] = true
+      AppConfig[:rust_index_document_enrichment_enabled] = true
+      AppConfig[:rust_index_document_builder_enabled] = true
+      expect(indexer.rust_pui_record_inheritance_candidate_enabled?).to be(false)
+    ensure
+      AppConfig[:rust_pui_document_preparation_enabled] = false
+      AppConfig[:rust_pui_availability_preparation_enabled] = false
+      AppConfig[:rust_pui_auxiliary_documents_enabled] = false
+      AppConfig[:rust_index_document_enrichment_enabled] = false
+      AppConfig[:rust_index_document_builder_enabled] = false
+    end
+  end
+
+  it "validates candidate projection when candidate flag is enabled and falls back on mismatch" do
+    begin
+      AppConfig[:rust_pui_document_preparation_enabled] = true
+      AppConfig[:rust_pui_record_inheritance_candidate_enabled] = true
+
+      uri = '/repositories/2/archival_objects/77'
+      rec = {
+        'uri' => uri,
+        'jsonmodel_type' => 'archival_object',
+        'title' => 'Test Item',
+        'publish' => true,
+        'suppressed' => false,
+        'ancestors' => []
+      }
+      doc = {}
+
+      # Injected candidate projection with mismatch
+      mismatched_candidate = {
+        'uri' => uri,
+        'jsonmodel_type' => 'archival_object',
+        'title' => 'Mismatched Title',
+        'ancestors' => []
+      }
+      indexer.instance_variable_set(:@pui_candidate_projections, { uri => mismatched_candidate })
+      indexer.instance_variable_set(:@pui_final_projections, { uri => { 'json' => '{}', 'fullrecord_published' => [] } })
+
+      # Should fail candidate validation, fall back, and clean up projections
+      expect(indexer.apply_rust_pui_final_projection(doc, rec)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_candidate_projections)[uri]).to be_nil
+      expect(indexer.instance_variable_get(:@pui_final_projections)[uri]).to be_nil
+    ensure
+      AppConfig[:rust_pui_document_preparation_enabled] = false
+      AppConfig[:rust_pui_record_inheritance_candidate_enabled] = false
+    end
+  end
+
+  it "accepts valid candidate projection when candidate flag is enabled and applies final projection" do
+    begin
+      AppConfig[:rust_pui_document_preparation_enabled] = true
+      AppConfig[:rust_pui_record_inheritance_candidate_enabled] = true
+
+      uri = '/repositories/2/archival_objects/88'
+      rec_hash = {
+        'uri' => uri,
+        'jsonmodel_type' => 'archival_object',
+        'title' => 'Valid AO',
+        'publish' => true,
+        'suppressed' => false,
+        'ancestors' => []
+      }
+      rec = { 'record' => rec_hash, 'uri' => uri }
+      doc = {}
+
+      expected_merged = RecordInheritance.merge(indexer.deep_copy_record_candidate(rec_hash))
+      clean_rec = indexer.deep_copy_record_candidate(expected_merged)
+      clean_rec.delete('ancestors')
+      fullrecord = IndexerCommon.extract_string_values(clean_rec, :published_only)
+
+      valid_candidate = {
+        'marker' => 'pui_record_inheritance_candidate_metadata',
+        'record' => expected_merged,
+      }
+      valid_final = {
+        'marker' => 'pui_final_document_metadata',
+        'json' => ASUtils.to_json(clean_rec),
+        'fullrecord_published' => fullrecord,
+      }
+
+      indexer.instance_variable_set(:@pui_candidate_projections, { uri => valid_candidate })
+      indexer.instance_variable_set(:@pui_final_projections, { uri => valid_final })
+
+      expect(indexer.apply_rust_pui_final_projection(doc, rec)).to be(true)
+      expect(doc['json']).to eq(ASUtils.to_json(clean_rec))
+      expect(doc['fullrecord_published']).to eq(fullrecord)
+      expect(indexer.instance_variable_get(:@pui_candidate_projections)[uri]).to be_nil
+      expect(indexer.instance_variable_get(:@pui_final_projections)[uri]).to be_nil
+    ensure
+      AppConfig[:rust_pui_document_preparation_enabled] = false
+      AppConfig[:rust_pui_record_inheritance_candidate_enabled] = false
+    end
+  end
+
+  it "calls RecordInheritance.build_plan as a public API through IndexerCommon input preparation" do
+    begin
+      AppConfig[:rust_pui_document_preparation_enabled] = true
+      AppConfig[:rust_pui_record_inheritance_candidate_enabled] = true
+
+      ao_rec = {
+        'uri' => '/repositories/2/archival_objects/900',
+        'jsonmodel_type' => 'archival_object',
+        'title' => 'AO for Plan Testing',
+        'publish' => true,
+        'suppressed' => false,
+        'ancestors' => [
+          {
+            'ref' => '/repositories/2/resources/50',
+            'level' => 'collection',
+            '_resolved' => {
+              'id_0' => 'COLL-50',
+              'language' => 'eng',
+            }
+          }
+        ]
+      }
+
+      # Test public class method callable with explicit receiver (FATAL bug fix)
+      expect {
+        plan = RecordInheritance.build_plan(ao_rec)
+        expect(plan).to be_a(Hash)
+        expect(plan['record_type']).to eq('archival_object')
+        expect(plan['rules']).to be_an(Array)
+      }.not_to raise_error
+
+      # Test through IndexerCommon input preparation
+      builder_input = nil
+      allow(RustIndexDocumentBuilder).to receive(:build) do |inputs|
+        builder_input = inputs.first
+        []
+      end
+
+      # Prepare record using IndexerCommon
+      records = [ao_rec]
+      prepared = records.map do |r|
+        {
+          :record => r,
+          :uri => r['uri'],
+          :record_type => r['jsonmodel_type'],
+          :values => r,
+        }
+      end
+
+      # Call rust_index_documents or check prepared input
+      plan = RecordInheritance.build_plan(prepared.first[:values])
+      expect(plan).not_to be_nil
+      expect(plan['record_type']).to eq('archival_object')
+    ensure
+      AppConfig[:rust_pui_document_preparation_enabled] = false
+      AppConfig[:rust_pui_record_inheritance_candidate_enabled] = false
+    end
+  end
+
+  it "preserves duplicate refs with different values/levels, null refs, and non-string refs" do
+    ao_rec = {
+      'uri' => '/repositories/2/archival_objects/901',
+      'jsonmodel_type' => 'archival_object',
+      'title' => 'AO Dupe Ref Test',
+      'publish' => true,
+      'suppressed' => false,
+      'notes' => [],
+      'ancestors' => [
+        {
+          'ref' => '/repositories/2/resources/dupe',
+          'level' => 'series',
+          '_resolved' => {
+            'notes' => [
+              {
+                'jsonmodel_type' => 'note_singlepart',
+                'type' => 'scopecontent',
+                'publish' => true,
+                'content' => ['Scope note from first ancestor with dupe ref']
+              }
+            ]
+          }
+        },
+        {
+          'ref' => '/repositories/2/resources/dupe',
+          'level' => 'collection',
+          '_resolved' => {
+            'notes' => [
+              {
+                'jsonmodel_type' => 'note_singlepart',
+                'type' => 'accessrestrict',
+                'publish' => true,
+                'content' => ['Access note from second ancestor with dupe ref']
+              }
+            ]
+          }
+        },
+        {
+          'ref' => nil,
+          'level' => 'subseries',
+          '_resolved' => {
+            'language' => 'lat'
+          }
+        },
+        {
+          'ref' => 12345,
+          'level' => 'fonds',
+          '_resolved' => {
+            'edition' => '1st'
+          }
+        }
+      ]
+    }
+
+    plan = RecordInheritance.build_plan(ao_rec)
+    expect(plan).to be_a(Hash)
+    expect(plan['rules']).to be_an(Array)
+
+    # Verify duplicate refs did not overwrite each other:
+    # We should have a rule action inheriting from the first dupe ref ('series')
+    # AND a rule action inheriting from the second dupe ref ('collection')
+    scope_rule = plan['rules'].find { |r| r['property'] == 'notes' && r['inherited_props']['level'] == 'series' }
+    access_rule = plan['rules'].find { |r| r['property'] == 'notes' && r['inherited_props']['level'] == 'collection' }
+    expect(scope_rule).not_to be_nil
+    expect(access_rule).not_to be_nil
+    expect(scope_rule['inherited_props']['ref']).to eq('/repositories/2/resources/dupe')
+    expect(access_rule['inherited_props']['ref']).to eq('/repositories/2/resources/dupe')
+
+    # Verify null ref and integer ref are preserved
+    null_ref_rule = plan['rules'].find { |r| r['property'] == 'language' }
+    if null_ref_rule
+      expect(null_ref_rule['inherited_props']['ref']).to be_nil
+    end
+  end
+
+  it "translates levels lazily only at the exact point of inheritance" do
+    translated_levels = []
+    # Test that translate_level is only called for ancestors that actually contribute inherited properties
+    inheritance = RecordInheritance.new
+    allow(inheritance).to receive(:translate_level) do |level|
+      translated_levels << level
+      level.upcase
+    end
+
+    ao_rec = {
+      'uri' => '/repositories/2/archival_objects/902',
+      'jsonmodel_type' => 'archival_object',
+      'title' => 'AO Lazy Translation Test',
+      'publish' => true,
+      'suppressed' => false,
+      'notes' => [
+        {
+          'jsonmodel_type' => 'note_singlepart',
+          'type' => 'scopecontent',
+          'publish' => true,
+          'content' => ['Own child note']
+        }
+      ],
+      'ancestors' => [
+        {
+          'ref' => '/repositories/2/archival_objects/unrelated',
+          'level' => 'unrelated_series',
+          '_resolved' => {} # no qualifying values to inherit
+        },
+        {
+          'ref' => '/repositories/2/resources/contributing',
+          'level' => 'contributing_collection',
+          '_resolved' => {
+            'language' => 'spa'
+          }
+        }
+      ]
+    }
+
+    plan = inheritance.build_plan(ao_rec)
+    expect(plan).to be_a(Hash)
+    # The unrelated ancestor's level must NOT have been translated for rules!
+    expect(translated_levels).not_to include('unrelated_series')
+    # And contributing collection must be translated exactly once!
+    expect(translated_levels.count('contributing_collection')).to eq(1)
+  end
+
+  it "calls translate_level exactly once per applied action and records the exact same translated value in the plan and simulated native candidate" do
+    call_counts = Hash.new(0)
+    counter = 0
+
+    inheritance = RecordInheritance.new
+    allow(inheritance).to receive(:translate_level) do |level|
+      counter += 1
+      call_counts[level] += 1
+      "#{level}_translated_#{counter}"
+    end
+
+    ao_rec = {
+      'uri' => '/repositories/2/archival_objects/905',
+      'jsonmodel_type' => 'archival_object',
+      'title' => 'AO Single Translate Test',
+      'publish' => true,
+      'suppressed' => false,
+      'notes' => [
+        {
+          'jsonmodel_type' => 'note_singlepart',
+          'type' => 'scopecontent',
+          'publish' => true,
+          'content' => ['Own child note']
+        }
+      ],
+      'ancestors' => [
+        {
+          'ref' => '/repositories/2/archival_objects/unrelated',
+          'level' => 'unrelated_series',
+          '_resolved' => {} # no qualifying values to inherit
+        },
+        {
+          'ref' => '/repositories/2/resources/contributing',
+          'level' => 'contributing_collection',
+          '_resolved' => {
+            'language' => 'spa'
+          }
+        }
+      ]
+    }
+
+    # Simulate native merge progressively using shared internal helper with a recorder
+    working_copy = inheritance.deep_copy_record(ao_rec)
+    config = inheritance.instance_variable_get(:@config)[:archival_object]
+    recorder = RecordInheritance::ActionRecorder.new('archival_object')
+    simulated_candidate = inheritance.send(:merge_record_internal, working_copy, config, {}, recorder)
+    plan = recorder.to_plan
+
+    # Exactly one translate_level call per applied action:
+    expect(call_counts['unrelated_series']).to eq(0)
+    expect(call_counts['contributing_collection']).to eq(1)
+
+    # Exact same translated value in the plan props and simulated native candidate:
+    recorded_props_level = plan['rules'][0]['inherited_props']['level']
+    candidate_props_level = simulated_candidate['language_inherited']['level']
+    expect(recorded_props_level).to eq('contributing_collection_translated_1')
+    expect(candidate_props_level).to eq('contributing_collection_translated_1')
+    expect(recorded_props_level).to eq(candidate_props_level)
+  end
+
+  it "rejects candidate projection with non-string, missing, or extra keys at PUIIndexer application" do
+    begin
+      AppConfig[:rust_pui_document_preparation_enabled] = true
+      AppConfig[:rust_pui_record_inheritance_candidate_enabled] = true
+
+      uri = '/repositories/2/archival_objects/88'
+      rec_hash = {
+        'uri' => uri,
+        'jsonmodel_type' => 'archival_object',
+        'title' => 'AO Test',
+        'publish' => true,
+        'suppressed' => false,
+        'ancestors' => []
+      }
+      rec = { 'record' => rec_hash, 'uri' => uri }
+      expected_merged = RecordInheritance.merge(indexer.deep_copy_record_candidate(rec_hash))
+      clean_rec = indexer.deep_copy_record_candidate(expected_merged)
+      clean_rec.delete('ancestors')
+      fullrecord = IndexerCommon.extract_string_values(clean_rec, :published_only)
+      valid_final = {
+        'marker' => 'pui_final_document_metadata',
+        'json' => ASUtils.to_json(clean_rec),
+        'fullrecord_published' => fullrecord,
+      }
+
+      # 1. Non-string keys in candidate projection
+      doc1 = {}
+      bad_cand1 = {
+        :marker => 'pui_record_inheritance_candidate_metadata',
+        'record' => expected_merged,
+      }
+      indexer.instance_variable_set(:@pui_candidate_projections, { uri => bad_cand1 })
+      indexer.instance_variable_set(:@pui_final_projections, { uri => valid_final.dup })
+      expect(indexer.apply_rust_pui_final_projection(doc1, rec)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_candidate_projections)[uri]).to be_nil
+      expect(indexer.instance_variable_get(:@pui_final_projections)[uri]).to be_nil
+      expect(doc1).to be_empty
+
+      # 2. Missing required keys in candidate projection
+      doc2 = {}
+      bad_cand2 = {
+        'marker' => 'pui_record_inheritance_candidate_metadata',
+      }
+      indexer.instance_variable_set(:@pui_candidate_projections, { uri => bad_cand2 })
+      indexer.instance_variable_set(:@pui_final_projections, { uri => valid_final.dup })
+      expect(indexer.apply_rust_pui_final_projection(doc2, rec)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_candidate_projections)[uri]).to be_nil
+      expect(indexer.instance_variable_get(:@pui_final_projections)[uri]).to be_nil
+      expect(doc2).to be_empty
+
+      # 3. Unexpected extra keys in candidate projection
+      doc3 = {}
+      bad_cand3 = {
+        'marker' => 'pui_record_inheritance_candidate_metadata',
+        'record' => expected_merged,
+        'extra_key' => 'not_allowed',
+      }
+      indexer.instance_variable_set(:@pui_candidate_projections, { uri => bad_cand3 })
+      indexer.instance_variable_set(:@pui_final_projections, { uri => valid_final.dup })
+      expect(indexer.apply_rust_pui_final_projection(doc3, rec)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_candidate_projections)[uri]).to be_nil
+      expect(indexer.instance_variable_get(:@pui_final_projections)[uri]).to be_nil
+      expect(doc3).to be_empty
+    ensure
+      AppConfig[:rust_pui_document_preparation_enabled] = false
+      AppConfig[:rust_pui_record_inheritance_candidate_enabled] = false
+    end
+  end
+
+  it "rejects candidate projection with type differences (int vs float, bool vs int)" do
+    begin
+      AppConfig[:rust_pui_document_preparation_enabled] = true
+      AppConfig[:rust_pui_record_inheritance_candidate_enabled] = true
+
+      uri = '/repositories/2/archival_objects/89'
+      rec_hash = {
+        'uri' => uri,
+        'jsonmodel_type' => 'archival_object',
+        'title' => 'AO Type Test',
+        'publish' => true,
+        'suppressed' => false,
+        'int_val' => 1,
+        'bool_val' => true,
+        'ancestors' => []
+      }
+      rec = { 'record' => rec_hash, 'uri' => uri }
+      expected_merged = RecordInheritance.merge(indexer.deep_copy_record_candidate(rec_hash))
+      clean_rec = indexer.deep_copy_record_candidate(expected_merged)
+      clean_rec.delete('ancestors')
+      fullrecord = IndexerCommon.extract_string_values(clean_rec, :published_only)
+      valid_final = {
+        'marker' => 'pui_final_document_metadata',
+        'json' => ASUtils.to_json(clean_rec),
+        'fullrecord_published' => fullrecord,
+      }
+
+      # 1. Candidate record with float 1.0 where integer 1 is expected
+      doc_float = {}
+      cand_float_rec = indexer.deep_copy_record_candidate(expected_merged)
+      cand_float_rec['int_val'] = 1.0
+      bad_cand_float = {
+        'marker' => 'pui_record_inheritance_candidate_metadata',
+        'record' => cand_float_rec,
+      }
+      indexer.instance_variable_set(:@pui_candidate_projections, { uri => bad_cand_float })
+      indexer.instance_variable_set(:@pui_final_projections, { uri => valid_final.dup })
+      expect(indexer.apply_rust_pui_final_projection(doc_float, rec)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_candidate_projections)[uri]).to be_nil
+      expect(indexer.instance_variable_get(:@pui_final_projections)[uri]).to be_nil
+      expect(doc_float).to be_empty
+
+      # 2. Candidate record with integer 1 where boolean true is expected
+      doc_bool = {}
+      cand_bool_rec = indexer.deep_copy_record_candidate(expected_merged)
+      cand_bool_rec['bool_val'] = 1
+      bad_cand_bool = {
+        'marker' => 'pui_record_inheritance_candidate_metadata',
+        'record' => cand_bool_rec,
+      }
+      indexer.instance_variable_set(:@pui_candidate_projections, { uri => bad_cand_bool })
+      indexer.instance_variable_set(:@pui_final_projections, { uri => valid_final.dup })
+      expect(indexer.apply_rust_pui_final_projection(doc_bool, rec)).to be(false)
+      expect(indexer.instance_variable_get(:@pui_candidate_projections)[uri]).to be_nil
+      expect(indexer.instance_variable_get(:@pui_final_projections)[uri]).to be_nil
+      expect(doc_bool).to be_empty
+    ensure
+      AppConfig[:rust_pui_document_preparation_enabled] = false
+      AppConfig[:rust_pui_record_inheritance_candidate_enabled] = false
+    end
+  end
 end

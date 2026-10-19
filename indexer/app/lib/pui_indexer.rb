@@ -134,13 +134,13 @@ class PUIIndexer < PeriodicIndexer
 
     uri = rec_uri
     projection = @pui_final_projections && @pui_final_projections[uri]
-    return false unless projection.is_a?(Hash)
+    return discard_pui_final(uri) unless projection.is_a?(Hash)
 
     # 1. Capability marker & structure validation
-    return false unless projection['marker'] == 'pui_final_document_metadata'
-    return false unless projection['json'].is_a?(String)
-    return false unless projection['fullrecord_published'].is_a?(Array)
-    return false if doc.has_key?('fullrecord')
+    return discard_pui_final(uri) unless projection['marker'] == 'pui_final_document_metadata'
+    return discard_pui_final(uri) unless projection['json'].is_a?(String)
+    return discard_pui_final(uri) unless projection['fullrecord_published'].is_a?(Array)
+    return discard_pui_final(uri) if doc.has_key?('fullrecord')
 
     # 2. Parse projection JSON
     parsed_json = begin
@@ -148,12 +148,12 @@ class PUIIndexer < PeriodicIndexer
                   rescue StandardError
                     nil
                   end
-    return false unless parsed_json.is_a?(Hash)
-    return false unless parsed_json['uri'].is_a?(String) && parsed_json['uri'] == uri
-    return false unless parsed_json['jsonmodel_type'].is_a?(String) && parsed_json['jsonmodel_type'] == doc['primary_type']
+    return discard_pui_final(uri) unless parsed_json.is_a?(Hash)
+    return discard_pui_final(uri) unless parsed_json['uri'].is_a?(String) && parsed_json['uri'] == uri
+    return discard_pui_final(uri) unless parsed_json['jsonmodel_type'].is_a?(String) && parsed_json['jsonmodel_type'] == doc['primary_type']
 
     # 3. Privacy assertions on parsed_json
-    return false if parsed_json.has_key?('ancestors')
+    return discard_pui_final(uri) if parsed_json.has_key?('ancestors')
     if parsed_json['instances'].is_a?(Array)
       parsed_json['instances'].each do |instance|
         next unless instance.is_a?(Hash)
@@ -161,9 +161,9 @@ class PUIIndexer < PeriodicIndexer
         if sub_c.is_a?(Hash) && sub_c['top_container'].is_a?(Hash)
           resolved_tc = sub_c['top_container']['_resolved']
           if resolved_tc.is_a?(Hash)
-            return false if resolved_tc.has_key?('internal_note')
+            return discard_pui_final(uri) if resolved_tc.has_key?('internal_note')
             resolved_cp = resolved_tc.dig('container_profile', '_resolved')
-            return false if resolved_cp.is_a?(Hash) && resolved_cp.has_key?('notes')
+            return discard_pui_final(uri) if resolved_cp.is_a?(Hash) && resolved_cp.has_key?('notes')
           end
         end
       end
@@ -190,12 +190,30 @@ class PUIIndexer < PeriodicIndexer
     end
 
     # Exact value and serialization equality
-    return false unless parsed_json == expected_clean
-    return false unless projection['json'] == ASUtils.to_json(expected_clean)
+    return discard_pui_final(uri) unless parsed_json == expected_clean
+    return discard_pui_final(uri) unless projection['json'] == ASUtils.to_json(expected_clean)
 
     # Published-only fullrecord check
     expected_fullrecord = IndexerCommon.extract_string_values(expected_clean, :published_only)
-    return false unless projection['fullrecord_published'] == expected_fullrecord
+    return discard_pui_final(uri) unless projection['fullrecord_published'] == expected_fullrecord
+
+    if rust_pui_record_inheritance_candidate_enabled? && RecordInheritance.has_type?(record['record']['jsonmodel_type'])
+      cand_proj = @pui_candidate_projections && @pui_candidate_projections[uri]
+      return discard_pui_final(uri) unless cand_proj.is_a?(Hash)
+      return discard_pui_final(uri) if cand_proj.keys.any? { |k| !k.is_a?(String) }
+      missing_cand_keys = RustIndexDocumentBuilder::PUI_CANDIDATE_FIELDS - cand_proj.keys
+      return discard_pui_final(uri) unless missing_cand_keys.empty?
+      extra_cand_keys = cand_proj.keys - RustIndexDocumentBuilder::PUI_CANDIDATE_FIELDS
+      return discard_pui_final(uri) unless extra_cand_keys.empty?
+      return discard_pui_final(uri) unless cand_proj['marker'] == 'pui_record_inheritance_candidate_metadata'
+      return discard_pui_final(uri) unless cand_proj['record'].is_a?(Hash)
+      begin
+        RustIndexDocumentBuilder.validate_json_equal!(expected_merged, cand_proj['record'], "pui candidate record for #{uri}")
+      rescue StandardError => e
+        Log.warn("PUI candidate projection validation failed for #{uri}: #{e.class}: #{e.message}")
+        return discard_pui_final(uri)
+      end
+    end
 
     # 5. Apply projection safely
     doc['json'] = projection['json']
@@ -222,11 +240,17 @@ class PUIIndexer < PeriodicIndexer
     doc.delete('fullrecord')
     doc.delete('ancestors')
     doc.delete_if { |k, _| k.to_s.start_with?('_archivalist_') }
-    @pui_final_projections.delete(uri)
+    discard_pui_final(uri)
     true
   rescue StandardError => e
     Log.warn("PUI final projection validation failed for #{uri}: #{e.class}: #{e.message}; using native fallback")
-    @pui_final_projections.delete(uri) if @pui_final_projections
+    discard_pui_final(uri)
+    false
+  end
+
+  def discard_pui_final(uri)
+    @pui_final_projections.delete(uri) if @pui_final_projections && uri
+    @pui_candidate_projections.delete(uri) if @pui_candidate_projections && uri
     false
   end
 

@@ -1575,6 +1575,12 @@ class IndexerCommon
       self.class.name == 'PUIIndexer'
   end
 
+  def rust_pui_record_inheritance_candidate_enabled?
+    AppConfig.has_key?(:rust_pui_record_inheritance_candidate_enabled) &&
+      AppConfig[:rust_pui_record_inheritance_candidate_enabled] &&
+      rust_pui_document_preparation_enabled?
+  end
+
   def rust_index_document_builder
     @rust_builder ||= RustIndexDocumentBuilder.new(
       AppConfig[:rust_index_document_builder_url] || 'http://127.0.0.1:4570',
@@ -1615,10 +1621,23 @@ class IndexerCommon
         'enrich' => rust_index_document_enrichment_enabled?,
       }
       if rust_pui_document_preparation_enabled? && RecordInheritance.has_type?(prepared[:record_type])
-        candidate = deep_copy_record_candidate(prepared[:values])
-        candidate = RecordInheritance.merge(candidate)
-        input['prepare_pui_final'] = true
-        input['pui_candidate_record'] = candidate
+        if rust_pui_record_inheritance_candidate_enabled?
+          plan = RecordInheritance.build_plan(prepared[:values])
+          if plan
+            input['prepare_pui_final'] = true
+            input['record_inheritance_plan'] = plan
+          else
+            candidate = deep_copy_record_candidate(prepared[:values])
+            candidate = RecordInheritance.merge(candidate)
+            input['prepare_pui_final'] = true
+            input['pui_candidate_record'] = candidate
+          end
+        else
+          candidate = deep_copy_record_candidate(prepared[:values])
+          candidate = RecordInheritance.merge(candidate)
+          input['prepare_pui_final'] = true
+          input['pui_candidate_record'] = candidate
+        end
       end
       if rust_pui_availability_preparation_enabled?
         input['prepare_pui_availability'] = true
@@ -1656,6 +1675,7 @@ class IndexerCommon
     @pui_routing_projections = {}
     @pui_notes_projections = {}
     @pui_availability_projections = {}
+    @pui_candidate_projections = {}
 
     records = dedupe_by_uri(records)
 
@@ -1696,6 +1716,10 @@ class IndexerCommon
           rust_cm_docs.each {|child| child.delete_if {|k, _| k.start_with?('_archivalist_')}}
         end
 
+        if doc.has_key?('_archivalist_pui_candidate')
+          pui_candidate = doc.delete('_archivalist_pui_candidate')
+          @pui_candidate_projections[uri] = pui_candidate if pui_candidate
+        end
         if doc.has_key?('_archivalist_pui_final')
           pui_final = doc.delete('_archivalist_pui_final')
           @pui_final_projections[uri] = pui_final if pui_final
@@ -1713,6 +1737,7 @@ class IndexerCommon
           @pui_availability_projections[uri] = pui_availability if pui_availability
         end
         if doc['_archivalist_rust_fields'].is_a?(Array)
+          doc['_archivalist_rust_fields'].delete('pui_record_inheritance_candidate_metadata')
           doc['_archivalist_rust_fields'].delete('pui_final_document_metadata')
           doc['_archivalist_rust_fields'].delete('pui_routing_metadata')
           doc['_archivalist_rust_fields'].delete('pui_notes_metadata')
@@ -1753,6 +1778,7 @@ class IndexerCommon
       @pui_routing_projections = nil
       @pui_notes_projections = nil
       @pui_availability_projections = nil
+      @pui_candidate_projections = nil
     end
 
     index_batch(batch, timing)

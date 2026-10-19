@@ -3862,4 +3862,1007 @@ describe RustIndexDocumentBuilder do
       expect { builder.build_pui_auxiliary([aux_input.merge('pui_auxiliary_json' => '   ')]) }.to raise_error(/pui_auxiliary_json must be a non-empty string/)
     end
   end
+
+  describe 'record inheritance candidate preparation' do
+    let(:plan_input) do
+      rec = {
+        'uri' => '/repositories/2/archival_objects/42',
+        'jsonmodel_type' => 'archival_object',
+        'title' => 'AO 42',
+        'publish' => true,
+        'suppressed' => false,
+        'ancestors' => []
+      }
+      plan = {
+        'record_type' => 'archival_object',
+        'rules' => [
+          {
+            'ancestor_element_indices' => nil,
+            'ancestor_index' => 0,
+            'property' => 'title',
+            'inherit_directly' => true,
+            'inherited_value' => 'AO 42',
+            'inherited_props' => {
+              'ref' => '/repositories/2/archival_objects/41',
+              'level' => 'series',
+              'direct' => true,
+            },
+          }
+        ],
+        'composite_identifiers' => nil,
+      }
+      {
+        'uri' => '/repositories/2/archival_objects/42',
+        'record_type' => 'archival_object',
+        'repository' => 2,
+        'record' => rec,
+        'prepare_pui_final' => true,
+        'record_inheritance_plan' => plan,
+      }
+    end
+
+    it 'validates record_inheritance_plan input structure' do
+      expect(builder).not_to receive(:perform_request)
+
+      # Non-hash plan
+      expect {
+        builder.build([plan_input.merge('record_inheritance_plan' => 'invalid')])
+      }.to raise_error(/record_inheritance_plan must be a Hash/)
+
+      # Non-string keys in plan
+      expect {
+        bad_plan = plan_input['record_inheritance_plan'].dup
+        bad_plan[:symbol_key] = 'value'
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/record_inheritance_plan contains non-string keys/)
+
+      # Missing required fields in plan
+      expect {
+        bad_plan = plan_input['record_inheritance_plan'].dup
+        bad_plan.delete('rules')
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/record_inheritance_plan missing required fields/)
+
+      # Unexpected fields in plan
+      expect {
+        bad_plan = plan_input['record_inheritance_plan'].merge('extra_field' => 'bad')
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/record_inheritance_plan contains unexpected fields/)
+
+      # Empty record_type in plan
+      expect {
+        bad_plan = plan_input['record_inheritance_plan'].merge('record_type' => '')
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/record_inheritance_plan\.record_type must be a non-empty string/)
+
+      # Mismatched record_type in plan
+      expect {
+        bad_plan = plan_input['record_inheritance_plan'].merge('record_type' => 'resource')
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/record_inheritance_plan\.record_type 'resource' does not match input\.record_type 'archival_object'/)
+
+      # Non-array rules
+      expect {
+        bad_plan = plan_input['record_inheritance_plan'].merge('rules' => 'invalid')
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/record_inheritance_plan\.rules must be an Array/)
+
+      # Non-hash rule entry
+      expect {
+        bad_plan = plan_input['record_inheritance_plan'].merge('rules' => ['invalid'])
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/rule in record_inheritance_plan\.rules must be a Hash/)
+
+      # Non-string keys in rule
+      expect {
+        bad_rule = { :property => 'title', 'ancestor_index' => 0, 'ancestor_element_indices' => nil, 'inherit_directly' => true, 'inherited_value' => 'AO', 'inherited_props' => { 'ref' => 'r', 'level' => nil, 'direct' => true } }
+        bad_plan = plan_input['record_inheritance_plan'].merge('rules' => [bad_rule])
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/rule in record_inheritance_plan\.rules contains non-string keys/)
+
+      # Missing required fields in rule
+      expect {
+        bad_rule = { 'property' => 'title', 'inherit_directly' => true }
+        bad_plan = plan_input['record_inheritance_plan'].merge('rules' => [bad_rule])
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/rule in record_inheritance_plan\.rules missing required fields/)
+
+      # Unexpected fields in rule
+      expect {
+        bad_rule = plan_input['record_inheritance_plan']['rules'][0].merge('unexpected' => 1)
+        bad_plan = plan_input['record_inheritance_plan'].merge('rules' => [bad_rule])
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/rule in record_inheritance_plan\.rules contains unexpected fields/)
+
+      # Empty rule property
+      expect {
+        bad_rule = plan_input['record_inheritance_plan']['rules'][0].merge('property' => '')
+        bad_plan = plan_input['record_inheritance_plan'].merge('rules' => [bad_rule])
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/rule\.property must be a non-empty string/)
+
+      # Non-boolean inherit_directly
+      expect {
+        bad_rule = plan_input['record_inheritance_plan']['rules'][0].merge('inherit_directly' => 'yes')
+        bad_plan = plan_input['record_inheritance_plan'].merge('rules' => [bad_rule])
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/rule\.inherit_directly must be a Boolean/)
+
+      # Invalid ancestor_index
+      expect {
+        bad_rule = plan_input['record_inheritance_plan']['rules'][0].merge('ancestor_index' => 'not_an_int')
+        bad_plan = plan_input['record_inheritance_plan'].merge('rules' => [bad_rule])
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/rule\.ancestor_index must be a non-negative Integer/)
+
+      expect {
+        bad_rule = plan_input['record_inheritance_plan']['rules'][0].merge('ancestor_index' => -1)
+        bad_plan = plan_input['record_inheritance_plan'].merge('rules' => [bad_rule])
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/rule\.ancestor_index must be a non-negative Integer/)
+
+      # Invalid ancestor_element_indices
+      expect {
+        bad_rule = plan_input['record_inheritance_plan']['rules'][0].merge('ancestor_element_indices' => 'not_an_array')
+        bad_plan = plan_input['record_inheritance_plan'].merge('rules' => [bad_rule])
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/rule\.ancestor_element_indices must be nil or an Array of non-negative Integers/)
+
+      expect {
+        bad_rule = plan_input['record_inheritance_plan']['rules'][0].merge('ancestor_element_indices' => [-1])
+        bad_plan = plan_input['record_inheritance_plan'].merge('rules' => [bad_rule])
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/rule\.ancestor_element_indices must be nil or an Array of non-negative Integers/)
+
+      # Nil inherited_value
+      expect {
+        bad_rule = plan_input['record_inheritance_plan']['rules'][0].merge('inherited_value' => nil)
+        bad_plan = plan_input['record_inheritance_plan'].merge('rules' => [bad_rule])
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/rule\.inherited_value must not be nil/)
+
+      # Non-hash inherited_props
+      expect {
+        bad_rule = plan_input['record_inheritance_plan']['rules'][0].merge('inherited_props' => 'invalid')
+        bad_plan = plan_input['record_inheritance_plan'].merge('rules' => [bad_rule])
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/rule\.inherited_props must be a Hash/)
+
+      # Non-string keys in inherited_props
+      expect {
+        bad_props = { :ref => 'r', 'level' => nil, 'direct' => true }
+        bad_rule = plan_input['record_inheritance_plan']['rules'][0].merge('inherited_props' => bad_props)
+        bad_plan = plan_input['record_inheritance_plan'].merge('rules' => [bad_rule])
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/rule\.inherited_props contains non-string keys/)
+
+      # Missing required fields in inherited_props
+      expect {
+        bad_props = { 'ref' => 'r', 'level' => nil }
+        bad_rule = plan_input['record_inheritance_plan']['rules'][0].merge('inherited_props' => bad_props)
+        bad_plan = plan_input['record_inheritance_plan'].merge('rules' => [bad_rule])
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/rule\.inherited_props missing required fields/)
+
+      # Unexpected fields in inherited_props
+      expect {
+        bad_props = plan_input['record_inheritance_plan']['rules'][0]['inherited_props'].merge('unknown' => true)
+        bad_rule = plan_input['record_inheritance_plan']['rules'][0].merge('inherited_props' => bad_props)
+        bad_plan = plan_input['record_inheritance_plan'].merge('rules' => [bad_rule])
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/rule\.inherited_props contains unexpected fields/)
+
+      # Non-boolean direct in inherited_props
+      expect {
+        bad_props = plan_input['record_inheritance_plan']['rules'][0]['inherited_props'].merge('direct' => 1)
+        bad_rule = plan_input['record_inheritance_plan']['rules'][0].merge('inherited_props' => bad_props)
+        bad_plan = plan_input['record_inheritance_plan'].merge('rules' => [bad_rule])
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/rule\.inherited_props\.direct must be a Boolean/)
+
+      # Invalid composite_identifiers structure
+      expect {
+        bad_plan = plan_input['record_inheritance_plan'].merge('composite_identifiers' => 'invalid')
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/composite_identifiers must be a Hash/)
+
+      expect {
+        bad_comp = { :pieces => ['a'], 'delimiter' => '.' }
+        bad_plan = plan_input['record_inheritance_plan'].merge('composite_identifiers' => bad_comp)
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/composite_identifiers contains non-string keys/)
+
+      expect {
+        bad_comp = { 'pieces' => ['a'] }
+        bad_plan = plan_input['record_inheritance_plan'].merge('composite_identifiers' => bad_comp)
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/composite_identifiers missing required fields/)
+
+      expect {
+        bad_comp = { 'pieces' => ['a'], 'delimiter' => '.', 'extra' => 1 }
+        bad_plan = plan_input['record_inheritance_plan'].merge('composite_identifiers' => bad_comp)
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/composite_identifiers contains unexpected fields/)
+
+      expect {
+        bad_comp = { 'pieces' => 'not_array', 'delimiter' => '.' }
+        bad_plan = plan_input['record_inheritance_plan'].merge('composite_identifiers' => bad_comp)
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/composite_identifiers\.pieces must be an Array/)
+
+      expect {
+        bad_comp = { 'pieces' => [123], 'delimiter' => '.' }
+        bad_plan = plan_input['record_inheritance_plan'].merge('composite_identifiers' => bad_comp)
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/composite_identifiers\.pieces elements must be Strings/)
+
+      expect {
+        bad_comp = { 'pieces' => ['a'], 'delimiter' => 123 }
+        bad_plan = plan_input['record_inheritance_plan'].merge('composite_identifiers' => bad_comp)
+        builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
+      }.to raise_error(/composite_identifiers\.delimiter must be a String/)
+    end
+
+    it 'validates _archivalist_pui_candidate response projection' do
+      clean_rec = plan_input['record']
+      doc = {
+        'id' => plan_input['uri'],
+        'uri' => plan_input['uri'],
+        'publish' => true,
+        'suppressed' => false,
+        'primary_type' => 'archival_object',
+        'types' => ['archival_object'],
+        'json' => ASUtils.to_json(clean_rec),
+        '_archivalist_rust_fields' => [
+          'pui_final_document_metadata',
+          'pui_routing_metadata',
+          'pui_notes_metadata',
+          'pui_record_inheritance_candidate_metadata',
+        ],
+        '_archivalist_pui_final' => {
+          'marker' => 'pui_final_document_metadata',
+          'json' => ASUtils.to_json(clean_rec),
+          'fullrecord_published' => ['AO 42'],
+        },
+        '_archivalist_pui_candidate' => {
+          'marker' => 'pui_record_inheritance_candidate_metadata',
+          'record' => clean_rec,
+        },
+      }
+
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+
+      res = builder.build([plan_input])
+      expect(res.length).to eq(1)
+      expect(res[0]['_archivalist_pui_candidate']).to be_a(Hash)
+      expect(res[0]['_archivalist_pui_candidate']['record']['title']).to eq('AO 42')
+    end
+
+    it 'rejects _archivalist_pui_candidate with non-string keys' do
+      clean_rec = plan_input['record']
+      doc = {
+        'id' => plan_input['uri'],
+        'uri' => plan_input['uri'],
+        'publish' => true,
+        'suppressed' => false,
+        'primary_type' => 'archival_object',
+        'types' => ['archival_object'],
+        'json' => ASUtils.to_json(clean_rec),
+        '_archivalist_rust_fields' => [
+          'pui_final_document_metadata',
+          'pui_routing_metadata',
+          'pui_notes_metadata',
+          'pui_record_inheritance_candidate_metadata',
+        ],
+        '_archivalist_pui_final' => {
+          'marker' => 'pui_final_document_metadata',
+          'json' => ASUtils.to_json(clean_rec),
+          'fullrecord_published' => ['AO 42'],
+        },
+        '_archivalist_pui_candidate' => {
+          :marker => 'pui_record_inheritance_candidate_metadata',
+          'record' => clean_rec,
+        },
+      }
+
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+
+      expect { builder.build([plan_input]) }.to raise_error(/pui candidate contains non-string keys/)
+    end
+
+    it 'rejects _archivalist_pui_candidate with missing required fields' do
+      clean_rec = plan_input['record']
+      doc = {
+        'id' => plan_input['uri'],
+        'uri' => plan_input['uri'],
+        'publish' => true,
+        'suppressed' => false,
+        'primary_type' => 'archival_object',
+        'types' => ['archival_object'],
+        'json' => ASUtils.to_json(clean_rec),
+        '_archivalist_rust_fields' => [
+          'pui_final_document_metadata',
+          'pui_routing_metadata',
+          'pui_notes_metadata',
+          'pui_record_inheritance_candidate_metadata',
+        ],
+        '_archivalist_pui_final' => {
+          'marker' => 'pui_final_document_metadata',
+          'json' => ASUtils.to_json(clean_rec),
+          'fullrecord_published' => ['AO 42'],
+        },
+        '_archivalist_pui_candidate' => {
+          'marker' => 'pui_record_inheritance_candidate_metadata',
+        },
+      }
+
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+
+      expect { builder.build([plan_input]) }.to raise_error(/pui candidate missing required fields/)
+    end
+
+    it 'rejects _archivalist_pui_candidate with unexpected extra fields' do
+      clean_rec = plan_input['record']
+      doc = {
+        'id' => plan_input['uri'],
+        'uri' => plan_input['uri'],
+        'publish' => true,
+        'suppressed' => false,
+        'primary_type' => 'archival_object',
+        'types' => ['archival_object'],
+        'json' => ASUtils.to_json(clean_rec),
+        '_archivalist_rust_fields' => [
+          'pui_final_document_metadata',
+          'pui_routing_metadata',
+          'pui_notes_metadata',
+          'pui_record_inheritance_candidate_metadata',
+        ],
+        '_archivalist_pui_final' => {
+          'marker' => 'pui_final_document_metadata',
+          'json' => ASUtils.to_json(clean_rec),
+          'fullrecord_published' => ['AO 42'],
+        },
+        '_archivalist_pui_candidate' => {
+          'marker' => 'pui_record_inheritance_candidate_metadata',
+          'record' => clean_rec,
+          'extra_field' => 'bad',
+        },
+      }
+
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+
+      expect { builder.build([plan_input]) }.to raise_error(/pui candidate contains unexpected fields/)
+    end
+
+    it 'rejects _archivalist_pui_candidate with mismatched marker' do
+      clean_rec = plan_input['record']
+      doc = {
+        'id' => plan_input['uri'],
+        'uri' => plan_input['uri'],
+        'publish' => true,
+        'suppressed' => false,
+        'primary_type' => 'archival_object',
+        'types' => ['archival_object'],
+        'json' => ASUtils.to_json(clean_rec),
+        '_archivalist_rust_fields' => [
+          'pui_final_document_metadata',
+          'pui_routing_metadata',
+          'pui_notes_metadata',
+          'pui_record_inheritance_candidate_metadata',
+        ],
+        '_archivalist_pui_final' => {
+          'marker' => 'pui_final_document_metadata',
+          'json' => ASUtils.to_json(clean_rec),
+          'fullrecord_published' => ['AO 42'],
+        },
+        '_archivalist_pui_candidate' => {
+          'marker' => 'wrong_marker',
+          'record' => clean_rec,
+        },
+      }
+
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+
+      expect { builder.build([plan_input]) }.to raise_error(/marker mismatch/)
+    end
+
+    it 'rejects _archivalist_pui_candidate with mismatched uri' do
+      clean_rec = plan_input['record'].merge('uri' => '/repositories/2/archival_objects/999')
+      doc = {
+        'id' => plan_input['uri'],
+        'uri' => plan_input['uri'],
+        'publish' => true,
+        'suppressed' => false,
+        'primary_type' => 'archival_object',
+        'types' => ['archival_object'],
+        'json' => ASUtils.to_json(clean_rec),
+        '_archivalist_rust_fields' => [
+          'pui_final_document_metadata',
+          'pui_routing_metadata',
+          'pui_notes_metadata',
+          'pui_record_inheritance_candidate_metadata',
+        ],
+        '_archivalist_pui_final' => {
+          'marker' => 'pui_final_document_metadata',
+          'json' => ASUtils.to_json(clean_rec),
+          'fullrecord_published' => ['AO 42'],
+        },
+        '_archivalist_pui_candidate' => {
+          'marker' => 'pui_record_inheritance_candidate_metadata',
+          'record' => clean_rec,
+        },
+      }
+
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+
+      expect { builder.build([plan_input]) }.to raise_error(/pui candidate record uri mismatch/)
+    end
+
+    it 'rejects _archivalist_pui_candidate with mismatched jsonmodel_type' do
+      clean_rec = plan_input['record'].merge('jsonmodel_type' => 'resource')
+      doc = {
+        'id' => plan_input['uri'],
+        'uri' => plan_input['uri'],
+        'publish' => true,
+        'suppressed' => false,
+        'primary_type' => 'archival_object',
+        'types' => ['archival_object'],
+        'json' => ASUtils.to_json(clean_rec),
+        '_archivalist_rust_fields' => [
+          'pui_final_document_metadata',
+          'pui_routing_metadata',
+          'pui_notes_metadata',
+          'pui_record_inheritance_candidate_metadata',
+        ],
+        '_archivalist_pui_final' => {
+          'marker' => 'pui_final_document_metadata',
+          'json' => ASUtils.to_json(clean_rec),
+          'fullrecord_published' => ['AO 42'],
+        },
+        '_archivalist_pui_candidate' => {
+          'marker' => 'pui_record_inheritance_candidate_metadata',
+          'record' => clean_rec,
+        },
+      }
+
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+
+      expect { builder.build([plan_input]) }.to raise_error(/pui candidate record jsonmodel_type mismatch/)
+    end
+
+    it 'rejects _archivalist_pui_candidate when candidate record fails parity validation' do
+      clean_rec = plan_input['record'].merge('title' => 'Tampered Merged Title')
+      doc = {
+        'id' => plan_input['uri'],
+        'uri' => plan_input['uri'],
+        'publish' => true,
+        'suppressed' => false,
+        'primary_type' => 'archival_object',
+        'types' => ['archival_object'],
+        'json' => ASUtils.to_json(clean_rec),
+        '_archivalist_rust_fields' => [
+          'pui_final_document_metadata',
+          'pui_routing_metadata',
+          'pui_notes_metadata',
+          'pui_record_inheritance_candidate_metadata',
+        ],
+        '_archivalist_pui_final' => {
+          'marker' => 'pui_final_document_metadata',
+          'json' => ASUtils.to_json(clean_rec),
+          'fullrecord_published' => ['Tampered Merged Title'],
+        },
+        '_archivalist_pui_candidate' => {
+          'marker' => 'pui_record_inheritance_candidate_metadata',
+          'record' => clean_rec,
+        },
+      }
+
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+
+      expect { builder.build([plan_input]) }.to raise_error(/pui candidate record for/)
+    end
+
+    it 'rejects unexpected _archivalist_pui_candidate when record_inheritance_plan was not provided' do
+      cand_input = plan_input.dup
+      cand_input.delete('record_inheritance_plan')
+      cand_input['pui_candidate_record'] = plan_input['record']
+
+      clean_rec = plan_input['record']
+      doc = {
+        'id' => plan_input['uri'],
+        'uri' => plan_input['uri'],
+        'publish' => true,
+        'suppressed' => false,
+        'primary_type' => 'archival_object',
+        'types' => ['archival_object'],
+        'json' => ASUtils.to_json(clean_rec),
+        '_archivalist_rust_fields' => [
+          'pui_final_document_metadata',
+          'pui_routing_metadata',
+          'pui_notes_metadata',
+        ],
+        '_archivalist_pui_final' => {
+          'marker' => 'pui_final_document_metadata',
+          'json' => ASUtils.to_json(clean_rec),
+          'fullrecord_published' => ['AO 42'],
+        },
+        '_archivalist_pui_candidate' => {
+          'marker' => 'pui_record_inheritance_candidate_metadata',
+          'record' => clean_rec,
+        },
+      }
+
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+
+      expect { builder.build([cand_input]) }.to raise_error(/unexpected _archivalist_pui_candidate when record_inheritance_plan is absent/)
+    end
+
+    describe 'RecordInheritance error and coercion parity' do
+      let(:custom_config) do
+        {
+          :archival_object => {
+            :inherited_fields => [
+              {
+                :property => 'notes',
+                :inherit_directly => true,
+              },
+              {
+                :property => 'language',
+                :inherit_directly => false,
+              }
+            ],
+            :composite_identifiers => {
+              :include_level => true,
+              :identifier_delimiter => '/',
+            }
+          }
+        }
+      end
+
+      it 'raises identical NoMethodError on missing ancestors between merge and build_plan' do
+        rec_missing_ancestors = {
+          'jsonmodel_type' => 'archival_object',
+          'uri' => '/repositories/2/archival_objects/500',
+          'notes' => []
+        }
+        merge_err = nil
+        plan_err = nil
+        begin
+          RecordInheritance.new(custom_config).merge(rec_missing_ancestors)
+        rescue => e
+          merge_err = e
+        end
+        begin
+          RecordInheritance.new(custom_config).build_plan(rec_missing_ancestors)
+        rescue => e
+          plan_err = e
+        end
+        expect(merge_err).to be_a(NoMethodError)
+        expect(plan_err).to be_a(NoMethodError)
+        expect(merge_err.class).to eq(plan_err.class)
+      end
+
+      it 'raises identical NoMethodError on malformed ancestor _resolved between merge and build_plan' do
+        rec_malformed_resolved = {
+          'jsonmodel_type' => 'archival_object',
+          'uri' => '/repositories/2/archival_objects/501',
+          'notes' => [],
+          'ancestors' => [
+            {
+              'ref' => '/repositories/2/resources/1',
+              'level' => 'collection',
+              '_resolved' => nil
+            }
+          ]
+        }
+        merge_err = nil
+        plan_err = nil
+        begin
+          RecordInheritance.new(custom_config).merge(rec_malformed_resolved)
+        rescue => e
+          merge_err = e
+        end
+        begin
+          RecordInheritance.new(custom_config).build_plan(rec_malformed_resolved)
+        rescue => e
+          plan_err = e
+        end
+        expect(merge_err).to be_a(NoMethodError)
+        expect(plan_err).to be_a(NoMethodError)
+        expect(merge_err.class).to eq(plan_err.class)
+      end
+
+      it 'raises identical error on wrong-shaped filtered ancestor values between merge and build_plan' do
+        cfg_with_bad_filter = {
+          :archival_object => {
+            :inherited_fields => [
+              {
+                :property => 'notes',
+                :inherit_directly => true,
+                :inherit_if => proc { |_v| 12345 } # integer does not respond to .empty?
+              }
+            ]
+          }
+        }
+        rec_bad_filter = {
+          'jsonmodel_type' => 'archival_object',
+          'uri' => '/repositories/2/archival_objects/502',
+          'notes' => [],
+          'ancestors' => [
+            {
+              'ref' => '/repositories/2/resources/1',
+              'level' => 'collection',
+              '_resolved' => {
+                'notes' => [{ 'jsonmodel_type' => 'note_singlepart', 'type' => 'abstract' }]
+              }
+            }
+          ]
+        }
+        merge_err = nil
+        plan_err = nil
+        begin
+          RecordInheritance.new(cfg_with_bad_filter).merge(rec_bad_filter)
+        rescue => e
+          merge_err = e
+        end
+        begin
+          RecordInheritance.new(cfg_with_bad_filter).build_plan(rec_bad_filter)
+        rescue => e
+          plan_err = e
+        end
+        expect(merge_err).to be_a(NoMethodError)
+        expect(plan_err).to be_a(NoMethodError)
+        expect(merge_err.class).to eq(plan_err.class)
+      end
+
+      it 'preserves exact property key semantics when configured with symbols vs strings' do
+        cfg_sym = {
+          :archival_object => {
+            :inherited_fields => [
+              {
+                :property => :notes,
+                :inherit_directly => true,
+              }
+            ]
+          }
+        }
+        rec_with_symbol_key = {
+          'jsonmodel_type' => 'archival_object',
+          'uri' => '/repositories/2/archival_objects/503',
+          :notes => [],
+          'ancestors' => [
+            {
+              'ref' => '/repositories/2/resources/1',
+              'level' => 'collection',
+              '_resolved' => {
+                :notes => [{ 'type' => 'abstract', 'content' => ['Symbol key note'] }]
+              }
+            }
+          ]
+        }
+        plan = RecordInheritance.new(cfg_sym).build_plan(rec_with_symbol_key)
+        expect(plan['rules'][0]['property']).to eq('notes')
+        expect(plan['rules'][0]['ancestor_index']).to eq(0)
+        expect(plan['rules'][0]['ancestor_element_indices']).to eq([0])
+      end
+
+      it 'preserves exact translated level value and composite delimiter conversion' do
+        custom_delimiter_obj = Class.new do
+          def to_s
+            ' :: '
+          end
+        end.new
+
+        cfg_custom_delim = {
+          :archival_object => {
+            :inherited_fields => [],
+            :composite_identifiers => {
+              :include_level => false,
+              :identifier_delimiter => custom_delimiter_obj
+            }
+          }
+        }
+        rec_delim = {
+          'jsonmodel_type' => 'archival_object',
+          'uri' => '/repositories/2/archival_objects/504',
+          'component_id' => 'c504',
+          'ancestors' => [
+            {
+              'ref' => '/repositories/2/resources/1',
+              'level' => 'collection',
+              '_resolved' => {
+                'id_0' => 'COLL',
+                'id_1' => '100'
+              }
+            }
+          ]
+        }
+        merged = RecordInheritance.new(cfg_custom_delim).merge(rec_delim)
+        plan = RecordInheritance.new(cfg_custom_delim).build_plan(rec_delim)
+        expect(merged['_composite_identifier']).to eq('COLL :: 100 :: c504')
+        expect(plan['composite_identifiers']['pieces']).to eq(['COLL :: 100', 'c504'])
+        expect(plan['composite_identifiers']['delimiter']).to eq(' :: ')
+      end
+    end
+
+    describe 'end-to-end candidate projection with native validation and unmutated source input' do
+      it 'validates candidate with ancestor mutations against RecordInheritance.merge and leaves source unmutated' do
+        ao_source = {
+          'jsonmodel_type' => 'archival_object',
+          'uri' => '/repositories/2/archival_objects/777',
+          'title' => 'Child AO 777',
+          'publish' => true,
+          'suppressed' => false,
+          'notes' => [],
+          'linked_agents' => [],
+          'ancestors' => [
+            {
+              'ref' => '/repositories/2/archival_objects/700',
+              'level' => 'series',
+              '_resolved' => {
+                'notes' => [
+                  {
+                    'jsonmodel_type' => 'note_singlepart',
+                    'type' => 'accessrestrict',
+                    'publish' => true,
+                    'content' => ['Direct series restriction']
+                  }
+                ],
+                'linked_agents' => []
+              }
+            },
+            {
+              'ref' => '/repositories/2/resources/50',
+              'level' => 'collection',
+              '_resolved' => {
+                'notes' => [
+                  {
+                    'jsonmodel_type' => 'note_singlepart',
+                    'type' => 'scopecontent',
+                    'publish' => true,
+                    'content' => ['Collection scope note']
+                  }
+                ],
+                'linked_agents' => [
+                  {
+                    'ref' => '/agents/people/99',
+                    'role' => 'creator',
+                    'terms' => []
+                  }
+                ]
+              }
+            }
+          ]
+        }
+
+        # Snapshot source before anything runs
+        source_snapshot = ASUtils.json_parse(ASUtils.to_json(ao_source))
+
+        # 1. Build plan using native RecordInheritance
+        plan = RecordInheritance.build_plan(ao_source)
+        expect(plan).to be_a(Hash)
+        expect(plan['rules'].length).to be >= 2
+
+        # Verify source was not mutated by build_plan
+        expect(ao_source).to eq(source_snapshot)
+
+        # 2. Compute expected native candidate using RecordInheritance.merge on a clone
+        # Note: RecordInheritance.merge shallow-clones the root and mutates ancestors in place!
+        expected_native_candidate = RecordInheritance.merge(ASUtils.json_parse(ASUtils.to_json(ao_source)))
+
+        # Assert expected native candidate has _inherited in BOTH destination AND inside ancestors
+        expect(expected_native_candidate['notes'][0]['_inherited']).to be_a(Hash)
+        expect(expected_native_candidate['ancestors'][0]['_resolved']['notes'][0]['_inherited']).to be_a(Hash)
+        expect(expected_native_candidate['linked_agents'][0]['_inherited']).to be_a(Hash)
+        expect(expected_native_candidate['ancestors'][1]['_resolved']['linked_agents'][0]['_inherited']).to be_a(Hash)
+
+        # 3. Simulate the sidecar response returning this candidate
+        cand_input = {
+          'uri' => ao_source['uri'],
+          'record_type' => 'archival_object',
+          'repository' => 2,
+          'record' => ao_source,
+          'prepare_pui_final' => true,
+          'record_inheritance_plan' => plan,
+        }
+
+        clean_expected = ASUtils.json_parse(ASUtils.to_json(expected_native_candidate))
+        clean_expected.delete('ancestors')
+
+        sidecar_doc = {
+          'id' => ao_source['uri'],
+          'uri' => ao_source['uri'],
+          'publish' => true,
+          'suppressed' => false,
+          'primary_type' => 'archival_object',
+          'types' => ['archival_object'],
+          'json' => ASUtils.to_json(clean_expected),
+          '_archivalist_rust_fields' => [
+            'pui_final_document_metadata',
+            'pui_routing_metadata',
+            'pui_notes_metadata',
+            'pui_record_inheritance_candidate_metadata',
+          ],
+          '_archivalist_pui_final' => {
+            'marker' => 'pui_final_document_metadata',
+            'json' => ASUtils.to_json(clean_expected),
+            'fullrecord_published' => ['Child AO 777'],
+          },
+          '_archivalist_pui_candidate' => {
+            'marker' => 'pui_record_inheritance_candidate_metadata',
+            'record' => expected_native_candidate,
+          },
+        }
+
+        allow(builder).to receive(:perform_request).and_return(
+          response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                          'documents' => [sidecar_doc])
+        )
+
+        # 4. Builder should accept candidate via strict equality check against RecordInheritance.merge(ao_source)
+        res = builder.build([cand_input])
+        expect(res.length).to eq(1)
+        expect(res[0]['_archivalist_pui_candidate']['record']).to eq(expected_native_candidate)
+
+        # 5. Verify source input is STILL completely unmutated!
+        expect(ao_source).to eq(source_snapshot)
+        expect(ao_source['notes']).to eq([])
+        expect(ao_source['linked_agents']).to eq([])
+        expect(ao_source['ancestors'][0]['_resolved']['notes'][0]['_inherited']).to be_nil
+        expect(ao_source['ancestors'][1]['_resolved']['linked_agents'][0]['_inherited']).to be_nil
+      end
+
+      it "correctly handles custom inherit_if returning deep-copied equal Hashes without mutating ancestor _resolved" do
+        custom_config = {
+          :archival_object => {
+            :inherited_fields => [
+              {
+                :property => 'notes',
+                :inherit_directly => true,
+                :inherit_if => proc { |notes|
+                  # Return newly allocated deep copies with equal values
+                  notes.map { |n| RecordInheritance.new.deep_copy_record(n) }
+                }
+              }
+            ]
+          }
+        }
+
+        inheritance = RecordInheritance.new(custom_config)
+
+        raw_note = {
+          'jsonmodel_type' => 'note_singlepart',
+          'type' => 'scopecontent',
+          'publish' => true,
+          'content' => ['Scope content from ancestor']
+        }
+
+        ao_source = {
+          'uri' => '/repositories/2/archival_objects/999',
+          'jsonmodel_type' => 'archival_object',
+          'title' => 'AO Custom Inherit If Test',
+          'publish' => true,
+          'suppressed' => false,
+          'notes' => [],
+          'ancestors' => [
+            {
+              'ref' => '/repositories/2/resources/55',
+              'level' => 'collection',
+              '_resolved' => {
+                'notes' => [raw_note]
+              }
+            }
+          ]
+        }
+
+        source_snapshot = ASUtils.json_parse(ASUtils.to_json(ao_source))
+
+        # 1. Plan generation
+        plan = inheritance.build_plan(ao_source)
+        expect(plan).to be_a(Hash)
+        expect(plan['rules'].length).to eq(1)
+        notes_rule = plan['rules'][0]
+        expect(notes_rule['property']).to eq('notes')
+        # Identity matching did NOT match raw_val items because elements were newly allocated deep copies!
+        expect(notes_rule['ancestor_element_indices']).to eq([])
+
+        # 2. Native merge
+        expected_native_candidate = inheritance.merge(inheritance.deep_copy_record(ao_source))
+
+        # Expected native candidate MUST have _inherited on destination copies:
+        expect(expected_native_candidate['notes'][0]['_inherited']).to be_a(Hash)
+        expect(expected_native_candidate['notes'][0]['_inherited']['ref']).to eq('/repositories/2/resources/55')
+
+        # Expected native candidate MUST NOT have _inherited inside ancestor _resolved:
+        expect(expected_native_candidate['ancestors'][0]['_resolved']['notes'][0]['_inherited']).to be_nil
+
+        # 3. Simulate sidecar response with candidate matching expected native candidate
+        clean_expected = ASUtils.json_parse(ASUtils.to_json(expected_native_candidate))
+        clean_expected.delete('ancestors')
+
+        sidecar_doc = {
+          'id' => ao_source['uri'],
+          'uri' => ao_source['uri'],
+          'publish' => true,
+          'suppressed' => false,
+          'primary_type' => 'archival_object',
+          'types' => ['archival_object'],
+          'json' => ASUtils.to_json(clean_expected),
+          '_archivalist_rust_fields' => [
+            'pui_final_document_metadata',
+            'pui_routing_metadata',
+            'pui_notes_metadata',
+            'pui_record_inheritance_candidate_metadata',
+          ],
+          '_archivalist_pui_final' => {
+            'marker' => 'pui_final_document_metadata',
+            'json' => ASUtils.to_json(clean_expected),
+            'fullrecord_published' => ['Scope content from ancestor'],
+          },
+          '_archivalist_pui_candidate' => {
+            'marker' => 'pui_record_inheritance_candidate_metadata',
+            'record' => expected_native_candidate,
+          },
+        }
+
+        cand_input = {
+          'uri' => ao_source['uri'],
+          'record_type' => 'archival_object',
+          'repository' => 2,
+          'record' => ao_source,
+          'prepare_pui_final' => true,
+          'record_inheritance_plan' => plan,
+        }
+
+        allow(builder).to receive(:perform_request).and_return(
+          response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                          'documents' => [sidecar_doc])
+        )
+
+        # In builder.build:
+        # validate_json_equal! validates expected_merged against cand_rec.
+        # Allow RecordInheritance.merge to use the custom config for this test:
+        allow(RecordInheritance).to receive(:merge) do |rec|
+          inheritance.merge(rec)
+        end
+
+        res = builder.build([cand_input])
+        expect(res.length).to eq(1)
+        cand_record = res[0]['_archivalist_pui_candidate']['record']
+        expect(cand_record).to eq(expected_native_candidate)
+        expect(cand_record['notes'][0]['_inherited']).to be_a(Hash)
+        expect(cand_record['ancestors'][0]['_resolved']['notes'][0]['_inherited']).to be_nil
+
+        # Source unmutated
+        expect(ao_source).to eq(source_snapshot)
+      end
+    end
+  end
 end

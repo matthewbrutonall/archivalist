@@ -173,7 +173,22 @@ strictly validates exact key sets, identity, type-strict values (including strin
 `types: ['pui']`), JSON semantic parity, response completeness, duplicate preservation, and ordering
 before stripping internal markers and appending to `batch`. On any sidecar unavailability, timeout,
 malformed response, or validation failure, Ruby cleanly falls back to native document construction
-with zero partial mutation.
+with zero partial mutation. Deterministic PUI RecordInheritance merge candidate construction for
+`PUIIndexer` final-document preparation is gated separately under
+`AppConfig[:rust_pui_record_inheritance_candidate_enabled]` (disabled by default). Ruby remains
+authoritative for dynamic configuration, evaluating `skip_if` and `inherit_if` Procs with exact native
+inputs and truthiness, localized `translate_level` values via I18n, custom/plugin-modified configuration,
+repeated rules, direct flags, composite identifier delimiter semantics, and native exception timing
+while compiling a serializable plan (`RecordInheritance.build_plan`). Rust executes the deterministic
+merge on a deep JSON copy (scalar/array inheritance, first qualifying ancestor selection, array
+concatenation/flattening, `_inherited` metadata on hashes vs `<property>_inherited` on scalars, repeated
+rules, and composite identifier construction). The merged candidate is projected under
+`_archivalist_pui_candidate` (`pui_record_inheritance_candidate_metadata`), retaining `ancestors`, and
+feeds the existing PUI final privacy/fullrecord projection (`_archivalist_pui_final`) in the same
+`/index/documents` batch request. Ruby independently computes native `RecordInheritance.merge` and
+type-strictly validates the Rust candidate; any mismatch, missing/extra key, or sidecar error falls back
+cleanly to native path with zero partial mutation or private marker leakage. Non-PUI/direct-only
+inheritance (`fetch_records`, backend/OAI, native `RecordInheritance.merge`) remains untouched.
 
 ## Test and benchmark helpers
 
