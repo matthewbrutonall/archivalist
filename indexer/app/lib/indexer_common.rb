@@ -1569,6 +1569,19 @@ class IndexerCommon
       self.class.name != 'PUIIndexer'
   end
 
+  def rust_pui_auxiliary_documents_enabled?
+    AppConfig.has_key?(:rust_pui_auxiliary_documents_enabled) &&
+      AppConfig[:rust_pui_auxiliary_documents_enabled] &&
+      self.class.name == 'PUIIndexer'
+  end
+
+  def rust_index_document_builder
+    @rust_builder ||= RustIndexDocumentBuilder.new(
+      AppConfig[:rust_index_document_builder_url] || 'http://127.0.0.1:4570',
+      AppConfig[:rust_index_document_builder_timeout_seconds] || 2
+    )
+  end
+
   def deep_copy_record_candidate(val)
     case val
     when Hash

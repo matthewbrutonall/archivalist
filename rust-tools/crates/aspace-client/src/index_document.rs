@@ -11,6 +11,15 @@ pub const PUI_NOTES_METADATA_MARKER: &str = "pui_notes_metadata";
 pub const PUI_NOTES_DOCUMENTS_KEY: &str = "_archivalist_pui_notes";
 pub const PUI_AVAILABILITY_METADATA_MARKER: &str = "pui_availability_metadata";
 pub const PUI_AVAILABILITY_DOCUMENTS_KEY: &str = "_archivalist_pui_availability";
+pub const PUI_AUXILIARY_METADATA_MARKER: &str = "pui_auxiliary_document_metadata";
+pub const PUI_AUXILIARY_DOCUMENTS_KEY: &str = "_archivalist_pui_auxiliary";
+pub const PUI_AUXILIARY_TYPES: &[&str] = &[
+    "resource_ordered_records",
+    "tree_root",
+    "tree_waypoint",
+    "tree_node",
+    "tree_node_from_root",
+];
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Clone)]
 pub struct IndexDocumentInput {
@@ -36,6 +45,12 @@ pub struct IndexDocumentInput {
     pub prepare_pui_availability: bool,
     #[serde(default)]
     pub record_inheritance_has_type: Option<bool>,
+    #[serde(default)]
+    pub prepare_pui_auxiliary: bool,
+    #[serde(default)]
+    pub pui_parent_id: Option<String>,
+    #[serde(default)]
+    pub pui_auxiliary_json: Option<String>,
 }
 
 impl Default for IndexDocumentInput {
@@ -54,6 +69,9 @@ impl Default for IndexDocumentInput {
             pui_candidate_record: None,
             prepare_pui_availability: false,
             record_inheritance_has_type: None,
+            prepare_pui_auxiliary: false,
+            pui_parent_id: None,
+            pui_auxiliary_json: None,
         }
     }
 }
@@ -3107,6 +3125,283 @@ fn add_pui_availability_fields(
     Ok(())
 }
 
+fn json_type_name(val: &Value) -> &'static str {
+    match val {
+        Value::Null => "Null",
+        Value::Bool(_) => "Bool",
+        Value::Number(n) => {
+            if n.is_i64() || n.is_u64() {
+                "Integer"
+            } else {
+                "Float"
+            }
+        }
+        Value::String(_) => "String",
+        Value::Array(_) => "Array",
+        Value::Object(_) => "Object",
+    }
+}
+
+fn assert_json_type_strict_equal(
+    expected: &Value,
+    actual: &Value,
+    path: &str,
+) -> Result<(), IndexDocumentError> {
+    match (expected, actual) {
+        (Value::Null, Value::Null) => Ok(()),
+        (Value::Bool(b1), Value::Bool(b2)) => {
+            if b1 == b2 {
+                Ok(())
+            } else {
+                Err(error(format!(
+                    "{path}: boolean mismatch: expected {b1}, got {b2}"
+                )))
+            }
+        }
+        (Value::Number(n1), Value::Number(n2)) => {
+            let n1_is_int = n1.is_i64() || n1.is_u64();
+            let n2_is_int = n2.is_i64() || n2.is_u64();
+            if n1_is_int != n2_is_int {
+                return Err(error(format!(
+                    "{path}: type mismatch between integer and float ({n1} vs {n2})"
+                )));
+            }
+            if n1_is_int {
+                let n1_i128 = n1
+                    .as_i64()
+                    .map(i128::from)
+                    .or_else(|| n1.as_u64().map(i128::from));
+                let n2_i128 = n2
+                    .as_i64()
+                    .map(i128::from)
+                    .or_else(|| n2.as_u64().map(i128::from));
+                if n1_i128 == n2_i128 {
+                    Ok(())
+                } else {
+                    Err(error(format!(
+                        "{path}: integer mismatch: expected {n1}, got {n2}"
+                    )))
+                }
+            } else {
+                let f1 = n1
+                    .as_f64()
+                    .ok_or_else(|| error(format!("{path}: unparseable float {n1}")))?;
+                let f2 = n2
+                    .as_f64()
+                    .ok_or_else(|| error(format!("{path}: unparseable float {n2}")))?;
+                if (f1 - f2).abs() < f64::EPSILON && f1.to_bits() == f2.to_bits() {
+                    Ok(())
+                } else {
+                    Err(error(format!(
+                        "{path}: float mismatch: expected {n1}, got {n2}"
+                    )))
+                }
+            }
+        }
+        (Value::String(s1), Value::String(s2)) => {
+            if s1 == s2 {
+                Ok(())
+            } else {
+                Err(error(format!(
+                    "{path}: string mismatch: expected {s1:?}, got {s2:?}"
+                )))
+            }
+        }
+        (Value::Array(a1), Value::Array(a2)) => {
+            if a1.len() != a2.len() {
+                return Err(error(format!(
+                    "{path}: array length mismatch: expected {}, got {}",
+                    a1.len(),
+                    a2.len()
+                )));
+            }
+            for (idx, (item1, item2)) in a1.iter().zip(a2.iter()).enumerate() {
+                assert_json_type_strict_equal(item1, item2, &format!("{path}[{idx}]"))?;
+            }
+            Ok(())
+        }
+        (Value::Object(o1), Value::Object(o2)) => {
+            if o1.len() != o2.len() {
+                return Err(error(format!(
+                    "{path}: object key count mismatch: expected {}, got {}",
+                    o1.len(),
+                    o2.len()
+                )));
+            }
+            for (k, v1) in o1 {
+                let v2 = o2.get(k).ok_or_else(|| {
+                    error(format!(
+                        "{path}: missing expected key {k:?} in auxiliary JSON"
+                    ))
+                })?;
+                assert_json_type_strict_equal(v1, v2, &format!("{path}.{k}"))?;
+            }
+            for k in o2.keys() {
+                if !o1.contains_key(k) {
+                    return Err(error(format!(
+                        "{path}: unexpected extra key {k:?} in auxiliary JSON"
+                    )));
+                }
+            }
+            Ok(())
+        }
+        (expected_val, actual_val) => Err(error(format!(
+            "{path}: type mismatch: expected {}, got {}",
+            json_type_name(expected_val),
+            json_type_name(actual_val)
+        ))),
+    }
+}
+
+fn build_pui_auxiliary_document(input: &IndexDocumentInput) -> Result<Value, IndexDocumentError> {
+    if !PUI_AUXILIARY_TYPES.contains(&input.record_type.as_str()) {
+        return Err(error(format!(
+            "invalid auxiliary record_type '{}'; expected one of {:?}",
+            input.record_type, PUI_AUXILIARY_TYPES
+        )));
+    }
+
+    let parent_id = input
+        .pui_parent_id
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            error("pui_parent_id must be a non-empty string when prepare_pui_auxiliary is true")
+        })?;
+
+    if input.record.is_null() {
+        return Err(error(
+            "record payload must not be null for auxiliary document",
+        ));
+    }
+
+    let aux_json_str = input
+        .pui_auxiliary_json
+        .as_ref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| {
+            error(
+                "pui_auxiliary_json must be a non-empty string when prepare_pui_auxiliary is true",
+            )
+        })?;
+
+    let parsed_aux: Value = serde_json::from_str(aux_json_str).map_err(|err| {
+        error(format!(
+            "pui_auxiliary_json must be a valid JSON string: {err}"
+        ))
+    })?;
+
+    assert_json_type_strict_equal(&input.record, &parsed_aux, "pui_auxiliary_json")?;
+
+    match input.record_type.as_str() {
+        "resource_ordered_records" => {
+            if !input.record.is_object() && !input.record.is_array() {
+                return Err(error(
+                    "record for resource_ordered_records must be an object or array",
+                ));
+            }
+            if !input.uri.ends_with("/ordered_records") {
+                return Err(error(format!(
+                    "uri for resource_ordered_records must end with '/ordered_records': '{}'",
+                    input.uri
+                )));
+            }
+            if !input.uri.starts_with(parent_id) {
+                return Err(error(format!(
+                    "uri '{}' must start with parent_id '{}' for resource_ordered_records",
+                    input.uri, parent_id
+                )));
+            }
+        }
+        "tree_root" => {
+            if !input.record.is_object() {
+                return Err(error("record for tree_root must be an object"));
+            }
+            if !input.uri.ends_with("/tree/root") {
+                return Err(error(format!(
+                    "uri for tree_root must end with '/tree/root': '{}'",
+                    input.uri
+                )));
+            }
+            if !input.uri.starts_with(parent_id) {
+                return Err(error(format!(
+                    "uri '{}' must start with parent_id '{}' for tree_root",
+                    input.uri, parent_id
+                )));
+            }
+        }
+        "tree_waypoint" => {
+            if !input.record.is_array() {
+                return Err(error("record for tree_waypoint must be an array"));
+            }
+            if !input.uri.contains("/tree/waypoint_") {
+                return Err(error(format!(
+                    "uri for tree_waypoint must contain '/tree/waypoint_': '{}'",
+                    input.uri
+                )));
+            }
+        }
+        "tree_node" => {
+            if !input.record.is_object() {
+                return Err(error("record for tree_node must be an object"));
+            }
+            if !input.uri.contains("/tree/node_") {
+                return Err(error(format!(
+                    "uri for tree_node must contain '/tree/node_': '{}'",
+                    input.uri
+                )));
+            }
+        }
+        "tree_node_from_root" => {
+            if !input.record.is_object() {
+                return Err(error("record for tree_node_from_root must be an object"));
+            }
+            if !input.uri.contains("/tree/node_from_root_") {
+                return Err(error(format!(
+                    "uri for tree_node_from_root must contain '/tree/node_from_root_': '{}'",
+                    input.uri
+                )));
+            }
+        }
+        _ => unreachable!(),
+    }
+
+    let mut document = Map::new();
+    document.insert("id".to_string(), Value::String(input.uri.clone()));
+    document.insert("uri".to_string(), Value::String(input.uri.clone()));
+    document.insert(
+        "pui_parent_id".to_string(),
+        Value::String(parent_id.to_string()),
+    );
+    document.insert("publish".to_string(), Value::String("true".to_string()));
+    document.insert(
+        "primary_type".to_string(),
+        Value::String(input.record_type.clone()),
+    );
+    document.insert(
+        "types".to_string(),
+        Value::Array(vec![Value::String("pui".to_string())]),
+    );
+    document.insert("json".to_string(), Value::String(aux_json_str.clone()));
+
+    let mut marker = Map::new();
+    marker.insert(
+        "marker".to_string(),
+        Value::String(PUI_AUXILIARY_METADATA_MARKER.to_string()),
+    );
+    marker.insert(
+        "auxiliary_type".to_string(),
+        Value::String(input.record_type.clone()),
+    );
+    document.insert(
+        PUI_AUXILIARY_DOCUMENTS_KEY.to_string(),
+        Value::Object(marker),
+    );
+
+    Ok(Value::Object(document))
+}
+
 pub fn build_index_document(input: IndexDocumentInput) -> Result<Value, IndexDocumentError> {
     if input.uri.trim().is_empty() {
         return Err(error("uri must not be empty"));
@@ -3122,6 +3417,35 @@ pub fn build_index_document(input: IndexDocumentInput) -> Result<Value, IndexDoc
     if input.prepare_pui_final && input.prepare_pui_availability {
         return Err(error(
             "cannot combine prepare_pui_final (pui) and prepare_pui_availability in same record",
+        ));
+    }
+    if input.prepare_pui_auxiliary {
+        if input.enrich || input.prepare_pui_final || input.prepare_pui_availability {
+            return Err(error(
+                "cannot combine prepare_pui_auxiliary with other preparation modes",
+            ));
+        }
+        if input.arks_enabled
+            || !input.dynamic_enum_fields.is_empty()
+            || input.accession_date_unknown_label.is_some()
+            || input.parsed_accession_date_year.is_some()
+            || input.pui_candidate_record.is_some()
+            || input.record_inheritance_has_type.is_some()
+        {
+            return Err(error(
+                "cannot set staff enrichment or pui final/availability fields when prepare_pui_auxiliary is true",
+            ));
+        }
+        return build_pui_auxiliary_document(&input);
+    }
+    if input.pui_parent_id.is_some() {
+        return Err(error(
+            "pui_parent_id is only allowed when prepare_pui_auxiliary is true",
+        ));
+    }
+    if input.pui_auxiliary_json.is_some() {
+        return Err(error(
+            "pui_auxiliary_json is only allowed when prepare_pui_auxiliary is true",
         ));
     }
 
@@ -8760,5 +9084,539 @@ mod tests {
             assert_eq!(tc_override["publish"], val);
             assert_eq!(tc_override["additions"], json!(["pui_container", "pui"]));
         }
+    }
+
+    #[test]
+    fn test_pui_auxiliary_all_kinds_and_shapes() {
+        // 1. resource_ordered_records
+        let ord_record = json!({
+            "uris": ["/repositories/2/archival_objects/1", "/repositories/2/archival_objects/2"]
+        });
+        let ord_input = IndexDocumentInput {
+            uri: "/repositories/2/resources/10/ordered_records".to_string(),
+            record_type: "resource_ordered_records".to_string(),
+            pui_parent_id: Some("/repositories/2/resources/10".to_string()),
+            record: ord_record.clone(),
+            pui_auxiliary_json: Some(serde_json::to_string(&ord_record).unwrap()),
+            prepare_pui_auxiliary: true,
+            ..Default::default()
+        };
+        let ord_doc = build_index_document(ord_input).unwrap();
+        assert_eq!(
+            ord_doc["id"],
+            "/repositories/2/resources/10/ordered_records"
+        );
+        assert_eq!(
+            ord_doc["uri"],
+            "/repositories/2/resources/10/ordered_records"
+        );
+        assert_eq!(ord_doc["pui_parent_id"], "/repositories/2/resources/10");
+        assert_eq!(ord_doc["publish"], "true");
+        assert!(ord_doc["publish"].is_string());
+        assert_ne!(ord_doc["publish"], true);
+        assert_eq!(ord_doc["primary_type"], "resource_ordered_records");
+        assert_eq!(ord_doc["types"], json!(["pui"]));
+        let ord_parsed: Value = serde_json::from_str(ord_doc["json"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            ord_parsed["uris"],
+            json!([
+                "/repositories/2/archival_objects/1",
+                "/repositories/2/archival_objects/2"
+            ])
+        );
+        let ord_meta = ord_doc[PUI_AUXILIARY_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(ord_meta["marker"], PUI_AUXILIARY_METADATA_MARKER);
+        assert_eq!(ord_meta["auxiliary_type"], "resource_ordered_records");
+
+        // 2. tree_root
+        let root_record = json!({
+            "title": "Root Collection",
+            "waypoints": 3
+        });
+        let root_input = IndexDocumentInput {
+            uri: "/repositories/2/resources/10/tree/root".to_string(),
+            record_type: "tree_root".to_string(),
+            pui_parent_id: Some("/repositories/2/resources/10".to_string()),
+            record: root_record.clone(),
+            pui_auxiliary_json: Some(serde_json::to_string(&root_record).unwrap()),
+            prepare_pui_auxiliary: true,
+            ..Default::default()
+        };
+        let root_doc = build_index_document(root_input).unwrap();
+        assert_eq!(root_doc["id"], "/repositories/2/resources/10/tree/root");
+        assert_eq!(root_doc["uri"], "/repositories/2/resources/10/tree/root");
+        assert_eq!(root_doc["pui_parent_id"], "/repositories/2/resources/10");
+        assert_eq!(root_doc["publish"], "true");
+        assert_eq!(root_doc["primary_type"], "tree_root");
+        assert_eq!(root_doc["types"], json!(["pui"]));
+        let root_meta = root_doc[PUI_AUXILIARY_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(root_meta["marker"], PUI_AUXILIARY_METADATA_MARKER);
+        assert_eq!(root_meta["auxiliary_type"], "tree_root");
+
+        // 3. tree_waypoint
+        let wp_record = json!([
+            {"uri": "/repositories/2/archival_objects/1", "child_count": 2},
+            {"uri": "/repositories/2/archival_objects/2", "child_count": 0}
+        ]);
+        let wp_input = IndexDocumentInput {
+            uri: "/repositories/2/resources/10/tree/waypoint__0".to_string(),
+            record_type: "tree_waypoint".to_string(),
+            pui_parent_id: Some("/repositories/2/resources/10".to_string()),
+            record: wp_record.clone(),
+            pui_auxiliary_json: Some(serde_json::to_string(&wp_record).unwrap()),
+            prepare_pui_auxiliary: true,
+            ..Default::default()
+        };
+        let wp_doc = build_index_document(wp_input).unwrap();
+        assert_eq!(
+            wp_doc["id"],
+            "/repositories/2/resources/10/tree/waypoint__0"
+        );
+        assert_eq!(
+            wp_doc["uri"],
+            "/repositories/2/resources/10/tree/waypoint__0"
+        );
+        assert_eq!(wp_doc["pui_parent_id"], "/repositories/2/resources/10");
+        assert_eq!(wp_doc["publish"], "true");
+        assert_eq!(wp_doc["primary_type"], "tree_waypoint");
+        assert_eq!(wp_doc["types"], json!(["pui"]));
+        let wp_meta = wp_doc[PUI_AUXILIARY_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(wp_meta["marker"], PUI_AUXILIARY_METADATA_MARKER);
+        assert_eq!(wp_meta["auxiliary_type"], "tree_waypoint");
+
+        // 4. tree_node
+        let node_record = json!({
+            "uri": "/repositories/2/archival_objects/1",
+            "title": "Series 1",
+            "waypoints": 1
+        });
+        let node_input = IndexDocumentInput {
+            uri: "/repositories/2/resources/10/tree/node_/repositories/2/archival_objects/1"
+                .to_string(),
+            record_type: "tree_node".to_string(),
+            pui_parent_id: Some("/repositories/2/archival_objects/1".to_string()),
+            record: node_record.clone(),
+            pui_auxiliary_json: Some(serde_json::to_string(&node_record).unwrap()),
+            prepare_pui_auxiliary: true,
+            ..Default::default()
+        };
+        let node_doc = build_index_document(node_input).unwrap();
+        assert_eq!(
+            node_doc["id"],
+            "/repositories/2/resources/10/tree/node_/repositories/2/archival_objects/1"
+        );
+        assert_eq!(
+            node_doc["uri"],
+            "/repositories/2/resources/10/tree/node_/repositories/2/archival_objects/1"
+        );
+        assert_eq!(
+            node_doc["pui_parent_id"],
+            "/repositories/2/archival_objects/1"
+        );
+        assert_eq!(node_doc["publish"], "true");
+        assert_eq!(node_doc["primary_type"], "tree_node");
+        assert_eq!(node_doc["types"], json!(["pui"]));
+        let node_meta = node_doc[PUI_AUXILIARY_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(node_meta["marker"], PUI_AUXILIARY_METADATA_MARKER);
+        assert_eq!(node_meta["auxiliary_type"], "tree_node");
+
+        // 5. tree_node_from_root
+        let path_record = json!({
+            "42": [{"node": "/repositories/2/resources/10", "offset": 0}]
+        });
+        let path_input = IndexDocumentInput {
+            uri: "/repositories/2/resources/10/tree/node_from_root_42".to_string(),
+            record_type: "tree_node_from_root".to_string(),
+            pui_parent_id: Some("/repositories/2/archival_objects/42".to_string()),
+            record: path_record.clone(),
+            pui_auxiliary_json: Some(serde_json::to_string(&path_record).unwrap()),
+            prepare_pui_auxiliary: true,
+            ..Default::default()
+        };
+        let path_doc = build_index_document(path_input).unwrap();
+        assert_eq!(
+            path_doc["id"],
+            "/repositories/2/resources/10/tree/node_from_root_42"
+        );
+        assert_eq!(
+            path_doc["uri"],
+            "/repositories/2/resources/10/tree/node_from_root_42"
+        );
+        assert_eq!(
+            path_doc["pui_parent_id"],
+            "/repositories/2/archival_objects/42"
+        );
+        assert_eq!(path_doc["publish"], "true");
+        assert_eq!(path_doc["primary_type"], "tree_node_from_root");
+        assert_eq!(path_doc["types"], json!(["pui"]));
+        let path_meta = path_doc[PUI_AUXILIARY_DOCUMENTS_KEY].as_object().unwrap();
+        assert_eq!(path_meta["marker"], PUI_AUXILIARY_METADATA_MARKER);
+        assert_eq!(path_meta["auxiliary_type"], "tree_node_from_root");
+    }
+
+    #[test]
+    fn test_pui_auxiliary_unicode_and_nested_json() {
+        let record = json!({
+            "uri": "/repositories/2/archival_objects/Séan_Sánchez_日本語_🎉",
+            "title": "Muintir na hÉireann & Sánchez Papers / 記録",
+            "nested": {
+                "levels": [
+                    {"deep": {"key": "luach", "list": ["a", "b", "c"]}}
+                ]
+            }
+        });
+        let raw_json = serde_json::to_string(&record).unwrap();
+        let unicode_input = IndexDocumentInput {
+            uri: "/repositories/2/resources/99/tree/node_/repositories/2/archival_objects/Séan_Sánchez_日本語_🎉".to_string(),
+            record_type: "tree_node".to_string(),
+            pui_parent_id: Some("/repositories/2/archival_objects/Séan_Sánchez_日本語_🎉".to_string()),
+            record: record.clone(),
+            pui_auxiliary_json: Some(raw_json.clone()),
+            prepare_pui_auxiliary: true,
+            ..Default::default()
+        };
+        let doc = build_index_document(unicode_input).unwrap();
+        assert_eq!(doc["id"], "/repositories/2/resources/99/tree/node_/repositories/2/archival_objects/Séan_Sánchez_日本語_🎉");
+        assert_eq!(
+            doc["pui_parent_id"],
+            "/repositories/2/archival_objects/Séan_Sánchez_日本語_🎉"
+        );
+        assert_eq!(doc["json"], raw_json);
+        let parsed: Value = serde_json::from_str(doc["json"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            parsed["title"],
+            "Muintir na hÉireann & Sánchez Papers / 記録"
+        );
+        assert_eq!(parsed["nested"]["levels"][0]["deep"]["key"], "luach");
+    }
+
+    #[test]
+    fn test_pui_auxiliary_verbatim_json_passthrough() {
+        // Noncanonical key ordering in pui_auxiliary_json is preserved verbatim when semantically equal
+        let record = json!({"alpha": 1, "beta": 2});
+        let noncanonical_json = "{\"beta\":2,\"alpha\":1}".to_string();
+        let input = IndexDocumentInput {
+            uri: "/repositories/2/resources/10/tree/root".to_string(),
+            record_type: "tree_root".to_string(),
+            pui_parent_id: Some("/repositories/2/resources/10".to_string()),
+            record,
+            pui_auxiliary_json: Some(noncanonical_json.clone()),
+            prepare_pui_auxiliary: true,
+            ..Default::default()
+        };
+        let doc = build_index_document(input).unwrap();
+        assert_eq!(doc["json"], noncanonical_json);
+    }
+
+    #[test]
+    fn test_pui_auxiliary_batch_ordering_and_isolation() {
+        let rec1 = json!({"item": 1});
+        let rec2 = json!({"item": 2});
+        let rec3 = json!([{"item": 3}]);
+        let records = vec![
+            IndexDocumentInput {
+                uri: "/repositories/2/resources/1/ordered_records".to_string(),
+                record_type: "resource_ordered_records".to_string(),
+                pui_parent_id: Some("/repositories/2/resources/1".to_string()),
+                record: rec1.clone(),
+                pui_auxiliary_json: Some(serde_json::to_string(&rec1).unwrap()),
+                prepare_pui_auxiliary: true,
+                ..Default::default()
+            },
+            IndexDocumentInput {
+                uri: "/repositories/2/resources/1/tree/root".to_string(),
+                record_type: "tree_root".to_string(),
+                pui_parent_id: Some("/repositories/2/resources/1".to_string()),
+                record: rec2.clone(),
+                pui_auxiliary_json: Some(serde_json::to_string(&rec2).unwrap()),
+                prepare_pui_auxiliary: true,
+                ..Default::default()
+            },
+            IndexDocumentInput {
+                uri: "/repositories/2/resources/1/tree/waypoint_parent_0".to_string(),
+                record_type: "tree_waypoint".to_string(),
+                pui_parent_id: Some("/repositories/2/resources/1".to_string()),
+                record: rec3.clone(),
+                pui_auxiliary_json: Some(serde_json::to_string(&rec3).unwrap()),
+                prepare_pui_auxiliary: true,
+                ..Default::default()
+            },
+        ];
+        let response = build_index_document_batch(IndexDocumentBatchRequest { records }).unwrap();
+        assert_eq!(response.documents.len(), 3);
+        assert_eq!(
+            response.documents[0]["uri"],
+            "/repositories/2/resources/1/ordered_records"
+        );
+        assert_eq!(
+            response.documents[1]["uri"],
+            "/repositories/2/resources/1/tree/root"
+        );
+        assert_eq!(
+            response.documents[2]["uri"],
+            "/repositories/2/resources/1/tree/waypoint_parent_0"
+        );
+    }
+
+    #[test]
+    fn test_pui_auxiliary_duplicates_supported() {
+        let rec = json!({"title": "Root"});
+        let input_item = IndexDocumentInput {
+            uri: "/repositories/2/resources/5/tree/root".to_string(),
+            record_type: "tree_root".to_string(),
+            pui_parent_id: Some("/repositories/2/resources/5".to_string()),
+            record: rec.clone(),
+            pui_auxiliary_json: Some(serde_json::to_string(&rec).unwrap()),
+            prepare_pui_auxiliary: true,
+            ..Default::default()
+        };
+        let response = build_index_document_batch(IndexDocumentBatchRequest {
+            records: vec![input_item.clone(), input_item],
+        })
+        .unwrap();
+        assert_eq!(response.documents.len(), 2);
+        assert_eq!(
+            response.documents[0]["id"],
+            "/repositories/2/resources/5/tree/root"
+        );
+        assert_eq!(
+            response.documents[1]["id"],
+            "/repositories/2/resources/5/tree/root"
+        );
+    }
+
+    #[test]
+    fn test_pui_auxiliary_validation_rejections() {
+        let valid_rec = json!({"title": "Root"});
+        let valid_json = serde_json::to_string(&valid_rec).unwrap();
+
+        // 1. Missing parent_id
+        let no_parent = IndexDocumentInput {
+            uri: "/repositories/2/resources/5/tree/root".to_string(),
+            record_type: "tree_root".to_string(),
+            pui_parent_id: None,
+            record: valid_rec.clone(),
+            pui_auxiliary_json: Some(valid_json.clone()),
+            prepare_pui_auxiliary: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(no_parent).is_err());
+
+        // 2. Empty parent_id
+        let empty_parent = IndexDocumentInput {
+            uri: "/repositories/2/resources/5/tree/root".to_string(),
+            record_type: "tree_root".to_string(),
+            pui_parent_id: Some("   ".to_string()),
+            record: valid_rec.clone(),
+            pui_auxiliary_json: Some(valid_json.clone()),
+            prepare_pui_auxiliary: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(empty_parent).is_err());
+
+        // 3. Null record
+        let null_rec = IndexDocumentInput {
+            uri: "/repositories/2/resources/5/tree/root".to_string(),
+            record_type: "tree_root".to_string(),
+            pui_parent_id: Some("/repositories/2/resources/5".to_string()),
+            record: Value::Null,
+            pui_auxiliary_json: Some(valid_json.clone()),
+            prepare_pui_auxiliary: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(null_rec).is_err());
+
+        // 4. Invalid record_type
+        let bad_type = IndexDocumentInput {
+            uri: "/repositories/2/resources/5/tree/root".to_string(),
+            record_type: "archival_object".to_string(),
+            pui_parent_id: Some("/repositories/2/resources/5".to_string()),
+            record: valid_rec.clone(),
+            pui_auxiliary_json: Some(valid_json.clone()),
+            prepare_pui_auxiliary: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(bad_type).is_err());
+
+        // 5. tree_waypoint with object instead of array
+        let wp_not_array = IndexDocumentInput {
+            uri: "/repositories/2/resources/5/tree/waypoint__0".to_string(),
+            record_type: "tree_waypoint".to_string(),
+            pui_parent_id: Some("/repositories/2/resources/5".to_string()),
+            record: json!({"not": "an_array"}),
+            pui_auxiliary_json: Some("{\"not\":\"an_array\"}".to_string()),
+            prepare_pui_auxiliary: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(wp_not_array).is_err());
+
+        // 6. tree_node with array instead of object
+        let node_not_obj = IndexDocumentInput {
+            uri: "/repositories/2/resources/5/tree/node_1".to_string(),
+            record_type: "tree_node".to_string(),
+            pui_parent_id: Some("/repositories/2/resources/5".to_string()),
+            record: json!(["not", "an_object"]),
+            pui_auxiliary_json: Some("[\"not\",\"an_object\"]".to_string()),
+            prepare_pui_auxiliary: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(node_not_obj).is_err());
+
+        // 7. Cannot combine with enrich
+        let comb_enrich = IndexDocumentInput {
+            uri: "/repositories/2/resources/5/tree/root".to_string(),
+            record_type: "tree_root".to_string(),
+            pui_parent_id: Some("/repositories/2/resources/5".to_string()),
+            record: valid_rec.clone(),
+            pui_auxiliary_json: Some(valid_json.clone()),
+            prepare_pui_auxiliary: true,
+            enrich: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(comb_enrich).is_err());
+
+        // 8. Cannot combine with prepare_pui_final
+        let comb_final = IndexDocumentInput {
+            uri: "/repositories/2/resources/5/tree/root".to_string(),
+            record_type: "tree_root".to_string(),
+            pui_parent_id: Some("/repositories/2/resources/5".to_string()),
+            record: valid_rec.clone(),
+            pui_auxiliary_json: Some(valid_json.clone()),
+            prepare_pui_auxiliary: true,
+            prepare_pui_final: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(comb_final).is_err());
+
+        // 9. Cannot combine with prepare_pui_availability
+        let comb_avail = IndexDocumentInput {
+            uri: "/repositories/2/resources/5/tree/root".to_string(),
+            record_type: "tree_root".to_string(),
+            pui_parent_id: Some("/repositories/2/resources/5".to_string()),
+            record: valid_rec.clone(),
+            pui_auxiliary_json: Some(valid_json.clone()),
+            prepare_pui_auxiliary: true,
+            prepare_pui_availability: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(comb_avail).is_err());
+
+        // 10. pui_parent_id without prepare_pui_auxiliary is rejected
+        let parent_without_flag = IndexDocumentInput {
+            uri: "/repositories/2/resources/5".to_string(),
+            record_type: "resource".to_string(),
+            pui_parent_id: Some("/repositories/2/resources/5".to_string()),
+            record: json!({"title": "Res"}),
+            prepare_pui_auxiliary: false,
+            ..Default::default()
+        };
+        assert!(build_index_document(parent_without_flag).is_err());
+
+        // 11. pui_auxiliary_json without prepare_pui_auxiliary is rejected
+        let aux_json_without_flag = IndexDocumentInput {
+            uri: "/repositories/2/resources/5".to_string(),
+            record_type: "resource".to_string(),
+            pui_auxiliary_json: Some("{}".to_string()),
+            record: json!({"title": "Res"}),
+            prepare_pui_auxiliary: false,
+            ..Default::default()
+        };
+        assert!(build_index_document(aux_json_without_flag).is_err());
+
+        // 12. Missing pui_auxiliary_json
+        let no_aux_json = IndexDocumentInput {
+            uri: "/repositories/2/resources/5/tree/root".to_string(),
+            record_type: "tree_root".to_string(),
+            pui_parent_id: Some("/repositories/2/resources/5".to_string()),
+            record: valid_rec.clone(),
+            pui_auxiliary_json: None,
+            prepare_pui_auxiliary: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(no_aux_json).is_err());
+
+        // 13. Empty pui_auxiliary_json
+        let empty_aux_json = IndexDocumentInput {
+            uri: "/repositories/2/resources/5/tree/root".to_string(),
+            record_type: "tree_root".to_string(),
+            pui_parent_id: Some("/repositories/2/resources/5".to_string()),
+            record: valid_rec.clone(),
+            pui_auxiliary_json: Some("   ".to_string()),
+            prepare_pui_auxiliary: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(empty_aux_json).is_err());
+
+        // 14. Malformed JSON in pui_auxiliary_json
+        let malformed_aux_json = IndexDocumentInput {
+            uri: "/repositories/2/resources/5/tree/root".to_string(),
+            record_type: "tree_root".to_string(),
+            pui_parent_id: Some("/repositories/2/resources/5".to_string()),
+            record: valid_rec.clone(),
+            pui_auxiliary_json: Some("{not valid json".to_string()),
+            prepare_pui_auxiliary: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(malformed_aux_json).is_err());
+
+        // 15. Semantic mismatch between record and pui_auxiliary_json
+        let mismatch_aux_json = IndexDocumentInput {
+            uri: "/repositories/2/resources/5/tree/root".to_string(),
+            record_type: "tree_root".to_string(),
+            pui_parent_id: Some("/repositories/2/resources/5".to_string()),
+            record: valid_rec.clone(),
+            pui_auxiliary_json: Some("{\"title\":\"Different Title\"}".to_string()),
+            prepare_pui_auxiliary: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(mismatch_aux_json).is_err());
+
+        // 16. Type mismatch: integer vs float
+        let int_float_mismatch = IndexDocumentInput {
+            uri: "/repositories/2/resources/5/tree/root".to_string(),
+            record_type: "tree_root".to_string(),
+            pui_parent_id: Some("/repositories/2/resources/5".to_string()),
+            record: json!({"count": 1}),
+            pui_auxiliary_json: Some("{\"count\":1.0}".to_string()),
+            prepare_pui_auxiliary: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(int_float_mismatch).is_err());
+
+        // 17. Type mismatch: bool vs int
+        let bool_int_mismatch = IndexDocumentInput {
+            uri: "/repositories/2/resources/5/tree/root".to_string(),
+            record_type: "tree_root".to_string(),
+            pui_parent_id: Some("/repositories/2/resources/5".to_string()),
+            record: json!({"flag": true}),
+            pui_auxiliary_json: Some("{\"flag\":1}".to_string()),
+            prepare_pui_auxiliary: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(bool_int_mismatch).is_err());
+
+        // 18. Type mismatch: bool vs string
+        let bool_str_mismatch = IndexDocumentInput {
+            uri: "/repositories/2/resources/5/tree/root".to_string(),
+            record_type: "tree_root".to_string(),
+            pui_parent_id: Some("/repositories/2/resources/5".to_string()),
+            record: json!({"flag": true}),
+            pui_auxiliary_json: Some("{\"flag\":\"true\"}".to_string()),
+            prepare_pui_auxiliary: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(bool_str_mismatch).is_err());
+
+        // 19. Type mismatch: string vs integer
+        let str_int_mismatch = IndexDocumentInput {
+            uri: "/repositories/2/resources/5/tree/root".to_string(),
+            record_type: "tree_root".to_string(),
+            pui_parent_id: Some("/repositories/2/resources/5".to_string()),
+            record: json!({"val": "42"}),
+            pui_auxiliary_json: Some("{\"val\":42}".to_string()),
+            prepare_pui_auxiliary: true,
+            ..Default::default()
+        };
+        assert!(build_index_document(str_int_mismatch).is_err());
     }
 }

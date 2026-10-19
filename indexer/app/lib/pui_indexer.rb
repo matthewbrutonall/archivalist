@@ -367,18 +367,79 @@ class PUIIndexer < PeriodicIndexer
   end
 
   def add_infscroll_docs(resource_uris, batch)
-    resource_uris.each do |resource_uri|
-      json = JSONModel::HTTP.get_json(resource_uri + '/ordered_records')
+    return if resource_uris.empty?
 
-      batch << {
-        'id' => "#{resource_uri}/ordered_records",
-        'uri' => "#{resource_uri}/ordered_records",
-        'pui_parent_id' => resource_uri,
-        'publish' => "true",
-        'primary_type' => "resource_ordered_records",
-        'types' => ['pui'],
-        'json' => ASUtils.to_json(json)
-      }
+    if rust_pui_auxiliary_documents_enabled?
+      fetched = []
+      begin
+        resource_uris.each do |resource_uri|
+          json = JSONModel::HTTP.get_json(resource_uri + '/ordered_records')
+          authoritative_json = ASUtils.to_json(json)
+          fetched << [resource_uri, json, authoritative_json]
+        end
+      rescue => e
+        # Preserve exact native observable behavior: on a fetch exception after earlier
+        # successful fetches, ensure the documents for all earlier successful fetches
+        # are appended in original order using native construction, then re-raise the
+        # original exception. Do not invoke the sidecar after the fetch failure.
+        fetched.each do |resource_uri, _json, authoritative_json|
+          batch << {
+            'id' => "#{resource_uri}/ordered_records",
+            'uri' => "#{resource_uri}/ordered_records",
+            'pui_parent_id' => resource_uri,
+            'publish' => "true",
+            'primary_type' => "resource_ordered_records",
+            'types' => ['pui'],
+            'json' => authoritative_json
+          }
+        end
+        raise e
+      end
+
+      return if fetched.empty?
+
+      inputs = fetched.map do |resource_uri, json, authoritative_json|
+        {
+          'uri' => "#{resource_uri}/ordered_records",
+          'record_type' => "resource_ordered_records",
+          'pui_parent_id' => resource_uri,
+          'record' => json,
+          'pui_auxiliary_json' => authoritative_json,
+          'prepare_pui_auxiliary' => true,
+        }
+      end
+
+      begin
+        docs = rust_index_document_builder.build_pui_auxiliary(inputs)
+        docs.each { |doc| batch << doc }
+      rescue => e
+        Log.warn("Rust PUI auxiliary document builder failed in add_infscroll_docs; using native fallback: #{e.class}: #{e.message}") if defined?(Log) && Log.respond_to?(:warn)
+        fetched.each do |resource_uri, _json, authoritative_json|
+          batch << {
+            'id' => "#{resource_uri}/ordered_records",
+            'uri' => "#{resource_uri}/ordered_records",
+            'pui_parent_id' => resource_uri,
+            'publish' => "true",
+            'primary_type' => "resource_ordered_records",
+            'types' => ['pui'],
+            'json' => authoritative_json
+          }
+        end
+      end
+    else
+      resource_uris.each do |resource_uri|
+        json = JSONModel::HTTP.get_json(resource_uri + '/ordered_records')
+
+        batch << {
+          'id' => "#{resource_uri}/ordered_records",
+          'uri' => "#{resource_uri}/ordered_records",
+          'pui_parent_id' => resource_uri,
+          'publish' => "true",
+          'primary_type' => "resource_ordered_records",
+          'types' => ['pui'],
+          'json' => ASUtils.to_json(json)
+        }
+      end
     end
   end
 
@@ -441,7 +502,7 @@ class PUIIndexer < PeriodicIndexer
     add_infscroll_docs(tree_uris.select {|uri| JSONModel.parse_reference(uri).fetch(:type) == 'resource'},
                        batch)
 
-    tree_indexer = LargeTreeDocIndexer.new(batch)
+    tree_indexer = LargeTreeDocIndexer.new(batch, rust_index_document_builder)
     tree_indexer.add_largetree_docs(tree_uris)
 
     if batch.length > 0

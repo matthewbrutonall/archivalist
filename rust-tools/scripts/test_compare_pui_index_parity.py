@@ -561,6 +561,62 @@ class TestPuiParityComparator(unittest.TestCase):
             os.environ.pop("TEST_GEN_USER", None)
             os.environ.pop("TEST_GEN_PASS", None)
 
+    def test_pui_auxiliary_document_structure_and_parity(self) -> None:
+        """PUI auxiliary documents match exact native shape and pass parity."""
+        aux_types = [
+            ("resource_ordered_records", "/repositories/2/resources/10/ordered_records", "/repositories/2/resources/10"),
+            ("tree_root", "/repositories/2/resources/10/tree/root", "/repositories/2/resources/10"),
+            ("tree_waypoint", "/repositories/2/resources/10/tree/waypoint__0", "/repositories/2/resources/10"),
+            ("tree_node", "/repositories/2/resources/10/tree/node_/repositories/2/archival_objects/1", "/repositories/2/archival_objects/1"),
+            ("tree_node_from_root", "/repositories/2/resources/10/tree/node_from_root_42", "/repositories/2/archival_objects/42"),
+        ]
+        for ptype, uri, parent_id in aux_types:
+            payload = [{"uri": f"{uri}/1", "child_count": 0}] if ptype == "tree_waypoint" else {"test": "value"}
+            doc = {
+                "id": uri,
+                "uri": uri,
+                "pui_parent_id": parent_id,
+                "publish": "true",
+                "primary_type": ptype,
+                "types": ["pui"],
+                "json": json.dumps(payload),
+            }
+            cand = dict(doc)
+            ok, reasons = comparator.compare_pui_document(doc, cand, comparator.DEFAULT_IGNORED_FIELDS)
+            self.assertTrue(ok, f"failed for {ptype}: {reasons}")
+
+    def test_pui_auxiliary_document_marker_leak_fails(self) -> None:
+        """Leaked _archivalist marker in candidate auxiliary document fails parity immediately."""
+        doc = {
+            "id": "/repositories/2/resources/10/tree/root",
+            "uri": "/repositories/2/resources/10/tree/root",
+            "pui_parent_id": "/repositories/2/resources/10",
+            "publish": "true",
+            "primary_type": "tree_root",
+            "types": ["pui"],
+            "json": json.dumps({"title": "Root"}),
+        }
+        cand_leaked = dict(doc, _archivalist_pui_auxiliary={"marker": "pui_auxiliary_document_metadata"})
+        ok, reasons = comparator.compare_pui_document(doc, cand_leaked, comparator.DEFAULT_IGNORED_FIELDS)
+        self.assertFalse(ok)
+        self.assertTrue(any("candidate privacy leak" in r or "private handoff field" in r for r in reasons))
+
+    def test_pui_auxiliary_document_type_coercion_fails(self) -> None:
+        """Boolean publish in candidate auxiliary document fails type-strict check against string 'true'."""
+        doc = {
+            "id": "/repositories/2/resources/10/tree/root",
+            "uri": "/repositories/2/resources/10/tree/root",
+            "pui_parent_id": "/repositories/2/resources/10",
+            "publish": "true",
+            "primary_type": "tree_root",
+            "types": ["pui"],
+            "json": json.dumps({"title": "Root"}),
+        }
+        cand_bool = dict(doc, publish=True)
+        ok, reasons = comparator.compare_pui_document(doc, cand_bool, comparator.DEFAULT_IGNORED_FIELDS)
+        self.assertFalse(ok)
+        self.assertTrue(any("publish: type mismatch" in r for r in reasons))
+
 
 if __name__ == "__main__":
     unittest.main()

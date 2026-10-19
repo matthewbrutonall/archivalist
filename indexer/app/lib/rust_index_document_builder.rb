@@ -59,6 +59,29 @@ class RustIndexDocumentBuilder
     'additions',
   ].freeze
 
+  PUI_AUXILIARY_FIELDS = [
+    'id',
+    'uri',
+    'pui_parent_id',
+    'publish',
+    'primary_type',
+    'types',
+    'json',
+  ].freeze
+
+  PUI_AUXILIARY_META_FIELDS = [
+    'marker',
+    'auxiliary_type',
+  ].freeze
+
+  PUI_AUXILIARY_TYPES = [
+    'resource_ordered_records',
+    'tree_root',
+    'tree_waypoint',
+    'tree_node',
+    'tree_node_from_root',
+  ].freeze
+
   def self.compute_pui_conditional_additions(primary_type, record_inheritance_has_type)
     additions = []
     if ['accession', 'digital_object', 'digital_object_component'].include?(primary_type)
@@ -85,6 +108,136 @@ class RustIndexDocumentBuilder
   def initialize(base_url, timeout_seconds)
     @url = URI.parse("#{base_url.to_s.chomp('/')}/index/documents")
     @timeout_seconds = timeout_seconds.to_f
+  end
+
+  def build_pui_auxiliary(inputs)
+    return [] if inputs.empty?
+
+    raise "inputs must be an Array" unless inputs.is_a?(Array)
+    maximum = 1000
+    if inputs.length > maximum
+      raise "inputs exceeds maximum batch size of #{maximum}"
+    end
+
+    inputs.each do |input|
+      raise "input must be a Hash" unless input.is_a?(Hash)
+      raise "input.prepare_pui_auxiliary must be explicitly true" unless input['prepare_pui_auxiliary'] == true
+      uri = input['uri']
+      raise "input.uri must be a non-empty string" unless uri.is_a?(String) && !uri.strip.empty?
+      record_type = input['record_type']
+      raise "invalid record_type #{record_type.inspect}" unless PUI_AUXILIARY_TYPES.include?(record_type)
+      parent_id = input['pui_parent_id']
+      raise "pui_parent_id must be a non-empty string" unless parent_id.is_a?(String) && !parent_id.strip.empty?
+      raise "input.record must not be nil" if input['record'].nil?
+      raise "input.record must be a Hash or Array" unless input['record'].is_a?(Hash) || input['record'].is_a?(Array)
+      aux_json = input['pui_auxiliary_json']
+      raise "pui_auxiliary_json must be a non-empty string" unless aux_json.is_a?(String) && !aux_json.strip.empty?
+    end
+
+    request = Net::HTTP::Post.new(@url.request_uri)
+    request['Content-Type'] = 'application/json'
+    request.body = ASUtils.to_json('records' => inputs)
+    response = perform_request(request)
+    raise "HTTP #{response.code}" unless response.code == '200'
+
+    payload = ASUtils.json_parse(response.body)
+    raise 'unexpected response identity' unless payload['served_by'] == EXPECTED_SERVER
+    documents = payload['documents']
+    raise 'response documents must be an array' unless documents.is_a?(Array)
+    raise 'response document count mismatch' unless documents.length == inputs.length
+
+    result = []
+    documents.zip(inputs).each_with_index do |(doc, input), idx|
+      raise "response document must be a Hash at index #{idx}" unless doc.is_a?(Hash)
+
+      uri = input['uri']
+      parent_id = input['pui_parent_id']
+      record_type = input['record_type']
+      record = input['record']
+
+      if doc.keys.any? { |k| !k.is_a?(String) }
+        raise "non-string key found in response document at index #{idx}"
+      end
+
+      expected_keys = PUI_AUXILIARY_FIELDS + ['_archivalist_pui_auxiliary']
+      missing_keys = expected_keys - doc.keys
+      unless missing_keys.empty?
+        raise "pui auxiliary missing required fields for #{uri}: #{missing_keys.sort.join(', ')}"
+      end
+      extra_keys = doc.keys - expected_keys
+      unless extra_keys.empty?
+        raise "pui auxiliary contains unexpected fields for #{uri}: #{extra_keys.sort.join(', ')}"
+      end
+
+      aux_meta = doc['_archivalist_pui_auxiliary']
+      raise "auxiliary metadata must be a Hash for #{uri}" unless aux_meta.is_a?(Hash)
+      if aux_meta.keys.any? { |k| !k.is_a?(String) }
+        raise "non-string key found in auxiliary metadata for #{uri}"
+      end
+      missing_meta = PUI_AUXILIARY_META_FIELDS - aux_meta.keys
+      unless missing_meta.empty?
+        raise "auxiliary metadata missing fields for #{uri}: #{missing_meta.sort.join(', ')}"
+      end
+      extra_meta = aux_meta.keys - PUI_AUXILIARY_META_FIELDS
+      unless extra_meta.empty?
+        raise "auxiliary metadata contains unexpected fields for #{uri}: #{extra_meta.sort.join(', ')}"
+      end
+      unless aux_meta['marker'] == 'pui_auxiliary_document_metadata'
+        raise "auxiliary metadata marker mismatch for #{uri}: expected 'pui_auxiliary_document_metadata', got #{aux_meta['marker'].inspect}"
+      end
+      unless aux_meta['auxiliary_type'] == record_type
+        raise "auxiliary metadata type mismatch for #{uri}: expected #{record_type.inspect}, got #{aux_meta['auxiliary_type'].inspect}"
+      end
+
+      # Strip marker
+      doc = doc.dup
+      doc.delete('_archivalist_pui_auxiliary')
+
+      # Ensure remaining keys match exact native keys
+      unless doc.keys.sort == PUI_AUXILIARY_FIELDS.sort
+        raise "doc keys mismatch after stripping marker for #{uri}"
+      end
+
+      # Strict type and value checks
+      unless doc['id'].is_a?(String) && doc['id'] == uri
+        raise "id mismatch for #{uri}: expected #{uri.inspect}, got #{doc['id'].inspect}"
+      end
+      unless doc['uri'].is_a?(String) && doc['uri'] == uri
+        raise "uri mismatch for #{uri}: expected #{uri.inspect}, got #{doc['uri'].inspect}"
+      end
+      unless doc['pui_parent_id'].is_a?(String) && doc['pui_parent_id'] == parent_id
+        raise "pui_parent_id mismatch for #{uri}: expected #{parent_id.inspect}, got #{doc['pui_parent_id'].inspect}"
+      end
+      unless doc['primary_type'].is_a?(String) && doc['primary_type'] == record_type
+        raise "primary_type mismatch for #{uri}: expected #{record_type.inspect}, got #{doc['primary_type'].inspect}"
+      end
+      unless doc['publish'].is_a?(String) && doc['publish'] == 'true'
+        raise "publish mismatch for #{uri}: expected string 'true', got #{doc['publish'].inspect} (#{doc['publish'].class})"
+      end
+      unless doc['types'].is_a?(Array) && doc['types'] == ['pui']
+        raise "types mismatch for #{uri}: expected ['pui'], got #{doc['types'].inspect}"
+      end
+      unless doc['json'].is_a?(String)
+        raise "json must be a String for #{uri}"
+      end
+
+      expected_json = ASUtils.to_json(record)
+      unless doc['json'] == expected_json
+        raise "json serialization mismatch for #{uri}"
+      end
+
+      parsed_json = ASUtils.json_parse(doc['json'])
+      validate_json_equal!(record, parsed_json, "pui auxiliary json for #{uri}")
+
+      # Assert no marker or internal field leakage
+      if doc.keys.any? { |k| k.start_with?('_archivalist') }
+        raise "internal marker leaked into candidate document for #{uri}"
+      end
+
+      result << doc
+    end
+
+    result
   end
 
   def build(inputs)
@@ -619,8 +772,14 @@ class RustIndexDocumentBuilder
   end
 
   def validate_json_equal!(expected, actual, path = 'child json')
-    unless expected.class == actual.class
-      raise "#{path} type mismatch: expected #{expected.class}, got #{actual.class}"
+    if expected.is_a?(TrueClass) || expected.is_a?(FalseClass)
+      unless actual.is_a?(TrueClass) || actual.is_a?(FalseClass)
+        raise "#{path} type mismatch: expected Boolean, got #{actual.class}"
+      end
+    else
+      unless expected.class == actual.class
+        raise "#{path} type mismatch: expected #{expected.class}, got #{actual.class}"
+      end
     end
 
     case expected
@@ -633,7 +792,9 @@ class RustIndexDocumentBuilder
         raise "#{path} keys mismatch (missing: #{missing.inspect}, extra: #{extra.inspect})"
       end
       expected_keys.each do |key|
-        validate_json_equal!(expected[key], actual[key], "#{path}.#{key}")
+        exp_val = expected.has_key?(key) ? expected[key] : (expected.has_key?(key.to_sym) ? expected[key.to_sym] : nil)
+        act_val = actual.has_key?(key) ? actual[key] : (actual.has_key?(key.to_sym) ? actual[key.to_sym] : nil)
+        validate_json_equal!(exp_val, act_val, "#{path}.#{key}")
       end
     when Array
       unless expected.length == actual.length

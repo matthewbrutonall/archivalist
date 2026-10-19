@@ -161,7 +161,19 @@ truthy. Exact native append order and duplicates (e.g. published top_container l
 published record acquiring `['pui_top_container', 'pui', 'pui_container', 'pui']`) and Ruby
 truthiness semantics are strictly preserved. If absent, malformed, extra-keyed, or mismatched,
 `IndexerCommon` discards the projection and executes unchanged native `apply_pui_fields` with
-zero partial mutation.
+zero partial mutation. Deterministic PUI auxiliary document preparation is gated separately
+under `AppConfig[:rust_pui_auxiliary_documents_enabled]` (disabled by default), migrating
+ordered-records synthetic documents (`PUIIndexer#add_infscroll_docs`) and LargeTree synthetic
+document envelopes (`tree_root`, `tree_waypoint`, `tree_node`, and `tree_node_from_root`) into
+Rust while keeping HTTP traversal, tree recursion, node/path discovery, delete calculations,
+batch state, and Solr writes entirely in Ruby. Rust receives already-fetched JSON payloads and
+authoritative Ruby-computed identity/parent inputs, returning deterministic candidate documents
+with capability marker `pui_auxiliary_document_metadata` (`_archivalist_pui_auxiliary`). Ruby
+strictly validates exact key sets, identity, type-strict values (including string publish `"true"`,
+`types: ['pui']`), JSON semantic parity, response completeness, duplicate preservation, and ordering
+before stripping internal markers and appending to `batch`. On any sidecar unavailability, timeout,
+malformed response, or validation failure, Ruby cleanly falls back to native document construction
+with zero partial mutation.
 
 ## Test and benchmark helpers
 

@@ -2624,4 +2624,15 @@ describe "periodic indexer" do
       end
     end
   end
+
+  describe "rust_pui_auxiliary_documents_enabled? isolation" do
+    it "isolates rust_pui_auxiliary_documents_enabled from PeriodicIndexer" do
+      begin
+        AppConfig[:rust_pui_auxiliary_documents_enabled] = true
+        expect(indexer.rust_pui_auxiliary_documents_enabled?).to be(false)
+      ensure
+        AppConfig[:rust_pui_auxiliary_documents_enabled] = false
+      end
+    end
+  end
 end

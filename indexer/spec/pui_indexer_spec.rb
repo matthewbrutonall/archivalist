@@ -98,8 +98,181 @@ describe "PUI indexer" do
     end
   end
   describe "add_infscroll_docs" do
-    it "adds infscroll docs" do
-    #    def add_infscroll_docs(resource_uris, batch)
+    let(:batch) { [] }
+    let(:res1) { '/repositories/2/resources/1' }
+    let(:res2) { '/repositories/2/resources/2' }
+    let(:json1) { {'uris' => ['/repositories/2/archival_objects/10']} }
+    let(:json2) { {'uris' => ['/repositories/2/archival_objects/20']} }
+
+    it "adds infscroll docs natively when flag is disabled" do
+      expect(JSONModel::HTTP).to receive(:get_json).with(res1 + '/ordered_records').and_return(json1)
+      expect(JSONModel::HTTP).to receive(:get_json).with(res2 + '/ordered_records').and_return(json2)
+
+      indexer.add_infscroll_docs([res1, res2], batch)
+
+      expect(batch.length).to eq(2)
+      expect(batch[0]).to eq({
+        'id' => "#{res1}/ordered_records",
+        'uri' => "#{res1}/ordered_records",
+        'pui_parent_id' => res1,
+        'publish' => 'true',
+        'primary_type' => 'resource_ordered_records',
+        'types' => ['pui'],
+        'json' => ASUtils.to_json(json1)
+      })
+      expect(batch[1]).to eq({
+        'id' => "#{res2}/ordered_records",
+        'uri' => "#{res2}/ordered_records",
+        'pui_parent_id' => res2,
+        'publish' => 'true',
+        'primary_type' => 'resource_ordered_records',
+        'types' => ['pui'],
+        'json' => ASUtils.to_json(json2)
+      })
+    end
+
+    it "uses rust builder in a single batch when flag is enabled" do
+      begin
+        AppConfig[:rust_pui_auxiliary_documents_enabled] = true
+
+        expect(JSONModel::HTTP).to receive(:get_json).with(res1 + '/ordered_records').and_return(json1)
+        expect(JSONModel::HTTP).to receive(:get_json).with(res2 + '/ordered_records').and_return(json2)
+
+        builder = instance_double('RustIndexDocumentBuilder')
+        expected_inputs = [
+          {
+            'uri' => "#{res1}/ordered_records",
+            'record_type' => 'resource_ordered_records',
+            'pui_parent_id' => res1,
+            'record' => json1,
+            'pui_auxiliary_json' => ASUtils.to_json(json1),
+            'prepare_pui_auxiliary' => true,
+          },
+          {
+            'uri' => "#{res2}/ordered_records",
+            'record_type' => 'resource_ordered_records',
+            'pui_parent_id' => res2,
+            'record' => json2,
+            'pui_auxiliary_json' => ASUtils.to_json(json2),
+            'prepare_pui_auxiliary' => true,
+          },
+        ]
+        mock_docs = [
+          {
+            'id' => "#{res1}/ordered_records",
+            'uri' => "#{res1}/ordered_records",
+            'pui_parent_id' => res1,
+            'publish' => 'true',
+            'primary_type' => 'resource_ordered_records',
+            'types' => ['pui'],
+            'json' => ASUtils.to_json(json1),
+          },
+          {
+            'id' => "#{res2}/ordered_records",
+            'uri' => "#{res2}/ordered_records",
+            'pui_parent_id' => res2,
+            'publish' => 'true',
+            'primary_type' => 'resource_ordered_records',
+            'types' => ['pui'],
+            'json' => ASUtils.to_json(json2),
+          },
+        ]
+        expect(builder).to receive(:build_pui_auxiliary).with(expected_inputs).and_return(mock_docs)
+        allow(indexer).to receive(:rust_index_document_builder).and_return(builder)
+
+        indexer.add_infscroll_docs([res1, res2], batch)
+
+        expect(batch.length).to eq(2)
+        expect(batch[0]['publish']).to eq('true')
+        expect(batch[0]['types']).to eq(['pui'])
+        expect(batch[0]['pui_parent_id']).to eq(res1)
+        expect(batch[1]['pui_parent_id']).to eq(res2)
+        expect(batch.none? { |d| d.keys.any? { |k| k.start_with?('_archivalist') } }).to be(true)
+      ensure
+        AppConfig[:rust_pui_auxiliary_documents_enabled] = false
+      end
+    end
+
+    it "falls back cleanly to native document construction on builder error without partial application" do
+      begin
+        AppConfig[:rust_pui_auxiliary_documents_enabled] = true
+
+        expect(JSONModel::HTTP).to receive(:get_json).with(res1 + '/ordered_records').and_return(json1)
+        expect(JSONModel::HTTP).to receive(:get_json).with(res2 + '/ordered_records').and_return(json2)
+
+        builder = instance_double('RustIndexDocumentBuilder')
+        expect(builder).to receive(:build_pui_auxiliary).and_raise(RuntimeError, "sidecar 500")
+        allow(indexer).to receive(:rust_index_document_builder).and_return(builder)
+
+        indexer.add_infscroll_docs([res1, res2], batch)
+
+        expect(batch.length).to eq(2)
+        expect(batch[0]['id']).to eq("#{res1}/ordered_records")
+        expect(batch[0]['publish']).to eq('true')
+        expect(batch[1]['id']).to eq("#{res2}/ordered_records")
+        expect(batch[1]['publish']).to eq('true')
+      ensure
+        AppConfig[:rust_pui_auxiliary_documents_enabled] = false
+      end
+    end
+
+    it "preserves native exception timing by retaining earlier fetched docs and re-raising on second fetch failure" do
+      begin
+        AppConfig[:rust_pui_auxiliary_documents_enabled] = true
+
+        expect(JSONModel::HTTP).to receive(:get_json).with(res1 + '/ordered_records').and_return(json1)
+        expect(JSONModel::HTTP).to receive(:get_json).with(res2 + '/ordered_records').and_raise(RuntimeError.new("fetch error on res2"))
+
+        # Do not invoke the sidecar after the fetch failure
+        expect(indexer).not_to receive(:rust_index_document_builder)
+
+        expect {
+          indexer.add_infscroll_docs([res1, res2], batch)
+        }.to raise_error(RuntimeError, "fetch error on res2")
+
+        # First document was retained in batch using native construction
+        expect(batch.length).to eq(1)
+        expect(batch[0]['id']).to eq("#{res1}/ordered_records")
+        expect(batch[0]['uri']).to eq("#{res1}/ordered_records")
+        expect(batch[0]['pui_parent_id']).to eq(res1)
+        expect(batch[0]['publish']).to eq('true')
+        expect(batch[0]['primary_type']).to eq('resource_ordered_records')
+        expect(batch[0]['types']).to eq(['pui'])
+        expect(batch[0]['json']).to eq(ASUtils.to_json(json1))
+      ensure
+        AppConfig[:rust_pui_auxiliary_documents_enabled] = false
+      end
+    end
+
+    it "treats empty input as a no-op without invoking sidecar or mutating batch" do
+      begin
+        AppConfig[:rust_pui_auxiliary_documents_enabled] = true
+        expect(indexer).not_to receive(:rust_index_document_builder)
+        indexer.add_infscroll_docs([], batch)
+        expect(batch).to be_empty
+      ensure
+        AppConfig[:rust_pui_auxiliary_documents_enabled] = false
+      end
+    end
+
+    it "falls back to native document construction when sidecar emits noncanonical or mismatched JSON" do
+      begin
+        AppConfig[:rust_pui_auxiliary_documents_enabled] = true
+
+        expect(JSONModel::HTTP).to receive(:get_json).with(res1 + '/ordered_records').and_return(json1)
+
+        builder = instance_double('RustIndexDocumentBuilder')
+        expect(builder).to receive(:build_pui_auxiliary).and_raise(RuntimeError, "json serialization mismatch for #{res1}/ordered_records")
+        allow(indexer).to receive(:rust_index_document_builder).and_return(builder)
+
+        indexer.add_infscroll_docs([res1], batch)
+
+        expect(batch.length).to eq(1)
+        expect(batch[0]['id']).to eq("#{res1}/ordered_records")
+        expect(batch[0]['json']).to eq(ASUtils.to_json(json1))
+      ensure
+        AppConfig[:rust_pui_auxiliary_documents_enabled] = false
+      end
     end
   end
   describe "skip_index_record?" do
@@ -1021,6 +1194,46 @@ describe "PUI indexer" do
       expect(indexer.rust_pui_availability_preparation_enabled?).to be(false)
     ensure
       AppConfig[:rust_pui_availability_preparation_enabled] = false
+    end
+  end
+
+  it "enables rust_pui_auxiliary_documents_enabled? only on PUIIndexer when configured" do
+    begin
+      expect(indexer.rust_pui_auxiliary_documents_enabled?).to be(false)
+      AppConfig[:rust_pui_auxiliary_documents_enabled] = true
+      expect(indexer.rust_pui_auxiliary_documents_enabled?).to be(true)
+    ensure
+      AppConfig[:rust_pui_auxiliary_documents_enabled] = false
+    end
+  end
+
+  it "supports general Ruby truthiness for rust_pui_auxiliary_documents_enabled? on PUIIndexer" do
+    begin
+      AppConfig[:rust_pui_auxiliary_documents_enabled] = "yes"
+      expect(indexer.rust_pui_auxiliary_documents_enabled?).to be_truthy
+      AppConfig[:rust_pui_auxiliary_documents_enabled] = :enabled
+      expect(indexer.rust_pui_auxiliary_documents_enabled?).to be_truthy
+      AppConfig[:rust_pui_auxiliary_documents_enabled] = nil
+      expect(indexer.rust_pui_auxiliary_documents_enabled?).to be_falsey
+      AppConfig[:rust_pui_auxiliary_documents_enabled] = false
+      expect(indexer.rust_pui_auxiliary_documents_enabled?).to be_falsey
+    ensure
+      AppConfig[:rust_pui_auxiliary_documents_enabled] = false
+    end
+  end
+
+  it "isolates rust_pui_auxiliary_documents_enabled? from other feature flags" do
+    begin
+      AppConfig[:rust_pui_document_preparation_enabled] = true
+      AppConfig[:rust_pui_availability_preparation_enabled] = true
+      AppConfig[:rust_index_document_enrichment_enabled] = true
+      AppConfig[:rust_index_document_builder_enabled] = true
+      expect(indexer.rust_pui_auxiliary_documents_enabled?).to be(false)
+    ensure
+      AppConfig[:rust_pui_document_preparation_enabled] = false
+      AppConfig[:rust_pui_availability_preparation_enabled] = false
+      AppConfig[:rust_index_document_enrichment_enabled] = false
+      AppConfig[:rust_index_document_builder_enabled] = false
     end
   end
 end

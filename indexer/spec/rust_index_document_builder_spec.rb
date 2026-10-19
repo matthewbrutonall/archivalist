@@ -3481,4 +3481,385 @@ describe RustIndexDocumentBuilder do
       expect { builder.build([plain_input]) }.to raise_error(/unexpected response pui availability projection marker/)
     end
   end
+
+  describe '#build_pui_auxiliary' do
+    let(:aux_input) do
+      rec = {'uris' => ['/repositories/2/archival_objects/1']}
+      {
+        'uri' => '/repositories/2/resources/10/ordered_records',
+        'record_type' => 'resource_ordered_records',
+        'pui_parent_id' => '/repositories/2/resources/10',
+        'record' => rec,
+        'pui_auxiliary_json' => ASUtils.to_json(rec),
+        'prepare_pui_auxiliary' => true,
+      }
+    end
+
+    def valid_aux_doc_for(inp)
+      {
+        'id' => inp['uri'],
+        'uri' => inp['uri'],
+        'pui_parent_id' => inp['pui_parent_id'],
+        'publish' => 'true',
+        'primary_type' => inp['record_type'],
+        'types' => ['pui'],
+        'json' => inp['pui_auxiliary_json'] || ASUtils.to_json(inp['record']),
+        '_archivalist_pui_auxiliary' => {
+          'marker' => 'pui_auxiliary_document_metadata',
+          'auxiliary_type' => inp['record_type'],
+        },
+      }
+    end
+
+    it 'returns empty array when inputs are empty without calling HTTP' do
+      expect(builder).not_to receive(:perform_request)
+      expect(builder.build_pui_auxiliary([])).to eq([])
+    end
+
+    it 'accepts valid auxiliary documents for all 5 kinds and strips marker' do
+      inputs = [
+        {
+          'uri' => '/repositories/2/resources/10/ordered_records',
+          'record_type' => 'resource_ordered_records',
+          'pui_parent_id' => '/repositories/2/resources/10',
+          'record' => {'uris' => ['/repositories/2/archival_objects/1']},
+          'prepare_pui_auxiliary' => true,
+        },
+        {
+          'uri' => '/repositories/2/resources/10/tree/root',
+          'record_type' => 'tree_root',
+          'pui_parent_id' => '/repositories/2/resources/10',
+          'record' => {'title' => 'Root'},
+          'prepare_pui_auxiliary' => true,
+        },
+        {
+          'uri' => '/repositories/2/resources/10/tree/waypoint__0',
+          'record_type' => 'tree_waypoint',
+          'pui_parent_id' => '/repositories/2/resources/10',
+          'record' => [{'uri' => '/repositories/2/archival_objects/1'}],
+          'prepare_pui_auxiliary' => true,
+        },
+        {
+          'uri' => '/repositories/2/resources/10/tree/node_/repositories/2/archival_objects/1',
+          'record_type' => 'tree_node',
+          'pui_parent_id' => '/repositories/2/archival_objects/1',
+          'record' => {'title' => 'Node'},
+          'prepare_pui_auxiliary' => true,
+        },
+        {
+          'uri' => '/repositories/2/resources/10/tree/node_from_root_42',
+          'record_type' => 'tree_node_from_root',
+          'pui_parent_id' => '/repositories/2/archival_objects/42',
+          'record' => {'42' => ['path']},
+          'prepare_pui_auxiliary' => true,
+        },
+      ]
+      inputs.each { |inp| inp['pui_auxiliary_json'] = ASUtils.to_json(inp['record']) }
+      docs = inputs.map { |inp| valid_aux_doc_for(inp) }
+
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => docs)
+      )
+
+      results = builder.build_pui_auxiliary(inputs)
+      expect(results.length).to eq(5)
+
+      results.each_with_index do |res, idx|
+        inp = inputs[idx]
+        expect(res.keys.sort).to eq(RustIndexDocumentBuilder::PUI_AUXILIARY_FIELDS.sort)
+        expect(res['id']).to eq(inp['uri'])
+        expect(res['uri']).to eq(inp['uri'])
+        expect(res['pui_parent_id']).to eq(inp['pui_parent_id'])
+        expect(res['publish']).to eq('true')
+        expect(res['publish']).to be_a(String)
+        expect(res['publish']).not_to be(true)
+        expect(res['primary_type']).to eq(inp['record_type'])
+        expect(res['types']).to eq(['pui'])
+        expect(ASUtils.json_parse(res['json'])).to eq(inp['record'])
+        expect(res.has_key?('_archivalist_pui_auxiliary')).to be(false)
+      end
+    end
+
+    it 'strictly rejects non-string or non-"true" publish values' do
+      # boolean true
+      doc1 = valid_aux_doc_for(aux_input).merge('publish' => true)
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc1])
+      )
+      expect { builder.build_pui_auxiliary([aux_input]) }.to raise_error(/publish mismatch/)
+
+      # integer 1
+      doc2 = valid_aux_doc_for(aux_input).merge('publish' => 1)
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc2])
+      )
+      expect { builder.build_pui_auxiliary([aux_input]) }.to raise_error(/publish mismatch/)
+
+      # string "false"
+      doc3 = valid_aux_doc_for(aux_input).merge('publish' => 'false')
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc3])
+      )
+      expect { builder.build_pui_auxiliary([aux_input]) }.to raise_error(/publish mismatch/)
+    end
+
+    it 'strictly rejects type and value mismatches in types, id, uri, pui_parent_id, and primary_type' do
+      # types is not ['pui']
+      doc_types = valid_aux_doc_for(aux_input).merge('types' => ['pui', 'extra'])
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_types])
+      )
+      expect { builder.build_pui_auxiliary([aux_input]) }.to raise_error(/types mismatch/)
+
+      # id mismatch
+      doc_id = valid_aux_doc_for(aux_input).merge('id' => '/other/id')
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_id])
+      )
+      expect { builder.build_pui_auxiliary([aux_input]) }.to raise_error(/id mismatch/)
+
+      # uri mismatch
+      doc_uri = valid_aux_doc_for(aux_input).merge('uri' => '/other/uri')
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_uri])
+      )
+      expect { builder.build_pui_auxiliary([aux_input]) }.to raise_error(/uri mismatch/)
+
+      # pui_parent_id mismatch
+      doc_parent = valid_aux_doc_for(aux_input).merge('pui_parent_id' => '/other/parent')
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_parent])
+      )
+      expect { builder.build_pui_auxiliary([aux_input]) }.to raise_error(/pui_parent_id mismatch/)
+
+      # primary_type mismatch
+      doc_pt = valid_aux_doc_for(aux_input).merge('primary_type' => 'tree_root')
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_pt])
+      )
+      expect { builder.build_pui_auxiliary([aux_input]) }.to raise_error(/primary_type mismatch/)
+    end
+
+    it 'strictly rejects missing fields and unexpected extra fields' do
+      # Missing pui_parent_id
+      doc_missing = valid_aux_doc_for(aux_input)
+      doc_missing.delete('pui_parent_id')
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_missing])
+      )
+      expect { builder.build_pui_auxiliary([aux_input]) }.to raise_error(/missing required fields/)
+
+      # Extra rogue field
+      doc_extra = valid_aux_doc_for(aux_input).merge('rogue_field' => 'injected_leak')
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_extra])
+      )
+      expect { builder.build_pui_auxiliary([aux_input]) }.to raise_error(/unexpected fields/)
+    end
+
+    it 'strictly validates auxiliary metadata marker and auxiliary_type' do
+      # Missing marker
+      doc_no_meta = valid_aux_doc_for(aux_input)
+      doc_no_meta.delete('_archivalist_pui_auxiliary')
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_no_meta])
+      )
+      expect { builder.build_pui_auxiliary([aux_input]) }.to raise_error(/missing required fields/)
+
+      # Wrong marker name
+      doc_wrong_marker = valid_aux_doc_for(aux_input)
+      doc_wrong_marker['_archivalist_pui_auxiliary']['marker'] = 'bad_marker'
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_wrong_marker])
+      )
+      expect { builder.build_pui_auxiliary([aux_input]) }.to raise_error(/marker mismatch/)
+
+      # Wrong auxiliary_type
+      doc_wrong_type = valid_aux_doc_for(aux_input)
+      doc_wrong_type['_archivalist_pui_auxiliary']['auxiliary_type'] = 'tree_node'
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_wrong_type])
+      )
+      expect { builder.build_pui_auxiliary([aux_input]) }.to raise_error(/type mismatch/)
+
+      # Extra field in metadata
+      doc_meta_extra = valid_aux_doc_for(aux_input)
+      doc_meta_extra['_archivalist_pui_auxiliary']['injected'] = true
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_meta_extra])
+      )
+      expect { builder.build_pui_auxiliary([aux_input]) }.to raise_error(/auxiliary metadata contains unexpected fields/)
+    end
+
+    it 'requires byte-for-byte exact JSON serialization parity and rejects noncanonical key ordering' do
+      rec = {'alpha' => 1, 'beta' => 2}
+      inp = {
+        'uri' => '/repositories/2/resources/10/tree/root',
+        'record_type' => 'tree_root',
+        'pui_parent_id' => '/repositories/2/resources/10',
+        'record' => rec,
+        'pui_auxiliary_json' => ASUtils.to_json(rec),
+        'prepare_pui_auxiliary' => true,
+      }
+      # Noncanonical key ordering with same semantics is strictly rejected
+      doc_noncanonical = valid_aux_doc_for(inp).merge('json' => '{"beta":2,"alpha":1}')
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_noncanonical])
+      )
+      expect { builder.build_pui_auxiliary([inp]) }.to raise_error(/json serialization mismatch/)
+
+      # Mismatched payload fails
+      doc_mismatch = valid_aux_doc_for(inp).merge('json' => ASUtils.to_json({'alpha' => 1, 'beta' => 999}))
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_mismatch])
+      )
+      expect { builder.build_pui_auxiliary([inp]) }.to raise_error(/json serialization mismatch/)
+    end
+
+    it 'enforces recursive type-strict semantic JSON comparison and preserves exact Unicode and nested structures' do
+      nested_record = {
+        'title' => 'Muintir na hÉireann & Sánchez Papers / 記録 ☘️',
+        'numbers' => [1, 2, 3],
+        'flags' => {'active' => true, 'archived' => false},
+        'ratio' => 3.14,
+        'nested' => {
+          'levels' => [{'id' => 10, 'empty' => nil}]
+        }
+      }
+      inp = {
+        'uri' => '/repositories/2/resources/10/tree/root',
+        'record_type' => 'tree_root',
+        'pui_parent_id' => '/repositories/2/resources/10',
+        'record' => nested_record,
+        'pui_auxiliary_json' => ASUtils.to_json(nested_record),
+        'prepare_pui_auxiliary' => true,
+      }
+      doc = valid_aux_doc_for(inp)
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc])
+      )
+      res = builder.build_pui_auxiliary([inp])
+      expect(res.first['json']).to eq(ASUtils.to_json(nested_record))
+      expect(ASUtils.json_parse(res.first['json'])).to eq(nested_record)
+
+      # Type mismatch: boolean vs integer
+      bad_type_record = {
+        'title' => 'Muintir na hÉireann & Sánchez Papers / 記録 ☘️',
+        'numbers' => [1, 2, 3],
+        'flags' => {'active' => 1, 'archived' => false},
+        'ratio' => 3.14,
+        'nested' => {
+          'levels' => [{'id' => 10, 'empty' => nil}]
+        }
+      }
+      doc_type_err = valid_aux_doc_for(inp).merge('json' => ASUtils.to_json(bad_type_record))
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_type_err])
+      )
+      expect { builder.build_pui_auxiliary([inp]) }.to raise_error(/type mismatch|json serialization mismatch/)
+
+      # Type mismatch: integer vs float
+      bad_num_record = {
+        'title' => 'Muintir na hÉireann & Sánchez Papers / 記録 ☘️',
+        'numbers' => [1.0, 2, 3],
+        'flags' => {'active' => true, 'archived' => false},
+        'ratio' => 3.14,
+        'nested' => {
+          'levels' => [{'id' => 10, 'empty' => nil}]
+        }
+      }
+      doc_num_err = valid_aux_doc_for(inp).merge('json' => ASUtils.to_json(bad_num_record))
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [doc_num_err])
+      )
+      expect { builder.build_pui_auxiliary([inp]) }.to raise_error(/type mismatch|json serialization mismatch/)
+    end
+
+    it 'preserves multi-record ordering and duplicate input entries' do
+      inp1 = aux_input
+      inp2_rec = {'title' => 'Duplicate item'}
+      inp2 = {
+        'uri' => '/repositories/2/resources/10/tree/root',
+        'record_type' => 'tree_root',
+        'pui_parent_id' => '/repositories/2/resources/10',
+        'record' => inp2_rec,
+        'pui_auxiliary_json' => ASUtils.to_json(inp2_rec),
+        'prepare_pui_auxiliary' => true,
+      }
+      inputs = [inp1, inp2, inp2] # duplicate inp2
+      docs = [valid_aux_doc_for(inp1), valid_aux_doc_for(inp2), valid_aux_doc_for(inp2)]
+
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => docs)
+      )
+
+      res = builder.build_pui_auxiliary(inputs)
+      expect(res.length).to eq(3)
+      expect(res[0]['uri']).to eq(inp1['uri'])
+      expect(res[1]['uri']).to eq(inp2['uri'])
+      expect(res[2]['uri']).to eq(inp2['uri'])
+    end
+
+    it 'rejects response document count mismatch' do
+      allow(builder).to receive(:perform_request).and_return(
+        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+                        'documents' => [valid_aux_doc_for(aux_input), valid_aux_doc_for(aux_input)])
+      )
+      expect { builder.build_pui_auxiliary([aux_input]) }.to raise_error(/document count mismatch/)
+    end
+
+    it 'raises error on sidecar failure (HTTP 500, network error)' do
+      allow(builder).to receive(:perform_request).and_return(response('500', 'error' => 'Internal Server Error'))
+      expect { builder.build_pui_auxiliary([aux_input]) }.to raise_error(/HTTP 500/)
+    end
+
+    it 'pre-validates inputs in Ruby before making HTTP request' do
+      expect(builder).not_to receive(:perform_request)
+
+      # Not a hash
+      expect { builder.build_pui_auxiliary(['invalid']) }.to raise_error(/input must be a Hash/)
+
+      # Missing prepare_pui_auxiliary
+      expect { builder.build_pui_auxiliary([aux_input.merge('prepare_pui_auxiliary' => false)]) }.to raise_error(/prepare_pui_auxiliary must be explicitly true/)
+
+      # Empty uri
+      expect { builder.build_pui_auxiliary([aux_input.merge('uri' => '')]) }.to raise_error(/uri must be a non-empty string/)
+
+      # Invalid record_type
+      expect { builder.build_pui_auxiliary([aux_input.merge('record_type' => 'unknown')]) }.to raise_error(/invalid record_type/)
+
+      # Empty pui_parent_id
+      expect { builder.build_pui_auxiliary([aux_input.merge('pui_parent_id' => '  ')]) }.to raise_error(/pui_parent_id must be a non-empty string/)
+
+      # Nil record
+      expect { builder.build_pui_auxiliary([aux_input.merge('record' => nil)]) }.to raise_error(/record must not be nil/)
+
+      # Missing pui_auxiliary_json
+      expect { builder.build_pui_auxiliary([aux_input.merge('pui_auxiliary_json' => nil)]) }.to raise_error(/pui_auxiliary_json must be a non-empty string/)
+
+      # Empty pui_auxiliary_json
+      expect { builder.build_pui_auxiliary([aux_input.merge('pui_auxiliary_json' => '   ')]) }.to raise_error(/pui_auxiliary_json must be a non-empty string/)
+    end
+  end
 end

@@ -433,7 +433,7 @@ def deep_type_strict_equal(v1: Any, v2: Any, path: str = "") -> Tuple[bool, Opti
     return True, None
 
 
-def normalize_baseline_pui_document(base_doc: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], Optional[str]]:
+def normalize_baseline_pui_document(base_doc: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[Any], Optional[str]]:
     """Normalize ONLY explicitly documented native-private fields from the baseline.
 
     Native ArchivesSpace PUI indexing behavior:
@@ -463,31 +463,32 @@ def normalize_baseline_pui_document(base_doc: Dict[str, Any]) -> Tuple[Dict[str,
 
     try:
         parsed_json = json.loads(raw_json)
-        if not isinstance(parsed_json, dict):
-            return normalized_doc, None, "baseline 'json' must parse to a JSON object"
+        if not isinstance(parsed_json, (dict, list)):
+            return normalized_doc, None, "baseline 'json' must parse to a JSON object or array"
     except Exception as err:
         return normalized_doc, None, f"baseline 'json' parse error: {err}"
 
-    # 2. Parsed JSON ancestors
-    parsed_json.pop("ancestors", None)
+    if isinstance(parsed_json, dict):
+        # 2. Parsed JSON ancestors
+        parsed_json.pop("ancestors", None)
 
-    # 3. Parsed JSON top_container internal_note and 4. container_profile notes
-    instances = parsed_json.get("instances")
-    if isinstance(instances, list):
-        for inst in instances:
-            if isinstance(inst, dict):
-                sub_c = inst.get("sub_container")
-                if isinstance(sub_c, dict):
-                    tc = sub_c.get("top_container")
-                    if isinstance(tc, dict):
-                        res_tc = tc.get("_resolved")
-                        if isinstance(res_tc, dict):
-                            res_tc.pop("internal_note", None)
-                            cp = res_tc.get("container_profile")
-                            if isinstance(cp, dict):
-                                res_cp = cp.get("_resolved")
-                                if isinstance(res_cp, dict):
-                                    res_cp.pop("notes", None)
+        # 3. Parsed JSON top_container internal_note and 4. container_profile notes
+        instances = parsed_json.get("instances")
+        if isinstance(instances, list):
+            for inst in instances:
+                if isinstance(inst, dict):
+                    sub_c = inst.get("sub_container")
+                    if isinstance(sub_c, dict):
+                        tc = sub_c.get("top_container")
+                        if isinstance(tc, dict):
+                            res_tc = tc.get("_resolved")
+                            if isinstance(res_tc, dict):
+                                res_tc.pop("internal_note", None)
+                                cp = res_tc.get("container_profile")
+                                if isinstance(cp, dict):
+                                    res_cp = cp.get("_resolved")
+                                    if isinstance(res_cp, dict):
+                                        res_cp.pop("notes", None)
 
     return normalized_doc, parsed_json, None
 
@@ -525,8 +526,8 @@ def compare_pui_document(
 
     try:
         cand_parsed_json = json.loads(cand_raw_json)
-        if not isinstance(cand_parsed_json, dict):
-            reasons.append("candidate 'json' must parse to a JSON object")
+        if not isinstance(cand_parsed_json, (dict, list)):
+            reasons.append("candidate 'json' must parse to a JSON object or array")
             return False, reasons
     except Exception as err:
         reasons.append(f"candidate 'json' parse error: {err}")

@@ -422,17 +422,35 @@ indexer to safely discard the untrusted projection and execute unchanged native
 `PUIIndexer#configure_doc_rules`, `PUIIndexer#add_notes`, and `PUIIndexer#final_doc_rules`
 for the batch without leaking private data or halting indexing.
 
+### Step D: PUI auxiliary document preparation
+
+When testing `AppConfig[:rust_pui_auxiliary_documents_enabled] = true`, verify that:
+1. Ordered-records synthetic documents (`PUIIndexer#add_infscroll_docs`) and LargeTree
+   synthetic document envelopes (`tree_root`, `tree_waypoint`, `tree_node`, and
+   `tree_node_from_root`) are built via the Rust sidecar in bounded batches.
+2. Every auxiliary document contains exactly 7 native Solr fields (`id`, `uri`,
+   `pui_parent_id`, `publish`, `primary_type`, `types`, `json`), with `publish` strictly
+   equal to string `"true"`, and `types` strictly equal to `["pui"]`.
+3. Capability marker `pui_auxiliary_document_metadata` (`_archivalist_pui_auxiliary`) is
+   validated and stripped by Ruby, never leaking into Solr or `IndexBatch`.
+4. Stale-node deletions (`LargeTreeDocIndexer#deletes`), tree traversal, waypoint recursion,
+   and Solr writes remain completely in Ruby.
+5. Sidecar failure, timeout, or malformed responses cause immediate fallback to native
+   document construction for the entire batch without partial application.
+
 ## 9. Rollback
 
 Set all sidecar enable flags, including `rust_index_document_builder_enabled`,
 `rust_index_document_enrichment_enabled`, `rust_pui_document_preparation_enabled`,
-and `rust_pui_availability_preparation_enabled`, to `false` and restart Archivalist:
+`rust_pui_availability_preparation_enabled`, and `rust_pui_auxiliary_documents_enabled`,
+to `false` and restart Archivalist:
 
 ```ruby
 AppConfig[:rust_index_document_builder_enabled] = false
 AppConfig[:rust_index_document_enrichment_enabled] = false
 AppConfig[:rust_pui_document_preparation_enabled] = false
 AppConfig[:rust_pui_availability_preparation_enabled] = false
+AppConfig[:rust_pui_auxiliary_documents_enabled] = false
 ```
 
 The sidecar can then be stopped independently. Do not point the service at the primary
