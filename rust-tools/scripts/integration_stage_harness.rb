@@ -38,18 +38,36 @@ require 'socket'
 module ArchivalistHarnessSafety
   ALLOWED_HOSTS = ['127.0.0.1', 'localhost', 'solr', 'solr-test'].freeze
   ALLOWED_PORTS = [8983, 8984, 8985].freeze
+  ALLOWED_BACKEND_HOSTS = ['127.0.0.1', 'localhost', 'backend', 'app'].freeze
+  ALLOWED_BACKEND_PORTS = [4567, 8089, 3000, 3002, 3003].freeze
   ALLOWED_ROLES = ['native', 'candidate', 'fallback'].freeze
+  ALLOWED_MODES = ['pui', 'staff'].freeze
   FORBIDDEN_KEYWORDS = ['archivesspace', 'archivesspace_shadow', 'production', 'primary', 'live'].freeze
 
   def self.generate_run_id
     "#{Time.now.utc.strftime('%Y%m%d_%H%M%S')}_#{Process.pid}_#{SecureRandom.hex(4)}"
   end
 
-  def self.stage_core_name(run_id, role)
+  def self.valid_backend_url?(url_str)
+    return false unless url_str.is_a?(String)
+    uri = URI.parse(url_str)
+    return false unless uri.is_a?(URI::HTTP) || uri.is_a?(URI::HTTPS)
+    return false unless ALLOWED_BACKEND_HOSTS.include?(uri.hostname)
+    return false unless ALLOWED_BACKEND_PORTS.include?(uri.port)
+    return false unless uri.user.nil? && uri.password.nil?
+    true
+  rescue URI::InvalidURIError
+    false
+  end
+
+  def self.stage_core_name(run_id, role, mode = 'pui')
     unless ALLOWED_ROLES.include?(role)
       raise "Invalid stage role '#{role}'; must be one of: #{ALLOWED_ROLES.join(', ')}"
     end
-    "stage_pui_#{run_id}_#{role}"
+    unless ALLOWED_MODES.include?(mode.to_s)
+      raise "Invalid stage mode '#{mode}'; must be one of: #{ALLOWED_MODES.join(', ')}"
+    end
+    "stage_#{mode}_#{run_id}_#{role}"
   end
 
   def self.valid_solr_url?(url_str)
@@ -68,9 +86,11 @@ module ArchivalistHarnessSafety
   def self.valid_stage_core_name?(core_name, expected_run_id)
     return false unless core_name.is_a?(String)
     FORBIDDEN_KEYWORDS.each do |kw|
-      return false if core_name.downcase == kw || core_name.downcase == "stage_pui_#{kw}"
+      return false if core_name.downcase == kw ||
+                      core_name.downcase == "stage_pui_#{kw}" ||
+                      core_name.downcase == "stage_staff_#{kw}"
     end
-    pattern = /\Astage_pui_#{Regexp.escape(expected_run_id)}_(native|candidate|fallback)\z/
+    pattern = /\Astage_(pui|staff)_#{Regexp.escape(expected_run_id)}_(native|candidate|fallback)\z/
     !(core_name =~ pattern).nil?
   end
 
@@ -219,6 +239,109 @@ module ArchivalistHarnessSafety
       end
     end
     true
+  end
+
+  def self.verify_auxiliary_parity(baseline_docs, candidate_docs, ignored_fields: ['_version_', 'score'])
+    unless baseline_docs.is_a?(Array) && candidate_docs.is_a?(Array)
+      raise "Auxiliary parity failure: Both baseline_docs and candidate_docs must be Arrays"
+    end
+    unless baseline_docs.length == candidate_docs.length
+      raise "Auxiliary parity failure: Doc count mismatch (baseline: #{baseline_docs.length}, candidate: #{candidate_docs.length})"
+    end
+
+    # Validate IDs in baseline_docs: assert unique nonempty string IDs
+    base_ids = []
+    baseline_docs.each_with_index do |doc, idx|
+      unless doc.is_a?(Hash)
+        raise "Auxiliary parity failure: Baseline doc at index #{idx} is not a Hash"
+      end
+      id = doc['id']
+      unless id.is_a?(String) && !id.strip.empty?
+        raise "Auxiliary parity failure: Baseline doc at index #{idx} has invalid or empty id: #{id.inspect}"
+      end
+      base_ids << id
+    end
+    if base_ids.length != base_ids.uniq.length
+      duplicates = base_ids.select { |id| base_ids.count(id) > 1 }.uniq
+      raise "Auxiliary parity failure: Duplicate IDs detected in baseline_docs: #{duplicates.inspect}"
+    end
+
+    # Validate IDs in candidate_docs
+    cand_ids = []
+    candidate_docs.each_with_index do |doc, idx|
+      unless doc.is_a?(Hash)
+        raise "Auxiliary parity failure: Candidate doc at index #{idx} is not a Hash"
+      end
+      id = doc['id']
+      unless id.is_a?(String) && !id.strip.empty?
+        raise "Auxiliary parity failure: Candidate doc at index #{idx} has invalid or empty id: #{id.inspect}"
+      end
+      cand_ids << id
+    end
+    if cand_ids.length != cand_ids.uniq.length
+      duplicates = cand_ids.select { |id| cand_ids.count(id) > 1 }.uniq
+      raise "Auxiliary parity failure: Duplicate IDs detected in candidate_docs: #{duplicates.inspect}"
+    end
+
+    unless base_ids.sort == cand_ids.sort
+      missing_in_cand = base_ids - cand_ids
+      extra_in_cand = cand_ids - base_ids
+      raise "Auxiliary parity failure: Identity set mismatch (missing in candidate: #{missing_in_cand.inspect}, extra in candidate: #{extra_in_cand.inspect})"
+    end
+
+    base_by_id = baseline_docs.each_with_object({}) { |d, h| h[d['id']] = d }
+    candidate_docs.each do |cand_d|
+      id = cand_d['id']
+      base_d = base_by_id[id]
+
+      all_keys = (base_d.keys + cand_d.keys).uniq - ignored_fields
+      all_keys.sort.each do |k|
+        raise "Auxiliary parity failure: Field '#{k}' missing in candidate doc #{id}" unless cand_d.key?(k)
+        raise "Auxiliary parity failure: Field '#{k}' missing in baseline doc #{id}" unless base_d.key?(k)
+
+        if k == 'json'
+          base_json_raw = base_d[k]
+          cand_json_raw = cand_d[k]
+          unless base_json_raw.is_a?(String) && cand_json_raw.is_a?(String)
+            raise "Auxiliary parity failure: 'json' field must be a String in doc #{id}"
+          end
+          begin
+            base_parsed = JSON.parse(base_json_raw)
+          rescue => e
+            raise "Auxiliary parity failure: Failed to parse baseline JSON in doc #{id}: #{e.message}"
+          end
+          begin
+            cand_parsed = JSON.parse(cand_json_raw)
+          rescue => e
+            raise "Auxiliary parity failure: Failed to parse candidate JSON in doc #{id}: #{e.message}"
+          end
+          assert_strict_equal(base_parsed, cand_parsed, "doc[#{id}].json")
+        else
+          assert_strict_equal(base_d[k], cand_d[k], "doc[#{id}].#{k}")
+        end
+      end
+    end
+    true
+  end
+
+  def self.freeze_dynamic_enum_strings!(doc)
+    return unless doc.is_a?(Hash)
+    doc.each do |k, v|
+      if k.is_a?(String) && k.end_with?('_enum_s') && v.is_a?(Array)
+        v.each { |item| item.freeze if item.is_a?(String) }
+      end
+    end
+  end
+
+  def self.clean_whitespace(doc)
+    if doc.is_a?(String) && !doc.frozen?
+      doc.strip!
+    elsif doc.is_a?(Hash)
+      doc.values.each { |v| clean_whitespace(v) }
+    elsif doc.is_a?(Array)
+      doc.each { |v| clean_whitespace(v) }
+    end
+    doc
   end
 
   def self.verify_process_identity(pid, state)

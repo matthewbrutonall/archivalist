@@ -57,6 +57,7 @@ describe LargeTreeDocIndexer do
             'uri' => "#{root_uri}/tree/node_from_root_1",
             'record_type' => 'tree_node_from_root',
             'pui_parent_id' => node_uris[0],
+            'repository' => 'global',
             'record' => {'1' => ['path-1']},
             'pui_auxiliary_json' => ASUtils.to_json({'1' => ['path-1']}),
             'prepare_pui_auxiliary' => true,
@@ -65,6 +66,7 @@ describe LargeTreeDocIndexer do
             'uri' => "#{root_uri}/tree/node_from_root_2",
             'record_type' => 'tree_node_from_root',
             'pui_parent_id' => node_uris[1],
+            'repository' => 'global',
             'record' => {'2' => ['path-2']},
             'pui_auxiliary_json' => ASUtils.to_json({'2' => ['path-2']}),
             'prepare_pui_auxiliary' => true,
@@ -198,6 +200,7 @@ describe LargeTreeDocIndexer do
           expect(inputs[0]['record_type']).to eq('tree_root')
           expect(inputs[1]['record_type']).to eq('tree_waypoint')
           expect(inputs[2]['record_type']).to eq('tree_node')
+          expect(inputs.all? { |inp| inp['repository'] == 'global' }).to be(true)
           inputs.map do |inp|
             {
               'id' => inp['uri'],

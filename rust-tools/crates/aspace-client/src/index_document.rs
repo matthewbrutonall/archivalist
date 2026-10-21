@@ -13103,4 +13103,41 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn test_index_document_input_rejects_missing_repository() {
+        let json_str = r#"{
+            "uri": "/repositories/4/resources/9/ordered_records",
+            "record_type": "resource_ordered_records",
+            "pui_parent_id": "/repositories/4/resources/9",
+            "record": {"uris": ["/repositories/4/resources/9"]},
+            "pui_auxiliary_json": "{\"uris\":[\"/repositories/4/resources/9\"]}",
+            "prepare_pui_auxiliary": true
+        }"#;
+        let res: Result<IndexDocumentInput, _> = serde_json::from_str(json_str);
+        assert!(
+            res.is_err(),
+            "missing ordinary repository field must reject"
+        );
+    }
+
+    #[test]
+    fn test_index_document_input_accepts_auxiliary_with_repository_global() {
+        let json_str = r#"{
+            "uri": "/repositories/4/resources/9/ordered_records",
+            "record_type": "resource_ordered_records",
+            "repository": "global",
+            "pui_parent_id": "/repositories/4/resources/9",
+            "record": {"uris": ["/repositories/4/resources/9"]},
+            "pui_auxiliary_json": "{\"uris\":[\"/repositories/4/resources/9\"]}",
+            "prepare_pui_auxiliary": true
+        }"#;
+        let input: IndexDocumentInput = serde_json::from_str(json_str)
+            .expect("deserialization must succeed with repository global");
+        assert_eq!(input.uri, "/repositories/4/resources/9/ordered_records");
+        assert_eq!(input.repository, Value::String("global".to_string()));
+        assert!(input.prepare_pui_auxiliary);
+        let doc = build_index_document(input).expect("auxiliary build must succeed");
+        assert_eq!(doc["id"], "/repositories/4/resources/9/ordered_records");
+    }
 }

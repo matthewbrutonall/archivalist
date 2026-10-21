@@ -107,4 +107,59 @@ describe "indexer common" do
     indexer.index_records(records)
   end
 
+  describe "Dynamic enum whitespace preservation and frozen-string pipeline" do
+    # WHY FREEZING IS NECESSARY:
+    # In native ArchivesSpace, enum strings (such as those populated through JSONModel
+    # schema lookups or converted from Set instances) behave as frozen strings in the
+    # document hash. The final indexing pipeline invokes clean_whitespace(doc), which
+    # checks:
+    #   if doc.is_a?(String) && !doc.frozen?
+    #     doc.strip!
+    #   end
+    # Because native enum strings were frozen, clean_whitespace skipped strip! and preserved
+    # any leading/trailing whitespace (e.g. '/repositories/4/resources/8.label_enum_s').
+    # In contrast, when Rust accelerates dynamic enum projection, JSON deserialization
+    # creates fresh unfrozen Ruby strings. Without freezing, clean_whitespace mutated
+    # them in-place with strip!, causing a candidate vs native Solr parity mismatch.
+    # Calling freeze_dynamic_enum_strings!(doc) freezes only strings within *_enum_s
+    # arrays, ensuring exact stored enum parity while allowing ordinary fields to be cleaned.
+    it "preserves leading and trailing whitespace on dynamic enum fields while cleaning ordinary fields" do
+      doc = {
+        'title' => '  Uncleaned Title String  ',
+        'description' => "\tOrdinary description\n",
+        'label_enum_s' => ['  leading_space_enum', 'trailing_space_enum  ', 'clean_enum'],
+        'type_enum_s' => ['  both_spaces_enum  '],
+        'unrelated_array' => ['  should_be_stripped  ']
+      }
+
+      # Prior to freezing, strings in arrays are mutable and unfrozen
+      expect(doc['label_enum_s'][0].frozen?).to be(false)
+
+      # freeze_dynamic_enum_strings! freezes only *_enum_s string items
+      indexer.freeze_dynamic_enum_strings!(doc)
+
+      expect(doc['label_enum_s'][0].frozen?).to be(true)
+      expect(doc['label_enum_s'][1].frozen?).to be(true)
+      expect(doc['label_enum_s'][2].frozen?).to be(true)
+      expect(doc['type_enum_s'][0].frozen?).to be(true)
+
+      # Unrelated fields are NOT frozen
+      expect(doc['title'].frozen?).to be(false)
+      expect(doc['description'].frozen?).to be(false)
+      expect(doc['unrelated_array'][0].frozen?).to be(false)
+
+      # Run final document whitespace cleaning
+      cleaned = indexer.clean_whitespace(doc)
+
+      # Preserved exact enum values (including leading/trailing whitespace)
+      expect(cleaned['label_enum_s']).to eq(['  leading_space_enum', 'trailing_space_enum  ', 'clean_enum'])
+      expect(cleaned['type_enum_s']).to eq(['  both_spaces_enum  '])
+
+      # Ordinary fields stripped as expected
+      expect(cleaned['title']).to eq('Uncleaned Title String')
+      expect(cleaned['description']).to eq('Ordinary description')
+      expect(cleaned['unrelated_array']).to eq(['should_be_stripped'])
+    end
+  end
+
 end

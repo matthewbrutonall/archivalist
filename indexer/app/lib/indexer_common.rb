@@ -379,6 +379,14 @@ class IndexerCommon
     doc.delete_if { |k, _| k.is_a?(String) && k.end_with?('_enum_s') }
   end
 
+  def freeze_dynamic_enum_strings!(doc)
+    doc.each do |k, v|
+      if k.is_a?(String) && k.end_with?('_enum_s') && v.is_a?(Array)
+        v.each { |item| item.freeze if item.is_a?(String) }
+      end
+    end
+  end
+
   def strict_json_equal?(expected, actual)
     return false unless expected.class == actual.class
 
@@ -522,6 +530,7 @@ class IndexerCommon
       rust_fields = Array(doc['_archivalist_rust_fields'])
       if rust_fields.include?('dynamic_enum_and_ark_metadata') && valid_dynamic_enum_and_ark_projection?(doc, record)
         # Accelerated by Rust sidecar: skip native dynamic enum traversal
+        freeze_dynamic_enum_strings!(doc)
       else
         doc['_archivalist_rust_fields'].delete('dynamic_enum_and_ark_metadata') if doc['_archivalist_rust_fields'].is_a?(Array)
         clean_dynamic_enum_fields!(doc)

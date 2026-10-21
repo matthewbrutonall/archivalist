@@ -563,6 +563,7 @@ class PUIIndexer < PeriodicIndexer
           'record_type' => "resource_ordered_records",
           'pui_parent_id' => resource_uri,
           'record' => json,
+          'repository' => 'global',
           'pui_auxiliary_json' => authoritative_json,
           'prepare_pui_auxiliary' => true,
         }

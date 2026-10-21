@@ -219,6 +219,27 @@ Scripts under `scripts/` are code-only harnesses:
 - `canary_pui_document_preparation.sh`: isolated non-production canary script for
   low-level PUI document preparation that verifies sidecar /health liveness and response
   privacy cleaning against the Rust sidecar while permanently refusing primary production Solr collections.
+- `repository_integration_stage_harness.rb`: full backend-driven repository integration gate
+  that exercises real ArchivesSpace API record snapshots, STAFF and PUI indexers, and tree/auxiliary
+  traversal against isolated, stage-owned unique Solr cores.
+  - **Invocation**:
+    ```bash
+    docker exec -e REPO_ID=4 -e REPEATS=3 -w /archivesspace archivesspaceai-app-1 \
+      /archivesspace/scripts/jruby /archivesspace/rust-tools/scripts/repository_integration_stage_harness.rb
+    ```
+  - **Safety Guarantees**:
+    - Pre-flight fail-closed validation of backend URL, Solr URL, and repository existence before any core or network mutations.
+    - Permanent prohibition on production or primary Solr cores (`archivesspace`, `archivesspace_shadow`, `production`, `primary`, `live`). Cores are uniquely named `stage_{staff,pui}_<run-id>_{native,candidate,fallback}`.
+    - Sidecars are spawned on dynamically verified unused loopback ports and strictly stopped using verified ownership; other running processes and cores are never blindly killed.
+    - Source database, service configurations, and existing Solr cores remain strictly read-only and intact.
+    - All created cores, benchmark logs, and reports are retained as permanent evidence; no automatic deletes.
+    - All feature flags (`AppConfig[:rust_*]`) default to false and remain disabled by default.
+  - **Truthful Coverage Disclosure**:
+    - Evaluates all record types present in the specified repository (e.g. resources, digital objects, accessions, top containers, container profiles, location profiles, archival objects, jobs).
+    - Unexercised global authority types (`agent_person`, `agent_software`, `agent_family`, `agent_corporate_entity`, `location`, `subject`) and absent repository types (e.g. `assessment`, `classification`, `event`) are explicitly logged and reported as unexercised / not passed rather than claimed as covered.
+    - Auxiliary documents (`resource_ordered_records`, `tree_root`, `tree_waypoint`, `tree_node`, `tree_node_from_root`) are partitioned strictly and verified via type-strict JSON and negative mutation checks.
+    - Outage fallback equivalence is verified with sidecar stopped and endpoint unreachable.
+    - Positive STAFF and positive PUI queries are derived independently at runtime from actual records present in the respective snapshots, asserting real expected IDs, nonzero complete hits, and exact candidate/fallback parity.
 - Helpers that query records require the caller to provide test-specific values
   through environment variables such as `RESOURCE_URI` and `QUERY`.
 
