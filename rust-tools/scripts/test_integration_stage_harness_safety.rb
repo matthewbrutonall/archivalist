@@ -22,6 +22,13 @@ class TestIntegrationStageHarnessSafety < Minitest::Test
     assert ArchivalistHarnessSafety.valid_solr_url?('http://localhost:8985/solr')
     assert ArchivalistHarnessSafety.valid_solr_url?('http://solr:8983/solr')
     assert ArchivalistHarnessSafety.valid_solr_url?('http://solr-test:8984/solr/')
+    assert ArchivalistHarnessSafety.valid_solr_url?('http://solr-bench:8983/solr')
+  end
+
+  def test_url_validation_rejects_near_miss_bench_hosts
+    refute ArchivalistHarnessSafety.valid_solr_url?('http://solr-bench.evil.com:8983/solr')
+    refute ArchivalistHarnessSafety.valid_solr_url?('http://solr-bench2:8983/solr')
+    refute ArchivalistHarnessSafety.valid_solr_url?('http://solr-bench:9999/solr')
   end
 
   def test_url_validation_rejects_external_hosts

@@ -36,7 +36,7 @@ require 'securerandom'
 require 'socket'
 
 module ArchivalistHarnessSafety
-  ALLOWED_HOSTS = ['127.0.0.1', 'localhost', 'solr', 'solr-test'].freeze
+  ALLOWED_HOSTS = ['127.0.0.1', 'localhost', 'solr', 'solr-test', 'solr-bench'].freeze
   ALLOWED_PORTS = [8983, 8984, 8985].freeze
   ALLOWED_BACKEND_HOSTS = ['127.0.0.1', 'localhost', 'backend', 'app'].freeze
   ALLOWED_BACKEND_PORTS = [4567, 8089, 3000, 3002, 3003].freeze

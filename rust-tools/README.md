@@ -240,6 +240,28 @@ Scripts under `scripts/` are code-only harnesses:
     - Auxiliary documents (`resource_ordered_records`, `tree_root`, `tree_waypoint`, `tree_node`, `tree_node_from_root`) are partitioned strictly and verified via type-strict JSON and negative mutation checks.
     - Outage fallback equivalence is verified with sidecar stopped and endpoint unreachable.
     - Positive STAFF and positive PUI queries are derived independently at runtime from actual records present in the respective snapshots, asserting real expected IDs, nonzero complete hits, and exact candidate/fallback parity.
+- `archivalist_profiler.rb` + `archivalist_profile_wrappers.rb`: opt-in aggregate profiler
+  (monotonic clock; calls, bytes, inclusive and exclusive time; nested time is subtracted so
+  exclusive times plus the region remainder sum to the region wall time). Only the stage
+  harness uses it, and only when `ARCHIVALIST_PROFILE=1`; wrappers forward args, kwargs,
+  blocks, return values, exceptions and method visibility, and become pure pass-throughs after
+  `uninstall_all!`. Nothing but aggregates (no record content, URIs, queries or credentials)
+  is stored. Unwrapped work is reported as `unwrapped_remainder_in_region`, never guessed.
+  `sidecar_http_incl_rust_compute` is loopback transport plus server-side Rust compute and is
+  NOT separable without server-side timing. `test_archivalist_profiler.rb` holds the
+  deterministic offline tests (fake clock, synthetic classes).
+- `run_profiled_repository_stage.sh`: runs the repository stage harness in the existing app
+  container with profiling enabled (`REPO_ID` required) and saves stdout, stderr and the true
+  exit status under ignored `benchmarks/`. The harness times warmup + `REPEATS`
+  inactive-wrapper passes first (wrappers are installed but are pass-throughs, so these are NOT
+  fully uninstrumented; JSON keys keep the legacy `uninstrumented_*` names), then
+  `PROFILE_REPEATS` profiled passes per mode. `PROFILE_MODE=off` runs a true no-wrapper
+  baseline (no wrapper installed). Set `SOLR_BASE_URL` (e.g. `http://solr-bench:8983/solr`,
+  allowlisted) to target an isolated Solr. Input snapshot cloning before each pass and Solr
+  commit/fetch after it lie outside the timed pass and are not measured. Profiled/inactive
+  median shows profiling overhead; `compare_all_staff_docs.py` checks ALL stored STAFF docs
+  (the repository comparator alone excludes profile docs). JVM `-Xss` is raised for the whole
+  run because wrapped recursive validators otherwise overflow JRuby's 512K stack cap.
 - Helpers that query records require the caller to provide test-specific values
   through environment variables such as `RESOURCE_URI` and `QUERY`.
 

@@ -149,6 +149,28 @@ if __FILE__ == $PROGRAM_NAME
   require 'pui_indexer'
   require 'large_tree_doc_indexer'
 
+  # Opt-in aggregate profiling (ARCHIVALIST_PROFILE=1). Off by default: nothing is wrapped and
+  # no timing/behavior changes unless explicitly enabled.
+  PROFILE_ENABLED = ENV['ARCHIVALIST_PROFILE'] == '1'
+  PROFILE_REPEATS = (ENV['PROFILE_REPEATS'] || '3').to_i
+  PROFILE_STATE = { profile_this_pass: false, results: {}, wrappers: nil }
+  if PROFILE_ENABLED
+    require_relative 'archivalist_profile_wrappers'
+    PROFILE_STATE[:wrappers] = ArchivalistProfileWrappers.install!
+  end
+
+  def profile_measure(label, &blk)
+    return blk.call unless PROFILE_ENABLED
+
+    ArchivalistProfileWrappers.measure(label, &blk)
+  end
+
+  def run_with_optional_profile(&body)
+    return [body.call, nil] unless PROFILE_STATE[:profile_this_pass]
+
+    ArchivalistProfiler.region('pass', &body)
+  end
+
   include JSONModel
 
   def commit_solr(core_name)
@@ -449,7 +471,7 @@ if __FILE__ == $PROGRAM_NAME
     if options[:builder_enabled]
       RustIndexDocumentBuilder.define_method(:build) do |inputs|
         instrumentation['builder_calls'] += 1
-        res = orig_builder_build.bind(self).call(inputs)
+        res = profile_measure('builder_build') { orig_builder_build.bind(self).call(inputs) }
         instrumentation['builder_projections_received'] += res.length if res.is_a?(Hash)
         res
       end
@@ -498,10 +520,13 @@ if __FILE__ == $PROGRAM_NAME
       end
     end
 
+    profile_snapshot = nil
     start_wall = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     begin
-      records_input.each_slice(100) do |slice|
-        indexer.send(:index_records, slice)
+      _, profile_snapshot = run_with_optional_profile do
+        records_input.each_slice(100) do |slice|
+          indexer.send(:index_records, slice)
+        end
       end
     ensure
       RustIndexDocumentBuilder.define_method(:build, orig_builder_build)
@@ -521,7 +546,8 @@ if __FILE__ == $PROGRAM_NAME
       'wall_ms' => wall_ms,
       'doc_count' => docs.length,
       'docs' => docs,
-      'instrumentation' => instrumentation
+      'instrumentation' => instrumentation,
+      'profile_snapshot' => profile_snapshot
     }
   end
 
@@ -564,14 +590,14 @@ if __FILE__ == $PROGRAM_NAME
     if options[:builder_enabled]
       RustIndexDocumentBuilder.define_method(:build) do |inputs|
         instrumentation['builder_calls'] += 1
-        res = orig_builder_build.bind(self).call(inputs)
+        res = profile_measure('builder_build') { orig_builder_build.bind(self).call(inputs) }
         instrumentation['builder_projections_received'] += res.length if res.is_a?(Hash)
         res
       end
 
       RustIndexDocumentBuilder.define_method(:build_pui_auxiliary) do |inputs|
         instrumentation['auxiliary_builder_calls'] += 1
-        res = orig_builder_aux.bind(self).call(inputs)
+        res = profile_measure('builder_build_pui_auxiliary') { orig_builder_aux.bind(self).call(inputs) }
         instrumentation['auxiliary_docs_received'] += res.length if res.is_a?(Array)
         res
       end
@@ -637,23 +663,26 @@ if __FILE__ == $PROGRAM_NAME
       end
     end
 
+    profile_snapshot = nil
     start_wall = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     begin
-      # 1. Index ordinary PUI records in bounded slices
-      records_input.each_slice(50) do |slice|
-        indexer.send(:index_records, slice)
-      end
+      _, profile_snapshot = run_with_optional_profile do
+        # 1. Index ordinary PUI records in bounded slices
+        records_input.each_slice(50) do |slice|
+          indexer.send(:index_records, slice)
+        end
 
-      # 2. Index Tree & Auxiliary records
-      aux_batch = IndexBatch.new
-      indexer.send(:add_infscroll_docs, res_uris, aux_batch)
+        # 2. Index Tree & Auxiliary records
+        aux_batch = IndexBatch.new
+        indexer.send(:add_infscroll_docs, res_uris, aux_batch)
 
-      builder_for_tree = indexer.send(:rust_index_document_builder)
-      tree_indexer = LargeTreeDocIndexer.new(aux_batch, builder_for_tree)
-      tree_indexer.add_largetree_docs(all_tree_uris)
+        builder_for_tree = indexer.send(:rust_index_document_builder)
+        tree_indexer = LargeTreeDocIndexer.new(aux_batch, builder_for_tree)
+        tree_indexer.add_largetree_docs(all_tree_uris)
 
-      if aux_batch.length > 0
-        indexer.send(:index_batch, aux_batch, nil, :parent_id_field => 'pui_parent_id')
+        if aux_batch.length > 0
+          indexer.send(:index_batch, aux_batch, nil, :parent_id_field => 'pui_parent_id')
+        end
       end
     ensure
       RustIndexDocumentBuilder.define_method(:build, orig_builder_build)
@@ -690,7 +719,8 @@ if __FILE__ == $PROGRAM_NAME
       'ordinary_docs' => ordinary_docs,
       'auxiliary_docs' => auxiliary_docs,
       'other_ordinary_docs' => other_ordinary_docs,
-      'instrumentation' => instrumentation
+      'instrumentation' => instrumentation,
+      'profile_snapshot' => profile_snapshot
     }
   end
 
@@ -709,6 +739,37 @@ if __FILE__ == $PROGRAM_NAME
     end
     sorted = timings.sort
     median = sorted[sorted.length / 2]
+
+    # Optional profiled repeats AFTER the uninstrumented measurements (same warm process, same
+    # snapshot). They rewrite identical documents into the same stage core; `last_res` (used for
+    # parity) is always from an uninstrumented repeat.
+    if PROFILE_ENABLED
+      profiled = []
+      PROFILE_REPEATS.times do |iter|
+        PROFILE_STATE[:profile_this_pass] = true
+        begin
+          pres = block.call
+        ensure
+          PROFILE_STATE[:profile_this_pass] = false
+        end
+        summary = ArchivalistProfiler.summarize(pres['profile_snapshot'], 'pass', categories: ArchivalistProfileWrappers::CATEGORIES)
+        profiled << { 'wall_ms' => pres['wall_ms'], 'snapshot' => pres['profile_snapshot'], 'summary' => summary }
+        puts "    [#{label}] Profiled repeat #{iter + 1}/#{PROFILE_REPEATS}: #{pres['wall_ms']} ms (profiling overhead included)"
+      end
+      PROFILE_STATE[:results][label] = {
+        'uninstrumented_raw_ms' => timings,
+        'uninstrumented_median_ms' => median,
+        'profiled_raw_ms' => profiled.map { |x| x['wall_ms'] },
+        'profiled_median_ms' => ArchivalistProfileWrappers.median(profiled.map { |x| x['wall_ms'] }),
+        'profiled_repeats' => profiled
+      }
+      save_incremental_step('profile', {
+        'run_id' => RUN_ID,
+        'wrappers' => PROFILE_STATE[:wrappers],
+        'modes' => PROFILE_STATE[:results]
+      })
+    end
+
     {
       'label' => label,
       'repeats' => repeats,
