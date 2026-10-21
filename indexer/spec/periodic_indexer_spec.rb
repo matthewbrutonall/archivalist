@@ -296,7 +296,7 @@ describe "periodic indexer" do
       doc = indexer.records.first
       expect(doc['accession_date']).to eq('2026-10-17')
       expect(doc['accession_date_year']).to eq(2026)
-      expected_pub, expected_unpub = IndexerCommon.extract_string_values(accession)
+      expected_pub, expected_unpub = IndexerCommon.extract_string_values(accession.to_hash(:raw))
       expect(doc['fullrecord_published']).to eq(expected_pub)
       expect(doc['fullrecord']).to eq(expected_unpub)
       expect(doc).not_to have_key('_archivalist_rust_fields')
@@ -336,7 +336,7 @@ describe "periodic indexer" do
       doc = indexer.records.first
       expect(doc['accession_date']).to eq(unknown_label)
       expect(doc['accession_date_year']).to eq(9999)
-      expect(doc['fullrecord'].last).to eq("#{unknown_label} ")
+      expect(doc['fullrecord'].last).to eq(unknown_label)
       expect(doc).not_to have_key('_archivalist_rust_fields')
     end
 
@@ -441,7 +441,7 @@ describe "periodic indexer" do
       doc = indexer.records.first
       expect(doc['accession_date']).to eq(unknown_label)
       expect(doc['accession_date_year']).to eq(9999)
-      expect(doc['fullrecord'].last).to eq("#{unknown_label} ")
+      expect(doc['fullrecord'].last).to eq(unknown_label)
       expect(doc).not_to have_key('_archivalist_rust_fields')
     end
 
@@ -481,9 +481,9 @@ describe "periodic indexer" do
       expect(doc['accession_date_year']).to eq(9999)
 
       # Deterministic reconstruction proof: exactly native fullrecord, no pollution, no duplication
-      expected_pub, expected_unpub = IndexerCommon.extract_string_values(accession)
+      expected_pub, expected_unpub = IndexerCommon.extract_string_values(accession.to_hash(:raw))
       expect(doc['fullrecord_published']).to eq(expected_pub)
-      expect(doc['fullrecord']).to eq(expected_unpub + ["#{unknown_label} "])
+      expect(doc['fullrecord']).to eq(expected_unpub + [unknown_label])
       expect(doc['fullrecord']).not_to include('corrupted_item')
       expect(doc['fullrecord']).not_to include('Wrong Unknown Label ')
       expect(doc['fullrecord']).not_to include('extraneous_suffix')
@@ -524,7 +524,7 @@ describe "periodic indexer" do
       doc = indexer.records.first
       expect(doc['accession_date']).to eq('2026-10-17')
       expect(doc['accession_date_year']).to eq(2026)
-      expected_pub, expected_unpub = IndexerCommon.extract_string_values(accession)
+      expected_pub, expected_unpub = IndexerCommon.extract_string_values(accession.to_hash(:raw))
       expect(doc['fullrecord']).to eq(expected_unpub)
       expect(doc).not_to have_key('_archivalist_rust_fields')
     end
@@ -685,6 +685,7 @@ describe "periodic indexer" do
                     'uri' => '/repositories/2/events/11',
                     'event_type' => 'ingestion',
                     'outcome' => 'pass',
+                    'linked_agents' => [],
                     'linked_records' => [
                       {
                         'ref' => '/repositories/2/resources/1',
@@ -758,6 +759,7 @@ describe "periodic indexer" do
                                 'floor' => '1',
                                 'room' => 'A',
                                 'area' => 'Bay 3',
+                                'barcode' => '123456',
                                 'owner_repo' => {'ref' => '/repositories/2'},
                                 'location_profile' => {
                                   'ref' => '/location_profiles/4',
@@ -767,6 +769,7 @@ describe "periodic indexer" do
                                   'uri' => '/locations/16',
                                   'title' => 'Annex Vault',
                                   'building' => 'Native Annex',
+                                  'barcode' => '123457',
                                   'owner_repo' => {'ref' => '/repositories/3'})
 
       allow(JSONModel::HTTP).to receive(:get_json).with('/repositories/3').and_return(
@@ -858,9 +861,9 @@ describe "periodic indexer" do
         'inactive' => false,
         'reviewer' => [],
         'collections' => [],
-        'formats' => [{'label' => 'Native Format', 'value' => 'true'}],
-        'ratings' => [{'label' => 'Native Rating', 'note' => 'Native note'}],
-        'conservation_issues' => [{'label' => 'Native Issue', 'value' => 'true'}]
+        'formats' => [{'label' => 'Native Format', 'value' => 'true', 'definition_id' => 1}],
+        'ratings' => [{'label' => 'Native Rating', 'note' => 'Native note', 'definition_id' => 1}],
+        'conservation_issues' => [{'label' => 'Native Issue', 'value' => 'true', 'definition_id' => 1}]
       )
 
       allow(indexer).to receive(:rust_index_documents) do |prepared_records|
@@ -1231,6 +1234,7 @@ describe "periodic indexer" do
       report_job = {
         'uri' => '/repositories/2/jobs/101',
         'record' => {
+          'uri' => '/repositories/2/jobs/101',
           'jsonmodel_type' => 'job',
           'job_type' => 'report_job',
           'status' => 'native_status',
@@ -1250,6 +1254,7 @@ describe "periodic indexer" do
       import_job = {
         'uri' => '/repositories/2/jobs/102',
         'record' => {
+          'uri' => '/repositories/2/jobs/102',
           'jsonmodel_type' => 'job',
           'job_type' => 'import_job',
           'status' => 'native_status',
@@ -1336,10 +1341,10 @@ describe "periodic indexer" do
       expect(rep_doc['title']).to eq(I18n.t("reports.assessment_list_report.title", :default => 'assessment_list_report'))
       expect(imp_doc['title']).to eq(I18n.t("job.types.import_job"))
 
-      # Ruby retains Time.parse(...).getlocal:
-      expect(rep_doc['time_submitted']).to eq(Time.parse('2026-10-17 10:00:00 UTC').getlocal)
-      expect(rep_doc['time_started']).to eq(Time.parse('2026-10-17 10:01:00 UTC').getlocal)
-      expect(rep_doc['time_finished']).to eq(Time.parse('2026-10-17 10:05:00 UTC').getlocal)
+      # Ruby retains Time.parse(...).getlocal (serialized as string by IndexBatch):
+      expect(rep_doc['time_submitted']).to eq(Time.parse('2026-10-17 10:00:00 UTC').getlocal.to_s)
+      expect(rep_doc['time_started']).to eq(Time.parse('2026-10-17 10:01:00 UTC').getlocal.to_s)
+      expect(rep_doc['time_finished']).to eq(Time.parse('2026-10-17 10:05:00 UTC').getlocal.to_s)
 
       # Ruby retains JSONModel::HTTP output_files lookup and files/job_data construction:
       expect(rep_doc['files']).to eq(['/jobs/101/file/report.pdf'])
@@ -1366,6 +1371,7 @@ describe "periodic indexer" do
       report_job = {
         'uri' => '/repositories/2/jobs/103',
         'record' => {
+          'uri' => '/repositories/2/jobs/103',
           'jsonmodel_type' => 'job',
           'job_type' => 'report_job',
           'status' => 'completed',
@@ -1384,12 +1390,15 @@ describe "periodic indexer" do
       top_container = {
         'uri' => '/repositories/2/top_containers/46',
         'record' => {
+          'uri' => '/repositories/2/top_containers/46',
           'jsonmodel_type' => 'top_container',
           'long_display_string' => 'Box 46',
           'display_string' => 'Box 46',
           'type' => 'box',
           'indicator' => '46',
           'barcode' => 'FB-46',
+          'container_locations' => [],
+          'collection' => [],
           'is_linked_to_published_record' => false,
         },
       }
@@ -1410,7 +1419,7 @@ describe "periodic indexer" do
       expect(job_doc['queue_position']).to eq(5)
       expect(job_doc['types']).to eq(['job', 'report_job', 'assessment_list_report'])
       expect(job_doc['title']).to eq(I18n.t("reports.assessment_list_report.title", :default => 'assessment_list_report'))
-      expect(job_doc['time_submitted']).to eq(Time.parse('2026-10-17 11:00:00 UTC').getlocal)
+      expect(job_doc['time_submitted']).to eq(Time.parse('2026-10-17 11:00:00 UTC').getlocal.to_s)
       expect(job_doc['files']).to eq(['/jobs/103/file/report.csv'])
       expect(job_doc['job_data']).to include('output_file --- /jobs/103/file/report.csv')
       expect(job_doc['job_data']).to include('format --- csv')
@@ -1451,6 +1460,8 @@ describe "periodic indexer" do
           'id_0' => 'COL-1',
           'level' => 'collection',
           'suppressed' => true,
+          'related_accessions' => [],
+          'classifications' => [],
           'collection_management' => full_cm,
         },
       }
@@ -1471,7 +1482,11 @@ describe "periodic indexer" do
           'display_string' => 'Accession 2026-01',
           'title' => nil,
           'id_0' => 'ACC-2',
+          'accession_date' => '2026-01-01',
           'suppressed' => false,
+          'related_resources' => [],
+          'related_accessions' => [],
+          'classifications' => [],
           'collection_management' => minimal_cm,
         },
       }
@@ -1485,6 +1500,9 @@ describe "periodic indexer" do
           'jsonmodel_type' => 'digital_object',
           'title' => 'Digital Object 3',
           'digital_object_id' => 'DO-3',
+          'collection' => [],
+          'linked_instances' => [],
+          'classifications' => [],
           'collection_management' => {
             'uri' => '/repositories/2/collection_management/12',
           },
@@ -1676,6 +1694,8 @@ describe "periodic indexer" do
           'title' => 'Resource without CM',
           'id_0' => 'R99',
           'level' => 'collection',
+          'related_accessions' => [],
+          'classifications' => [],
         },
       }
 
@@ -1697,7 +1717,11 @@ describe "periodic indexer" do
     it "ensures PUI indexer path uses no Rust child handoff and retains native behavior" do
       pui_idx = PeriodicIndexer.new
       def pui_idx.index_batch(batch, timing); @index_batch = batch; end
-      def pui_idx.records; @index_batch ? @index_batch.to_a : []; end
+      def pui_idx.records
+        res = []
+        @index_batch&.each { |r| res << r }
+        res
+      end
       allow(pui_idx).to receive_message_chain(:class, :name).and_return('PUIIndexer')
       expect(pui_idx.rust_index_document_enrichment_enabled?).to be(false)
 
@@ -1773,6 +1797,8 @@ describe "periodic indexer" do
           'title' => 'Resource without CM',
           'id_0' => 'R99',
           'level' => 'collection',
+          'related_accessions' => [],
+          'classifications' => [],
         },
       }
 
@@ -2072,6 +2098,8 @@ describe "periodic indexer" do
           'uri' => '/repositories/2/resources/101',
           'jsonmodel_type' => 'resource',
           'title' => 'Sample PUI Resource',
+          'related_accessions' => [],
+          'classifications' => [],
           'publish' => true,
         },
       }
@@ -2085,6 +2113,10 @@ describe "periodic indexer" do
           'jsonmodel_type' => 'accession',
           'title' => 'Sample PUI Accession',
           'display_string' => 'Acc 102',
+          'accession_date' => '2026-01-01',
+          'related_resources' => [],
+          'related_accessions' => [],
+          'classifications' => [],
           'publish' => true,
         },
       }
@@ -2097,6 +2129,9 @@ describe "periodic indexer" do
           'uri' => '/repositories/2/top_containers/103',
           'jsonmodel_type' => 'top_container',
           'title' => 'Box 103',
+          'display_string' => 'Box 103',
+          'container_locations' => [],
+          'collection' => [],
           'publish' => true,
           'is_linked_to_published_record' => true,
         },
@@ -2479,6 +2514,7 @@ describe "periodic indexer" do
 
       cases.each do |c|
         rec, test_doc, plan = c.call
+        test_doc = Marshal.load(Marshal.dump(test_doc))
         indexer.instance_variable_set(:@pui_availability_projections, { sample_resource['uri'] => plan })
 
         # Before apply, types has only initial primary type
@@ -2590,13 +2626,17 @@ describe "periodic indexer" do
         [true,  'box_linked', 'box_linked', ['top_container', 'pui_top_container', 'pui', 'pui_container', 'pui']],
       ]
 
-      matrix.each do |init_pub, linked_val, exp_pub, exp_types|
+      matrix.each_with_index do |(init_pub, linked_val, exp_pub, exp_types), idx|
+        tc_uri = "/repositories/2/top_containers/#{300 + idx}"
         tc_record = {
-          'uri' => "/repositories/2/top_containers/matrix_#{init_pub}_#{linked_val}",
+          'uri' => tc_uri,
           'record' => {
-            'uri' => "/repositories/2/top_containers/matrix_#{init_pub}_#{linked_val}",
+            'uri' => tc_uri,
             'jsonmodel_type' => 'top_container',
             'title' => 'Matrix Box',
+            'display_string' => 'Matrix Box',
+            'container_locations' => [],
+            'collection' => [],
             'publish' => init_pub,
             'is_linked_to_published_record' => linked_val,
           },

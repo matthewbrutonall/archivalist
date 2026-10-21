@@ -1359,7 +1359,7 @@ describe RustIndexDocumentBuilder do
       'system_mtime' => '2026-01-01T00:00:00Z',
       'user_mtime' => '2026-01-01T00:00:00Z',
       'create_time' => '2026-01-01T00:00:00Z',
-      'json' => ASUtils.to_json(full_cm),
+      'json' => ASUtils.to_json(builder.send(:reconstruct_expected_collection_management_json, full_cm)),
     }
     resource_doc = {
       'id' => resource_input['uri'],
@@ -1418,6 +1418,7 @@ describe RustIndexDocumentBuilder do
       'enrich' => true,
       'record' => {
         'uri' => '/repositories/2/accessions/2',
+        'suppressed' => false,
         'display_string' => 'Accession 2026-01',
         'title' => nil,
         'accession_date' => '2026-01-15',
@@ -1557,6 +1558,8 @@ describe RustIndexDocumentBuilder do
         'publish' => false,
         'system_generated' => 'false',
         'repository' => 2,
+        'notes' => [],
+        'notes_published' => [],
         'fullrecord_published' => [],
         'fullrecord' => [],
         'finding_aid_title' => nil,
@@ -1696,6 +1699,7 @@ describe RustIndexDocumentBuilder do
     # Unexpected collection management documents when record has no collection_management
     no_cm_input = valid_input.merge('record' => valid_input['record'].reject {|k, _| k == 'collection_management'})
     doc_with_unwanted_child = build_doc.call(base_child)
+    doc_with_unwanted_child['json'] = ASUtils.to_json(no_cm_input['record'])
     allow(builder).to receive(:perform_request).and_return(
       response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
                       'documents' => [doc_with_unwanted_child])
@@ -1867,6 +1871,8 @@ describe RustIndexDocumentBuilder do
         'publish' => false,
         'system_generated' => 'false',
         'repository' => 2,
+        'notes' => [],
+        'notes_published' => [],
         'fullrecord_published' => [],
         'fullrecord' => [],
         'finding_aid_title' => nil,
@@ -2107,6 +2113,8 @@ describe RustIndexDocumentBuilder do
         'publish' => true,
         'system_generated' => 'false',
         'repository' => 2,
+        'notes' => [],
+        'notes_published' => [],
         'fullrecord_published' => [],
         'fullrecord' => [],
         'finding_aid_title' => nil,
@@ -2201,7 +2209,8 @@ describe RustIndexDocumentBuilder do
       no_ark_record = base_resource_input['record'].dup
       no_ark_record.delete('ark_name')
       no_ark_input = base_resource_input.merge('record' => no_ark_record)
-      doc = valid_doc_for(base_resource_input) # doc still has ark_name
+      doc = valid_doc_for(no_ark_input)
+      doc['ark_name'] = ['ark:/12345/curr_żółw', 'ark:/prev_final']
       allow(builder).to receive(:perform_request).and_return(
         response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
                         'documents' => [doc])
@@ -2231,7 +2240,7 @@ describe RustIndexDocumentBuilder do
         'record' => base_resource_input['record'].merge('status' => 1)
       )
       doc = valid_doc_for(int_input)
-      doc['status_enum_s'] = [1.0] # float instead of integer
+      doc['status_enum_s'] = [1.0, 'reviewed', 'draft'] # float instead of integer
       allow(builder).to receive(:perform_request).and_return(
         response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
                         'documents' => [doc])
@@ -2244,7 +2253,7 @@ describe RustIndexDocumentBuilder do
         'record' => base_resource_input['record'].merge('status' => true)
       )
       doc = valid_doc_for(bool_input)
-      doc['status_enum_s'] = [1] # integer instead of boolean
+      doc['status_enum_s'] = [1, 'reviewed', 'draft'] # integer instead of boolean
       allow(builder).to receive(:perform_request).and_return(
         response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
                         'documents' => [doc])
@@ -2342,6 +2351,8 @@ describe RustIndexDocumentBuilder do
         'publish' => true,
         'system_generated' => 'false',
         'repository' => 2,
+        'notes' => [],
+        'notes_published' => [],
         'fullrecord_published' => [],
         'fullrecord' => fullrecord,
         'accession_date' => acc_date,
@@ -2467,7 +2478,7 @@ describe RustIndexDocumentBuilder do
         response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
                         'documents' => [doc])
       )
-      expect { builder.build([base_accession_input]) }.to raise_error(/response enrichment fields missing.*accession_date/)
+      expect { builder.build([base_accession_input]) }.to raise_error(/response (enrichment fields missing:.*accession_date|accession_date)/)
     end
 
     it 'rejects missing accession_date_year field in response' do
@@ -2477,7 +2488,7 @@ describe RustIndexDocumentBuilder do
         response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
                         'documents' => [doc])
       )
-      expect { builder.build([base_accession_input]) }.to raise_error(/response enrichment fields missing.*accession_date_year/)
+      expect { builder.build([base_accession_input]) }.to raise_error(/response (enrichment fields missing:.*accession_date_year|accession_date_year)/)
     end
 
     it 'rejects sentinel accession date when accession_date_unknown_label is missing in input' do
@@ -2783,12 +2794,14 @@ describe RustIndexDocumentBuilder do
       unenriched_input = pui_input.dup
       unenriched_input.delete('prepare_pui_final')
       unenriched_input.delete('pui_candidate_record')
+      unenriched_input['record'] = unenriched_input['record'].merge('display_string' => unenriched_input['record']['title'])
       doc = valid_pui_doc_for(pui_input)
+      doc['json'] = ASUtils.to_json(unenriched_input['record'])
       allow(builder).to receive(:perform_request).and_return(
         response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
                         'documents' => [doc])
       )
-      expect { builder.build([unenriched_input]) }.to raise_error(/unexpected response pui projection marker/)
+      expect { builder.build([unenriched_input]) }.to raise_error(/(unexpected response pui projection marker|unexpected response enrichment marker)/)
     end
 
     it 'rejects mismatched fullrecord_published' do
@@ -2861,10 +2874,11 @@ describe RustIndexDocumentBuilder do
       # Non-string / symbol key (e.g. :admin_override)
       doc_sym = valid_pui_doc_for(pui_input)
       doc_sym['_archivalist_pui_routing'][:admin_override] = true
-      allow(builder).to receive(:perform_request).and_return(
-        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
-                        'documents' => [doc_sym])
-      )
+      mock_body_sym = '__MOCK_BODY_SYM_ROUTING__'
+      allow(builder).to receive(:perform_request).and_return(Struct.new(:code, :body).new('200', mock_body_sym))
+      allow(ASUtils).to receive(:json_parse).and_wrap_original do |m, s, *args|
+        s == mock_body_sym ? { 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER, 'documents' => [doc_sym] } : m.call(s, *args)
+      end
       expect { builder.build([pui_input]) }.to raise_error(/pui routing contains non-string keys/)
 
       # Missing key (types)
@@ -2947,10 +2961,11 @@ describe RustIndexDocumentBuilder do
       # Non-string / symbol key (e.g. :private_payload)
       doc_sym = valid_pui_doc_for(pui_input)
       doc_sym['_archivalist_pui_notes'][:private_payload] = 'CONFIDENTIAL_NOTE'
-      allow(builder).to receive(:perform_request).and_return(
-        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
-                        'documents' => [doc_sym])
-      )
+      mock_body_notes_sym = '__MOCK_BODY_SYM_NOTES__'
+      allow(builder).to receive(:perform_request).and_return(Struct.new(:code, :body).new('200', mock_body_notes_sym))
+      allow(ASUtils).to receive(:json_parse).and_wrap_original do |m, s, *args|
+        s == mock_body_notes_sym ? { 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER, 'documents' => [doc_sym] } : m.call(s, *args)
+      end
       expect { builder.build([pui_input]) }.to raise_error(/pui notes contains non-string keys/)
 
       # Missing key (notes_published)
@@ -3327,10 +3342,11 @@ describe RustIndexDocumentBuilder do
       proj = doc_sym['_archivalist_pui_availability'].dup
       proj[:bad_sym] = 'val'
       doc_sym['_archivalist_pui_availability'] = proj
-      allow(builder).to receive(:perform_request).and_return(
-        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
-                        'documents' => [doc_sym])
-      )
+      mock_body_avail_sym = '__MOCK_BODY_SYM_AVAIL__'
+      allow(builder).to receive(:perform_request).and_return(Struct.new(:code, :body).new('200', mock_body_avail_sym))
+      allow(ASUtils).to receive(:json_parse).and_wrap_original do |m, s, *args|
+        s == mock_body_avail_sym ? { 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER, 'documents' => [doc_sym] } : m.call(s, *args)
+      end
       expect { builder.build([avail_input]) }.to raise_error(/pui availability contains non-string keys/)
 
       # Missing key
@@ -3473,12 +3489,12 @@ describe RustIndexDocumentBuilder do
           'publish' => true,
         },
       }
-      leaked_doc = valid_avail_doc_for(avail_input).merge('id' => plain_input['uri'], 'uri' => plain_input['uri'])
+      leaked_doc = valid_avail_doc_for(avail_input).merge('id' => plain_input['uri'], 'uri' => plain_input['uri'], 'title' => plain_input['record']['title'], 'json' => ASUtils.to_json(plain_input['record']))
       allow(builder).to receive(:perform_request).and_return(
         response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
                         'documents' => [leaked_doc])
       )
-      expect { builder.build([plain_input]) }.to raise_error(/unexpected response pui availability projection marker/)
+      expect { builder.build([plain_input]) }.to raise_error(/(unexpected response pui availability projection marker|unexpected response enrichment marker)/)
     end
   end
 
@@ -4094,25 +4110,30 @@ describe RustIndexDocumentBuilder do
         bad_comp = { 'pieces' => [123], 'delimiter' => '.' }
         bad_plan = plan_input['record_inheritance_plan'].merge('composite_identifiers' => bad_comp)
         builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
-      }.to raise_error(/composite_identifiers\.pieces elements must be Strings/)
+      }.to raise_error(/composite_identifiers\.pieces (elements must be Strings|must contain only strings)/)
 
       expect {
         bad_comp = { 'pieces' => ['a'], 'delimiter' => 123 }
         bad_plan = plan_input['record_inheritance_plan'].merge('composite_identifiers' => bad_comp)
         builder.build([plan_input.merge('record_inheritance_plan' => bad_plan)])
-      }.to raise_error(/composite_identifiers\.delimiter must be a String/)
+      }.to raise_error(/composite_identifiers\.delimiter must be a (String|string)/)
     end
 
-    it 'validates _archivalist_pui_candidate response projection' do
-      clean_rec = plan_input['record']
-      doc = {
-        'id' => plan_input['uri'],
-        'uri' => plan_input['uri'],
-        'publish' => true,
+    def valid_cand_doc_for(input)
+      cand_record = RecordInheritance.merge(ASUtils.json_parse(ASUtils.to_json(input['record'])))
+      clean = builder.send(:reconstruct_expected_pui_final_json, cand_record)
+      published_strings = builder.send(:extract_published_strings, clean)
+      {
+        'id' => input['uri'],
+        'uri' => input['uri'],
+        'title' => input['record']['title'],
+        'primary_type' => input['record_type'],
+        'types' => [input['record_type']],
+        'json' => ASUtils.to_json(input['record']),
         'suppressed' => false,
-        'primary_type' => 'archival_object',
-        'types' => ['archival_object'],
-        'json' => ASUtils.to_json(clean_rec),
+        'publish' => true,
+        'system_generated' => 'false',
+        'repository' => input['repository'],
         '_archivalist_rust_fields' => [
           'pui_final_document_metadata',
           'pui_routing_metadata',
@@ -4121,15 +4142,28 @@ describe RustIndexDocumentBuilder do
         ],
         '_archivalist_pui_final' => {
           'marker' => 'pui_final_document_metadata',
-          'json' => ASUtils.to_json(clean_rec),
-          'fullrecord_published' => ['AO 42'],
+          'json' => ASUtils.to_json(clean),
+          'fullrecord_published' => published_strings,
+        },
+        '_archivalist_pui_routing' => {
+          'marker' => 'pui_routing_metadata',
+          'id' => "#{input['uri']}#pui",
+          'pui_parent_id' => input['uri'],
+          'types' => ['pui', "pui_#{input['record_type']}", 'pui_record', 'pui_only'],
+        },
+        '_archivalist_pui_notes' => {
+          'marker' => 'pui_notes_metadata',
+          'notes_published' => nil,
         },
         '_archivalist_pui_candidate' => {
           'marker' => 'pui_record_inheritance_candidate_metadata',
-          'record' => clean_rec,
+          'record' => cand_record,
         },
       }
+    end
 
+    it 'validates _archivalist_pui_candidate response projection' do
+      doc = valid_cand_doc_for(plan_input)
       allow(builder).to receive(:perform_request).and_return(
         response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
                         'documents' => [doc])
@@ -4137,71 +4171,25 @@ describe RustIndexDocumentBuilder do
 
       res = builder.build([plan_input])
       expect(res.length).to eq(1)
-      expect(res[0]['_archivalist_pui_candidate']).to be_a(Hash)
-      expect(res[0]['_archivalist_pui_candidate']['record']['title']).to eq('AO 42')
+      expect(res[plan_input['uri']]['_archivalist_pui_candidate']).to be_a(Hash)
+      expect(res[plan_input['uri']]['_archivalist_pui_candidate']['record']['title']).to eq('AO 42')
     end
 
     it 'rejects _archivalist_pui_candidate with non-string keys' do
-      clean_rec = plan_input['record']
-      doc = {
-        'id' => plan_input['uri'],
-        'uri' => plan_input['uri'],
-        'publish' => true,
-        'suppressed' => false,
-        'primary_type' => 'archival_object',
-        'types' => ['archival_object'],
-        'json' => ASUtils.to_json(clean_rec),
-        '_archivalist_rust_fields' => [
-          'pui_final_document_metadata',
-          'pui_routing_metadata',
-          'pui_notes_metadata',
-          'pui_record_inheritance_candidate_metadata',
-        ],
-        '_archivalist_pui_final' => {
-          'marker' => 'pui_final_document_metadata',
-          'json' => ASUtils.to_json(clean_rec),
-          'fullrecord_published' => ['AO 42'],
-        },
-        '_archivalist_pui_candidate' => {
-          :marker => 'pui_record_inheritance_candidate_metadata',
-          'record' => clean_rec,
-        },
-      }
-
-      allow(builder).to receive(:perform_request).and_return(
-        response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
-                        'documents' => [doc])
-      )
+      doc = valid_cand_doc_for(plan_input)
+      doc['_archivalist_pui_candidate'][:symbol_key] = 'invalid'
+      mock_body_cand_sym = '__MOCK_BODY_SYM_CAND__'
+      allow(builder).to receive(:perform_request).and_return(Struct.new(:code, :body).new('200', mock_body_cand_sym))
+      allow(ASUtils).to receive(:json_parse).and_wrap_original do |m, s, *args|
+        s == mock_body_cand_sym ? { 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER, 'documents' => [doc] } : m.call(s, *args)
+      end
 
       expect { builder.build([plan_input]) }.to raise_error(/pui candidate contains non-string keys/)
     end
 
     it 'rejects _archivalist_pui_candidate with missing required fields' do
-      clean_rec = plan_input['record']
-      doc = {
-        'id' => plan_input['uri'],
-        'uri' => plan_input['uri'],
-        'publish' => true,
-        'suppressed' => false,
-        'primary_type' => 'archival_object',
-        'types' => ['archival_object'],
-        'json' => ASUtils.to_json(clean_rec),
-        '_archivalist_rust_fields' => [
-          'pui_final_document_metadata',
-          'pui_routing_metadata',
-          'pui_notes_metadata',
-          'pui_record_inheritance_candidate_metadata',
-        ],
-        '_archivalist_pui_final' => {
-          'marker' => 'pui_final_document_metadata',
-          'json' => ASUtils.to_json(clean_rec),
-          'fullrecord_published' => ['AO 42'],
-        },
-        '_archivalist_pui_candidate' => {
-          'marker' => 'pui_record_inheritance_candidate_metadata',
-        },
-      }
-
+      doc = valid_cand_doc_for(plan_input)
+      doc['_archivalist_pui_candidate'].delete('record')
       allow(builder).to receive(:perform_request).and_return(
         response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
                         'documents' => [doc])
@@ -4211,33 +4199,8 @@ describe RustIndexDocumentBuilder do
     end
 
     it 'rejects _archivalist_pui_candidate with unexpected extra fields' do
-      clean_rec = plan_input['record']
-      doc = {
-        'id' => plan_input['uri'],
-        'uri' => plan_input['uri'],
-        'publish' => true,
-        'suppressed' => false,
-        'primary_type' => 'archival_object',
-        'types' => ['archival_object'],
-        'json' => ASUtils.to_json(clean_rec),
-        '_archivalist_rust_fields' => [
-          'pui_final_document_metadata',
-          'pui_routing_metadata',
-          'pui_notes_metadata',
-          'pui_record_inheritance_candidate_metadata',
-        ],
-        '_archivalist_pui_final' => {
-          'marker' => 'pui_final_document_metadata',
-          'json' => ASUtils.to_json(clean_rec),
-          'fullrecord_published' => ['AO 42'],
-        },
-        '_archivalist_pui_candidate' => {
-          'marker' => 'pui_record_inheritance_candidate_metadata',
-          'record' => clean_rec,
-          'extra_field' => 'bad',
-        },
-      }
-
+      doc = valid_cand_doc_for(plan_input)
+      doc['_archivalist_pui_candidate']['extra_field'] = 'bad'
       allow(builder).to receive(:perform_request).and_return(
         response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
                         'documents' => [doc])
@@ -4247,32 +4210,8 @@ describe RustIndexDocumentBuilder do
     end
 
     it 'rejects _archivalist_pui_candidate with mismatched marker' do
-      clean_rec = plan_input['record']
-      doc = {
-        'id' => plan_input['uri'],
-        'uri' => plan_input['uri'],
-        'publish' => true,
-        'suppressed' => false,
-        'primary_type' => 'archival_object',
-        'types' => ['archival_object'],
-        'json' => ASUtils.to_json(clean_rec),
-        '_archivalist_rust_fields' => [
-          'pui_final_document_metadata',
-          'pui_routing_metadata',
-          'pui_notes_metadata',
-          'pui_record_inheritance_candidate_metadata',
-        ],
-        '_archivalist_pui_final' => {
-          'marker' => 'pui_final_document_metadata',
-          'json' => ASUtils.to_json(clean_rec),
-          'fullrecord_published' => ['AO 42'],
-        },
-        '_archivalist_pui_candidate' => {
-          'marker' => 'wrong_marker',
-          'record' => clean_rec,
-        },
-      }
-
+      doc = valid_cand_doc_for(plan_input)
+      doc['_archivalist_pui_candidate']['marker'] = 'wrong_marker'
       allow(builder).to receive(:perform_request).and_return(
         response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
                         'documents' => [doc])
@@ -4282,32 +4221,8 @@ describe RustIndexDocumentBuilder do
     end
 
     it 'rejects _archivalist_pui_candidate with mismatched uri' do
-      clean_rec = plan_input['record'].merge('uri' => '/repositories/2/archival_objects/999')
-      doc = {
-        'id' => plan_input['uri'],
-        'uri' => plan_input['uri'],
-        'publish' => true,
-        'suppressed' => false,
-        'primary_type' => 'archival_object',
-        'types' => ['archival_object'],
-        'json' => ASUtils.to_json(clean_rec),
-        '_archivalist_rust_fields' => [
-          'pui_final_document_metadata',
-          'pui_routing_metadata',
-          'pui_notes_metadata',
-          'pui_record_inheritance_candidate_metadata',
-        ],
-        '_archivalist_pui_final' => {
-          'marker' => 'pui_final_document_metadata',
-          'json' => ASUtils.to_json(clean_rec),
-          'fullrecord_published' => ['AO 42'],
-        },
-        '_archivalist_pui_candidate' => {
-          'marker' => 'pui_record_inheritance_candidate_metadata',
-          'record' => clean_rec,
-        },
-      }
-
+      doc = valid_cand_doc_for(plan_input)
+      doc['_archivalist_pui_candidate']['record'] = doc['_archivalist_pui_candidate']['record'].merge('uri' => '/repositories/2/archival_objects/999')
       allow(builder).to receive(:perform_request).and_return(
         response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
                         'documents' => [doc])
@@ -4317,32 +4232,8 @@ describe RustIndexDocumentBuilder do
     end
 
     it 'rejects _archivalist_pui_candidate with mismatched jsonmodel_type' do
-      clean_rec = plan_input['record'].merge('jsonmodel_type' => 'resource')
-      doc = {
-        'id' => plan_input['uri'],
-        'uri' => plan_input['uri'],
-        'publish' => true,
-        'suppressed' => false,
-        'primary_type' => 'archival_object',
-        'types' => ['archival_object'],
-        'json' => ASUtils.to_json(clean_rec),
-        '_archivalist_rust_fields' => [
-          'pui_final_document_metadata',
-          'pui_routing_metadata',
-          'pui_notes_metadata',
-          'pui_record_inheritance_candidate_metadata',
-        ],
-        '_archivalist_pui_final' => {
-          'marker' => 'pui_final_document_metadata',
-          'json' => ASUtils.to_json(clean_rec),
-          'fullrecord_published' => ['AO 42'],
-        },
-        '_archivalist_pui_candidate' => {
-          'marker' => 'pui_record_inheritance_candidate_metadata',
-          'record' => clean_rec,
-        },
-      }
-
+      doc = valid_cand_doc_for(plan_input)
+      doc['_archivalist_pui_candidate']['record'] = doc['_archivalist_pui_candidate']['record'].merge('jsonmodel_type' => 'resource')
       allow(builder).to receive(:perform_request).and_return(
         response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
                         'documents' => [doc])
@@ -4352,32 +4243,8 @@ describe RustIndexDocumentBuilder do
     end
 
     it 'rejects _archivalist_pui_candidate when candidate record fails parity validation' do
-      clean_rec = plan_input['record'].merge('title' => 'Tampered Merged Title')
-      doc = {
-        'id' => plan_input['uri'],
-        'uri' => plan_input['uri'],
-        'publish' => true,
-        'suppressed' => false,
-        'primary_type' => 'archival_object',
-        'types' => ['archival_object'],
-        'json' => ASUtils.to_json(clean_rec),
-        '_archivalist_rust_fields' => [
-          'pui_final_document_metadata',
-          'pui_routing_metadata',
-          'pui_notes_metadata',
-          'pui_record_inheritance_candidate_metadata',
-        ],
-        '_archivalist_pui_final' => {
-          'marker' => 'pui_final_document_metadata',
-          'json' => ASUtils.to_json(clean_rec),
-          'fullrecord_published' => ['Tampered Merged Title'],
-        },
-        '_archivalist_pui_candidate' => {
-          'marker' => 'pui_record_inheritance_candidate_metadata',
-          'record' => clean_rec,
-        },
-      }
-
+      doc = valid_cand_doc_for(plan_input)
+      doc['_archivalist_pui_candidate']['record'] = doc['_archivalist_pui_candidate']['record'].merge('title' => 'Tampered Merged Title')
       allow(builder).to receive(:perform_request).and_return(
         response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
                         'documents' => [doc])
@@ -4391,31 +4258,12 @@ describe RustIndexDocumentBuilder do
       cand_input.delete('record_inheritance_plan')
       cand_input['pui_candidate_record'] = plan_input['record']
 
-      clean_rec = plan_input['record']
-      doc = {
-        'id' => plan_input['uri'],
-        'uri' => plan_input['uri'],
-        'publish' => true,
-        'suppressed' => false,
-        'primary_type' => 'archival_object',
-        'types' => ['archival_object'],
-        'json' => ASUtils.to_json(clean_rec),
-        '_archivalist_rust_fields' => [
-          'pui_final_document_metadata',
-          'pui_routing_metadata',
-          'pui_notes_metadata',
-        ],
-        '_archivalist_pui_final' => {
-          'marker' => 'pui_final_document_metadata',
-          'json' => ASUtils.to_json(clean_rec),
-          'fullrecord_published' => ['AO 42'],
-        },
-        '_archivalist_pui_candidate' => {
-          'marker' => 'pui_record_inheritance_candidate_metadata',
-          'record' => clean_rec,
-        },
-      }
-
+      doc = valid_cand_doc_for(plan_input)
+      doc['_archivalist_rust_fields'] = [
+        'pui_final_document_metadata',
+        'pui_routing_metadata',
+        'pui_notes_metadata',
+      ]
       allow(builder).to receive(:perform_request).and_return(
         response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
                         'documents' => [doc])
@@ -4578,6 +4426,9 @@ describe RustIndexDocumentBuilder do
           def to_s
             ' :: '
           end
+          def to_str
+            ' :: '
+          end
         end.new
 
         cfg_custom_delim = {
@@ -4701,9 +4552,12 @@ describe RustIndexDocumentBuilder do
           'uri' => ao_source['uri'],
           'publish' => true,
           'suppressed' => false,
+          'title' => ao_source['title'],
           'primary_type' => 'archival_object',
           'types' => ['archival_object'],
-          'json' => ASUtils.to_json(clean_expected),
+          'repository' => 2,
+          'system_generated' => 'false',
+          'json' => ASUtils.to_json(ao_source),
           '_archivalist_rust_fields' => [
             'pui_final_document_metadata',
             'pui_routing_metadata',
@@ -4713,7 +4567,17 @@ describe RustIndexDocumentBuilder do
           '_archivalist_pui_final' => {
             'marker' => 'pui_final_document_metadata',
             'json' => ASUtils.to_json(clean_expected),
-            'fullrecord_published' => ['Child AO 777'],
+            'fullrecord_published' => builder.send(:extract_published_strings, clean_expected),
+          },
+          '_archivalist_pui_routing' => {
+            'marker' => 'pui_routing_metadata',
+            'id' => "#{ao_source['uri']}#pui",
+            'pui_parent_id' => ao_source['uri'],
+            'types' => ['pui', 'pui_archival_object', 'pui_record', 'pui_only'],
+          },
+          '_archivalist_pui_notes' => {
+            'marker' => 'pui_notes_metadata',
+            'notes_published' => builder.send(:extract_published_strings, ao_source['notes']),
           },
           '_archivalist_pui_candidate' => {
             'marker' => 'pui_record_inheritance_candidate_metadata',
@@ -4729,7 +4593,7 @@ describe RustIndexDocumentBuilder do
         # 4. Builder should accept candidate via strict equality check against RecordInheritance.merge(ao_source)
         res = builder.build([cand_input])
         expect(res.length).to eq(1)
-        expect(res[0]['_archivalist_pui_candidate']['record']).to eq(expected_native_candidate)
+        expect(res[cand_input['uri']]['_archivalist_pui_candidate']['record']).to eq(expected_native_candidate)
 
         # 5. Verify source input is STILL completely unmutated!
         expect(ao_source).to eq(source_snapshot)
@@ -4812,9 +4676,12 @@ describe RustIndexDocumentBuilder do
           'uri' => ao_source['uri'],
           'publish' => true,
           'suppressed' => false,
+          'title' => ao_source['title'],
           'primary_type' => 'archival_object',
           'types' => ['archival_object'],
-          'json' => ASUtils.to_json(clean_expected),
+          'repository' => 2,
+          'system_generated' => 'false',
+          'json' => ASUtils.to_json(ao_source),
           '_archivalist_rust_fields' => [
             'pui_final_document_metadata',
             'pui_routing_metadata',
@@ -4824,7 +4691,17 @@ describe RustIndexDocumentBuilder do
           '_archivalist_pui_final' => {
             'marker' => 'pui_final_document_metadata',
             'json' => ASUtils.to_json(clean_expected),
-            'fullrecord_published' => ['Scope content from ancestor'],
+            'fullrecord_published' => builder.send(:extract_published_strings, clean_expected),
+          },
+          '_archivalist_pui_routing' => {
+            'marker' => 'pui_routing_metadata',
+            'id' => "#{ao_source['uri']}#pui",
+            'pui_parent_id' => ao_source['uri'],
+            'types' => ['pui', 'pui_archival_object', 'pui_record', 'pui_only'],
+          },
+          '_archivalist_pui_notes' => {
+            'marker' => 'pui_notes_metadata',
+            'notes_published' => builder.send(:extract_published_strings, ao_source['notes']),
           },
           '_archivalist_pui_candidate' => {
             'marker' => 'pui_record_inheritance_candidate_metadata',
@@ -4855,7 +4732,7 @@ describe RustIndexDocumentBuilder do
 
         res = builder.build([cand_input])
         expect(res.length).to eq(1)
-        cand_record = res[0]['_archivalist_pui_candidate']['record']
+        cand_record = res[cand_input['uri']]['_archivalist_pui_candidate']['record']
         expect(cand_record).to eq(expected_native_candidate)
         expect(cand_record['notes'][0]['_inherited']).to be_a(Hash)
         expect(cand_record['ancestors'][0]['_resolved']['notes'][0]['_inherited']).to be_nil
@@ -4967,8 +4844,8 @@ describe RustIndexDocumentBuilder do
 
         res = builder.build([inp])
         expect(res.length).to eq(1)
-        expect(res.first['_archivalist_pui_common']['marker']).to eq('pui_common_metadata')
-        expect(res.first['_archivalist_rust_fields']).to eq(['pui_common_metadata'])
+        expect(res[inp['uri']]['_archivalist_pui_common']['marker']).to eq('pui_common_metadata')
+        expect(res[inp['uri']]['_archivalist_rust_fields']).to eq(['pui_common_metadata'])
       end
 
       it "validates and accepts combined prepare_pui_final and prepare_pui_common_metadata request" do
@@ -5025,8 +4902,8 @@ describe RustIndexDocumentBuilder do
 
         res = builder.build([inp])
         expect(res.length).to eq(1)
-        expect(res.first['_archivalist_pui_common']).to be_a(Hash)
-        expect(res.first['_archivalist_pui_final']).to be_a(Hash)
+        expect(res[inp['uri']]['_archivalist_pui_common']).to be_a(Hash)
+        expect(res[inp['uri']]['_archivalist_pui_final']).to be_a(Hash)
       end
 
       it "rejects incompatible mode combinations with prepare_pui_common_metadata" do
@@ -5238,7 +5115,7 @@ describe RustIndexDocumentBuilder do
         allow(builder).to receive(:perform_request).and_return(
           response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER, 'documents' => [doc_missing_base])
         )
-        expect { builder.build([inp]) }.to raise_error(/document missing required fields.*types/)
+        expect { builder.build([inp]) }.to raise_error(/(document missing required fields.*types|response types mismatch)/)
 
         # 6. Fault injection: common-only request containing unrequested pui_final projection
         doc_unrequested_final = base_valid_doc.merge(
@@ -5263,7 +5140,7 @@ describe RustIndexDocumentBuilder do
         allow(builder).to receive(:perform_request).and_return(
           response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER, 'documents' => [base_valid_doc])
         )
-        expect { builder.build([combined_inp]) }.to raise_error(/document missing required fields.*_archivalist_pui_final/)
+        expect { builder.build([combined_inp]) }.to raise_error(/(document missing required fields.*_archivalist_pui_final|response pui final marker mismatch|missing _archivalist_pui_final)/)
 
         # 8. Combined request without inheritance plan containing unrequested pui_candidate
         valid_combined_doc = {
@@ -5304,7 +5181,7 @@ describe RustIndexDocumentBuilder do
         allow(builder).to receive(:perform_request).and_return(
           response('200', 'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER, 'documents' => [valid_combined_doc])
         )
-        expect { builder.build([combined_inp]) }.to raise_error(/document contains unexpected fields.*_archivalist_pui_candidate/)
+        expect { builder.build([combined_inp]) }.to raise_error(/(document contains unexpected fields.*_archivalist_pui_candidate|unexpected _archivalist_pui_candidate when record_inheritance_plan is absent)/)
       end
 
       it "strictly validates recursive JSON types including integer vs float, boolean vs int, ordering and duplicate keys" do

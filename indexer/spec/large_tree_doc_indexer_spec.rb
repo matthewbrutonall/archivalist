@@ -356,7 +356,7 @@ describe LargeTreeDocIndexer do
 
     it 'enables tree acceleration consistently whenever ordered-records acceleration is enabled' do
       indexer = described_class.new([])
-      pui_indexer = PUIIndexer.new
+      pui_indexer = PUIIndexer.new(AppConfig[:backend_url], nil, 'PUIIndexer')
 
       # When set to a truthy string, both indexers enable acceleration
       AppConfig[:rust_pui_auxiliary_documents_enabled] = "true"

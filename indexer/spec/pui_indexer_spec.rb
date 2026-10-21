@@ -7,7 +7,7 @@ describe "PUI indexer" do
 
     def indexer.prepare_docs(records)
       records.map {|rec|
-        rec_hash = rec.respond_to?(:to_hash) ? rec.to_hash(:raw) : rec
+        rec_hash = rec.is_a?(Hash) ? rec : (rec.respond_to?(:to_hash) ? rec.to_hash(:raw) : rec)
         rec_hash = ASUtils.json_parse(ASUtils.to_json(rec_hash))
         rec_hash['display_string'] ||= rec_hash['title']
 
@@ -327,6 +327,7 @@ describe "PUI indexer" do
                        'top_container' => {
                          'ref' => '/repositories/2/top_containers/1',
                          '_resolved' => {
+                           'container_locations' => [],
                            'internal_note' => 'PRIVATE_INTERNAL_NOTE',
                            'container_profile' => {
                              '_resolved' => {
@@ -417,9 +418,9 @@ describe "PUI indexer" do
 
     it "reflects intentional privacy hardening and baseline normalization between native and Rust-prepared outputs" do
       _res, ao1 = sample_records
-      _res, ao2 = sample_records
-
       rec_native = indexer.prepare_docs([ao1]).first
+      rec_native['record'] = RecordInheritance.merge(rec_native['record'])
+      ao2 = indexer.deep_copy_record_candidate(rec_native['record'])
       doc_native = indexer.start_index(rec_native)
       doc_native['ancestors'] = ['/repositories/2/resources/1']
       indexer.run_all_but_final_doc_rules(doc_native, rec_native)
@@ -430,7 +431,7 @@ describe "PUI indexer" do
       doc_rust = indexer.start_index(rec_rust)
       doc_rust['ancestors'] = ['/repositories/2/resources/1']
 
-      candidate = RecordInheritance.merge(indexer.deep_copy_record_candidate(rec_rust['record']))
+      candidate = indexer.deep_copy_record_candidate(rec_rust['record'])
       clean_candidate = indexer.deep_copy_record_candidate(candidate)
       clean_candidate.delete('ancestors')
       clean_candidate['instances'][0]['sub_container']['top_container']['_resolved'].delete('internal_note')
@@ -482,7 +483,7 @@ describe "PUI indexer" do
       test_indexer = PUIIndexer.new(AppConfig[:backend_url], nil, 'PUIIndexer')
       captured_batch = []
       test_indexer.define_singleton_method(:index_batch) do |batch, _timing = nil, _opts = {}|
-        captured_batch.concat(batch)
+        batch.each { |doc| captured_batch << doc }
       end
 
       _res, ao = sample_records
@@ -617,7 +618,7 @@ describe "PUI indexer" do
       fallback_indexer = PUIIndexer.new(AppConfig[:backend_url], nil, 'PUIIndexer')
       fallback_batch = []
       fallback_indexer.define_singleton_method(:index_batch) do |batch, _timing = nil, _opts = {}|
-        fallback_batch.concat(batch)
+        batch.each { |doc| fallback_batch << doc }
       end
 
       _res2, ao2 = sample_records
@@ -989,14 +990,14 @@ describe "PUI indexer" do
       doc6 = indexer.start_index(rec)
       bad_rec6 = indexer.deep_copy_record_candidate(rec)
       bad_rec6['record']['uri'] = '/repositories/2/archival_objects/999'
-      indexer.instance_variable_set(:@pui_routing_projections, { uri => {
+      indexer.instance_variable_set(:@pui_routing_projections, { bad_rec6['record']['uri'] => {
         'marker' => 'pui_routing_metadata',
-        'id' => "#{uri}#pui",
-        'pui_parent_id' => uri,
+        'id' => "#{bad_rec6['record']['uri']}#pui",
+        'pui_parent_id' => bad_rec6['record']['uri'],
         'types' => ['pui', 'pui_archival_object', 'pui_record', 'pui_only']
       }})
       expect(indexer.apply_rust_pui_routing_projection(doc6, bad_rec6)).to be(false)
-      expect(indexer.instance_variable_get(:@pui_routing_projections)[uri]).to be_nil
+      expect(indexer.instance_variable_get(:@pui_routing_projections)[bad_rec6['record']['uri']]).to be_nil
       expect(doc6['id']).to eq(uri)
       expect(doc6['types']).to eq(['archival_object'])
 
@@ -1239,16 +1240,19 @@ describe "PUI indexer" do
 
   it "enables rust_pui_record_inheritance_candidate_enabled? only when configured" do
     begin
+      AppConfig[:rust_pui_document_preparation_enabled] = true
       expect(indexer.rust_pui_record_inheritance_candidate_enabled?).to be(false)
       AppConfig[:rust_pui_record_inheritance_candidate_enabled] = true
       expect(indexer.rust_pui_record_inheritance_candidate_enabled?).to be(true)
     ensure
       AppConfig[:rust_pui_record_inheritance_candidate_enabled] = false
+      AppConfig[:rust_pui_document_preparation_enabled] = false
     end
   end
 
   it "supports general Ruby truthiness for rust_pui_record_inheritance_candidate_enabled?" do
     begin
+      AppConfig[:rust_pui_document_preparation_enabled] = true
       AppConfig[:rust_pui_record_inheritance_candidate_enabled] = "yes"
       expect(indexer.rust_pui_record_inheritance_candidate_enabled?).to be_truthy
       AppConfig[:rust_pui_record_inheritance_candidate_enabled] = :enabled
@@ -1259,6 +1263,7 @@ describe "PUI indexer" do
       expect(indexer.rust_pui_record_inheritance_candidate_enabled?).to be_falsey
     ensure
       AppConfig[:rust_pui_record_inheritance_candidate_enabled] = false
+      AppConfig[:rust_pui_document_preparation_enabled] = false
     end
   end
 
@@ -1286,14 +1291,16 @@ describe "PUI indexer" do
 
       uri = '/repositories/2/archival_objects/77'
       rec = {
-        'uri' => uri,
-        'jsonmodel_type' => 'archival_object',
-        'title' => 'Test Item',
-        'publish' => true,
-        'suppressed' => false,
-        'ancestors' => []
+        'record' => {
+          'uri' => uri,
+          'jsonmodel_type' => 'archival_object',
+          'title' => 'Test Item',
+          'publish' => true,
+          'suppressed' => false,
+          'ancestors' => []
+        }
       }
-      doc = {}
+      doc = { 'primary_type' => 'archival_object' }
 
       # Injected candidate projection with mismatch
       mismatched_candidate = {
@@ -1330,7 +1337,7 @@ describe "PUI indexer" do
         'ancestors' => []
       }
       rec = { 'record' => rec_hash, 'uri' => uri }
-      doc = {}
+      doc = { 'primary_type' => 'archival_object' }
 
       expected_merged = RecordInheritance.merge(indexer.deep_copy_record_candidate(rec_hash))
       clean_rec = indexer.deep_copy_record_candidate(expected_merged)
@@ -1461,14 +1468,16 @@ describe "PUI indexer" do
           'ref' => nil,
           'level' => 'subseries',
           '_resolved' => {
-            'language' => 'lat'
+            'language' => 'lat',
+            'notes' => []
           }
         },
         {
           'ref' => 12345,
           'level' => 'fonds',
           '_resolved' => {
-            'edition' => '1st'
+            'edition' => '1st',
+            'notes' => []
           }
         }
       ]
@@ -1481,8 +1490,8 @@ describe "PUI indexer" do
     # Verify duplicate refs did not overwrite each other:
     # We should have a rule action inheriting from the first dupe ref ('series')
     # AND a rule action inheriting from the second dupe ref ('collection')
-    scope_rule = plan['rules'].find { |r| r['property'] == 'notes' && r['inherited_props']['level'] == 'series' }
-    access_rule = plan['rules'].find { |r| r['property'] == 'notes' && r['inherited_props']['level'] == 'collection' }
+    scope_rule = plan['rules'].find { |r| r['property'] == 'notes' && r['inherited_props']['level'].to_s.downcase == 'series' }
+    access_rule = plan['rules'].find { |r| r['property'] == 'notes' && r['inherited_props']['level'].to_s.downcase == 'collection' }
     expect(scope_rule).not_to be_nil
     expect(access_rule).not_to be_nil
     expect(scope_rule['inherited_props']['ref']).to eq('/repositories/2/resources/dupe')
@@ -1498,7 +1507,13 @@ describe "PUI indexer" do
   it "translates levels lazily only at the exact point of inheritance" do
     translated_levels = []
     # Test that translate_level is only called for ancestors that actually contribute inherited properties
-    inheritance = RecordInheritance.new
+    inheritance = RecordInheritance.new({
+      :archival_object => {
+        :inherited_fields => [
+          { :property => 'language', :inherit_directly => true }
+        ]
+      }
+    })
     allow(inheritance).to receive(:translate_level) do |level|
       translated_levels << level
       level.upcase
@@ -1522,13 +1537,14 @@ describe "PUI indexer" do
         {
           'ref' => '/repositories/2/archival_objects/unrelated',
           'level' => 'unrelated_series',
-          '_resolved' => {} # no qualifying values to inherit
+          '_resolved' => { 'notes' => [] } # no qualifying values to inherit
         },
         {
           'ref' => '/repositories/2/resources/contributing',
           'level' => 'contributing_collection',
           '_resolved' => {
-            'language' => 'spa'
+            'language' => 'spa',
+            'notes' => []
           }
         }
       ]
@@ -1546,7 +1562,13 @@ describe "PUI indexer" do
     call_counts = Hash.new(0)
     counter = 0
 
-    inheritance = RecordInheritance.new
+    inheritance = RecordInheritance.new({
+      :archival_object => {
+        :inherited_fields => [
+          { :property => 'language', :inherit_directly => true }
+        ]
+      }
+    })
     allow(inheritance).to receive(:translate_level) do |level|
       counter += 1
       call_counts[level] += 1
@@ -1571,13 +1593,14 @@ describe "PUI indexer" do
         {
           'ref' => '/repositories/2/archival_objects/unrelated',
           'level' => 'unrelated_series',
-          '_resolved' => {} # no qualifying values to inherit
+          '_resolved' => { 'notes' => [] } # no qualifying values to inherit
         },
         {
           'ref' => '/repositories/2/resources/contributing',
           'level' => 'contributing_collection',
           '_resolved' => {
-            'language' => 'spa'
+            'language' => 'spa',
+            'notes' => []
           }
         }
       ]
@@ -1628,7 +1651,7 @@ describe "PUI indexer" do
       }
 
       # 1. Non-string keys in candidate projection
-      doc1 = {}
+      doc1 = { 'primary_type' => 'archival_object' }
       bad_cand1 = {
         :marker => 'pui_record_inheritance_candidate_metadata',
         'record' => expected_merged,
@@ -1638,10 +1661,10 @@ describe "PUI indexer" do
       expect(indexer.apply_rust_pui_final_projection(doc1, rec)).to be(false)
       expect(indexer.instance_variable_get(:@pui_candidate_projections)[uri]).to be_nil
       expect(indexer.instance_variable_get(:@pui_final_projections)[uri]).to be_nil
-      expect(doc1).to be_empty
+      expect(doc1).to eq({ 'primary_type' => 'archival_object' })
 
       # 2. Missing required keys in candidate projection
-      doc2 = {}
+      doc2 = { 'primary_type' => 'archival_object' }
       bad_cand2 = {
         'marker' => 'pui_record_inheritance_candidate_metadata',
       }
@@ -1650,10 +1673,10 @@ describe "PUI indexer" do
       expect(indexer.apply_rust_pui_final_projection(doc2, rec)).to be(false)
       expect(indexer.instance_variable_get(:@pui_candidate_projections)[uri]).to be_nil
       expect(indexer.instance_variable_get(:@pui_final_projections)[uri]).to be_nil
-      expect(doc2).to be_empty
+      expect(doc2).to eq({ 'primary_type' => 'archival_object' })
 
       # 3. Unexpected extra keys in candidate projection
-      doc3 = {}
+      doc3 = { 'primary_type' => 'archival_object' }
       bad_cand3 = {
         'marker' => 'pui_record_inheritance_candidate_metadata',
         'record' => expected_merged,
@@ -1664,7 +1687,7 @@ describe "PUI indexer" do
       expect(indexer.apply_rust_pui_final_projection(doc3, rec)).to be(false)
       expect(indexer.instance_variable_get(:@pui_candidate_projections)[uri]).to be_nil
       expect(indexer.instance_variable_get(:@pui_final_projections)[uri]).to be_nil
-      expect(doc3).to be_empty
+      expect(doc3).to eq({ 'primary_type' => 'archival_object' })
     ensure
       AppConfig[:rust_pui_document_preparation_enabled] = false
       AppConfig[:rust_pui_record_inheritance_candidate_enabled] = false
@@ -1699,7 +1722,7 @@ describe "PUI indexer" do
       }
 
       # 1. Candidate record with float 1.0 where integer 1 is expected
-      doc_float = {}
+      doc_float = { 'primary_type' => 'archival_object' }
       cand_float_rec = indexer.deep_copy_record_candidate(expected_merged)
       cand_float_rec['int_val'] = 1.0
       bad_cand_float = {
@@ -1711,10 +1734,10 @@ describe "PUI indexer" do
       expect(indexer.apply_rust_pui_final_projection(doc_float, rec)).to be(false)
       expect(indexer.instance_variable_get(:@pui_candidate_projections)[uri]).to be_nil
       expect(indexer.instance_variable_get(:@pui_final_projections)[uri]).to be_nil
-      expect(doc_float).to be_empty
+      expect(doc_float).to eq({ 'primary_type' => 'archival_object' })
 
       # 2. Candidate record with integer 1 where boolean true is expected
-      doc_bool = {}
+      doc_bool = { 'primary_type' => 'archival_object' }
       cand_bool_rec = indexer.deep_copy_record_candidate(expected_merged)
       cand_bool_rec['bool_val'] = 1
       bad_cand_bool = {
@@ -1726,7 +1749,7 @@ describe "PUI indexer" do
       expect(indexer.apply_rust_pui_final_projection(doc_bool, rec)).to be(false)
       expect(indexer.instance_variable_get(:@pui_candidate_projections)[uri]).to be_nil
       expect(indexer.instance_variable_get(:@pui_final_projections)[uri]).to be_nil
-      expect(doc_bool).to be_empty
+      expect(doc_bool).to eq({ 'primary_type' => 'archival_object' })
     ensure
       AppConfig[:rust_pui_document_preparation_enabled] = false
       AppConfig[:rust_pui_record_inheritance_candidate_enabled] = false
@@ -2228,7 +2251,7 @@ describe "PUI indexer" do
           'suppressed' => false,
           'publish' => true,
           'system_generated' => 'false',
-          'repository' => 2,
+          'repository' => '/repositories/2',
           '_archivalist_rust_fields' => ['pui_common_metadata'],
           '_archivalist_pui_common' => valid_pui_common_projection.dup
         }
@@ -2357,7 +2380,7 @@ describe "PUI indexer" do
           'suppressed' => false,
           'publish' => true,
           'system_generated' => 'false',
-          'repository' => 2,
+          'repository' => '/repositories/2',
           '_archivalist_rust_fields' => ['pui_common_metadata'],
           '_archivalist_pui_common' => valid_pui_common_projection.dup
         }
@@ -2494,7 +2517,7 @@ describe "PUI indexer" do
           'suppressed' => false,
           'publish' => true,
           'system_generated' => 'false',
-          'repository' => 2,
+          'repository' => '/repositories/2',
           '_archivalist_rust_fields' => ['pui_common_metadata'],
           '_archivalist_pui_common' => valid_pui_common_projection.dup
         }
@@ -2570,7 +2593,7 @@ describe "PUI indexer" do
           'suppressed' => false,
           'publish' => true,
           'system_generated' => 'false',
-          'repository' => 2,
+          'repository' => '/repositories/2',
           '_archivalist_rust_fields' => ['pui_common_metadata'],
           '_archivalist_pui_common' => sparse_common_proj
         }
@@ -2642,7 +2665,7 @@ describe "PUI indexer" do
           'suppressed' => false,
           'publish' => true,
           'system_generated' => 'false',
-          'repository' => 2,
+          'repository' => '/repositories/2',
           '_archivalist_rust_fields' => ['pui_common_metadata'],
           '_archivalist_pui_common' => valid_pui_common_projection.dup
         }
