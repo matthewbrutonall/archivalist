@@ -2849,14 +2849,14 @@ fn clean_pui_candidate_instances(instances: &mut [Value]) {
             if let Some(Value::Object(sub_container)) = instance_obj.get_mut("sub_container") {
                 if let Some(Value::Object(top_container)) = sub_container.get_mut("top_container") {
                     if let Some(Value::Object(resolved_top)) = top_container.get_mut("_resolved") {
-                        resolved_top.remove("internal_note");
+                        resolved_top.shift_remove("internal_note");
                         if let Some(Value::Object(container_profile)) =
                             resolved_top.get_mut("container_profile")
                         {
                             if let Some(Value::Object(resolved_cp)) =
                                 container_profile.get_mut("_resolved")
                             {
-                                resolved_cp.remove("notes");
+                                resolved_cp.shift_remove("notes");
                             }
                         }
                     }
@@ -2993,9 +2993,6 @@ fn execute_record_inheritance_merge(
                     has_non_object = true;
                 }
             }
-            if has_non_object {
-                record.insert(format!("{}_inherited", rule.property), props_val.clone());
-            }
 
             let target_arr = match record.get_mut(&rule.property) {
                 Some(Value::Array(existing)) => existing,
@@ -3010,13 +3007,16 @@ fn execute_record_inheritance_merge(
             };
             target_arr.extend(items.clone());
             flatten_json_array(target_arr);
-        } else {
-            if let Value::Object(val_obj) = &mut val {
-                val_obj.insert("_inherited".to_string(), props_val);
-            } else {
-                record.insert(format!("{}_inherited", rule.property), props_val);
+
+            if has_non_object {
+                record.insert(format!("{}_inherited", rule.property), props_val.clone());
             }
+        } else if let Value::Object(val_obj) = &mut val {
+            val_obj.insert("_inherited".to_string(), props_val);
             record.insert(rule.property.clone(), val);
+        } else {
+            record.insert(rule.property.clone(), val);
+            record.insert(format!("{}_inherited", rule.property), props_val);
         }
     }
 
@@ -3193,7 +3193,7 @@ fn add_pui_final_fields(
     let mut clean_candidate = candidate_obj;
 
     // Remove ancestors from the final PUI JSON candidate
-    clean_candidate.remove("ancestors");
+    clean_candidate.shift_remove("ancestors");
 
     // Remove top-container internal_note and container-profile notes within instances
     if let Some(Value::Array(instances)) = clean_candidate.get_mut("instances") {
@@ -3250,7 +3250,7 @@ fn add_pui_final_fields(
     );
 
     // CRITICAL: Never emit unpublished/private fullrecord for this PUI slice
-    document.remove("fullrecord");
+    document.shift_remove("fullrecord");
 
     Ok(())
 }
@@ -7956,11 +7956,14 @@ mod tests {
         });
 
         let mut expected_clean = candidate.clone();
-        expected_clean.as_object_mut().unwrap().remove("ancestors");
+        expected_clean
+            .as_object_mut()
+            .unwrap()
+            .shift_remove("ancestors");
         expected_clean["instances"][0]["sub_container"]["top_container"]["_resolved"]
             .as_object_mut()
             .unwrap()
-            .remove("internal_note");
+            .shift_remove("internal_note");
 
         let (expected_published, _expected_unpublished) = extract_string_values(&expected_clean);
 
@@ -12888,5 +12891,216 @@ mod tests {
             ..Default::default()
         };
         assert!(build_index_document(inp2).is_err());
+    }
+
+    #[test]
+    fn test_pui_final_non_alphabetical_nested_and_unicode_parity() {
+        let raw_json = r#"{
+            "z_custom": "custom_value",
+            "uri": "/repositories/999/archival_objects/777",
+            "title": "Émile Cartailhac 📚 — Société Géologique 中文",
+            "suppressed": false,
+            "publish": true,
+            "jsonmodel_type": "archival_object",
+            "repository": {"ref": "/repositories/999"},
+            "notes": [
+                {
+                    "type": "scopecontent",
+                    "publish": true,
+                    "jsonmodel_type": "note_singlepart",
+                    "content": ["Premier mémoire sur les cavernes pyrénéennes."]
+                }
+            ],
+            "ancestors": [
+                {
+                    "ref": "/repositories/999/resources/10",
+                    "level": "collection",
+                    "_resolved": {"title": "Secret Ancestor Collection"}
+                }
+            ],
+            "instances": [
+                {
+                    "instance_type": "mixed_materials",
+                    "sub_container": {
+                        "top_container": {
+                            "ref": "/repositories/999/top_containers/501",
+                            "_resolved": {
+                                "z_custom": "keep_after_clean",
+                                "display_string": "Boîte 501",
+                                "internal_note": "TOP_SECRET_INTERNAL_NOTE_123",
+                                "container_profile": {
+                                    "_resolved": {
+                                        "name": "Carton d'archives",
+                                        "notes": "TOP_SECRET_PROFILE_NOTE_456"
+                                    }
+                                },
+                                "a_custom": "keep_last"
+                            }
+                        }
+                    }
+                }
+            ],
+            "a_custom": "final_field"
+        }"#;
+
+        let candidate: Value = serde_json::from_str(raw_json).unwrap();
+        let input = IndexDocumentInput {
+            uri: "/repositories/999/archival_objects/777".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(999),
+            record: candidate.clone(),
+            prepare_pui_final: true,
+            pui_candidate_record: Some(candidate),
+            ..Default::default()
+        };
+
+        let doc = build_index_document(input).expect("must build successfully");
+        let pui_final = &doc[PUI_FINAL_DOCUMENTS_KEY];
+        let pui_json_str = pui_final["json"].as_str().unwrap();
+
+        assert!(!pui_json_str.contains("ancestors"));
+        assert!(!pui_json_str.contains("Secret Ancestor Collection"));
+        assert!(!pui_json_str.contains("TOP_SECRET_INTERNAL_NOTE_123"));
+        assert!(!pui_json_str.contains("TOP_SECRET_PROFILE_NOTE_456"));
+
+        let parsed_clean: Value = serde_json::from_str(pui_json_str).unwrap();
+        let obj = parsed_clean.as_object().unwrap();
+        let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "z_custom",
+                "uri",
+                "title",
+                "suppressed",
+                "publish",
+                "jsonmodel_type",
+                "repository",
+                "notes",
+                "instances",
+                "a_custom"
+            ]
+        );
+
+        let instances = obj["instances"].as_array().unwrap();
+        let tc_resolved = instances[0]["sub_container"]["top_container"]["_resolved"]
+            .as_object()
+            .unwrap();
+        let tc_keys: Vec<&str> = tc_resolved.keys().map(String::as_str).collect();
+        assert_eq!(
+            tc_keys,
+            vec![
+                "z_custom",
+                "display_string",
+                "container_profile",
+                "a_custom"
+            ]
+        );
+
+        let cp_resolved = tc_resolved["container_profile"]["_resolved"]
+            .as_object()
+            .unwrap();
+        let cp_keys: Vec<&str> = cp_resolved.keys().map(String::as_str).collect();
+        assert_eq!(cp_keys, vec!["name"]);
+
+        let pub_strings = pui_final["fullrecord_published"].as_array().unwrap();
+        let pub_vec: Vec<&str> = pub_strings.iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(
+            pub_vec,
+            vec![
+                "custom_value",
+                "/repositories/999/archival_objects/777",
+                "Émile Cartailhac 📚 — Société Géologique 中文",
+                "final_field",
+                "mixed_materials",
+                "scopecontent",
+                "Premier mémoire sur les cavernes pyrénéennes."
+            ]
+        );
+    }
+
+    #[test]
+    fn test_record_inheritance_candidate_scalar_and_array_key_ordering() {
+        let raw_record = r#"{
+            "z_header": "top",
+            "uri": "/repositories/999/archival_objects/888",
+            "jsonmodel_type": "archival_object",
+            "title": "Inheritance AO",
+            "publish": true,
+            "suppressed": false,
+            "dates": [],
+            "ancestors": [
+                {
+                    "ref": "/repositories/999/resources/10",
+                    "level": "collection",
+                    "_resolved": {
+                        "dates": [
+                            {"label": "creation", "expression": "1882", "begin": "1882-01-01"}
+                        ],
+                        "language": "fre"
+                    }
+                }
+            ],
+            "a_tail": "bottom"
+        }"#;
+
+        let record_val: Value = serde_json::from_str(raw_record).unwrap();
+        let plan = RecordInheritancePlan {
+            record_type: "archival_object".to_string(),
+            rules: vec![
+                RecordInheritanceRulePlan {
+                    property: "dates".to_string(),
+                    inherit_directly: true,
+                    ancestor_index: 0,
+                    ancestor_element_indices: Some(vec![0]),
+                    inherited_value: json!([
+                        {"label": "creation", "expression": "1882", "begin": "1882-01-01"}
+                    ]),
+                    inherited_props: InheritanceProps {
+                        ref_val: Value::String("/repositories/999/resources/10".to_string()),
+                        level: Value::String("Collection".to_string()),
+                        direct: true,
+                    },
+                },
+                RecordInheritanceRulePlan {
+                    property: "language".to_string(),
+                    inherit_directly: false,
+                    ancestor_index: 0,
+                    ancestor_element_indices: None,
+                    inherited_value: Value::String("fre".to_string()),
+                    inherited_props: InheritanceProps {
+                        ref_val: Value::String("/repositories/999/resources/10".to_string()),
+                        level: Value::String("Collection".to_string()),
+                        direct: false,
+                    },
+                },
+            ],
+            composite_identifiers: Some(CompositeIdentifierPlan {
+                pieces: vec!["COL-10".to_string(), "SER-888".to_string()],
+                delimiter: ".".to_string(),
+            }),
+        };
+
+        let merged =
+            execute_record_inheritance_merge(&record_val, &plan).expect("merge must succeed");
+        let keys: Vec<&str> = merged.keys().map(String::as_str).collect();
+
+        assert_eq!(
+            keys,
+            vec![
+                "z_header",
+                "uri",
+                "jsonmodel_type",
+                "title",
+                "publish",
+                "suppressed",
+                "dates",
+                "ancestors",
+                "a_tail",
+                "language",
+                "language_inherited",
+                "_composite_identifier"
+            ]
+        );
     }
 }

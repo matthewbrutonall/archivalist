@@ -1970,4 +1970,12 @@ mod tests {
             Some("archivesspace_shadow")
         );
     }
+
+    #[test]
+    fn test_sidecar_json_insertion_order_preserved() {
+        let input = r#"{"z_field":"end","a_field":"start","nested":{"m":1,"b":2}}"#;
+        let val: serde_json::Value = serde_json::from_str(input).unwrap();
+        let out = serde_json::to_string(&val).unwrap();
+        assert_eq!(input, out);
+    }
 }

@@ -696,6 +696,199 @@ test "builder rejects unrequested pui_candidate in combined request without inhe
   end
 end
 
+test "builder validates non-alphabetical key preservation and exact serialization for pui_final" do
+  builder = RustIndexDocumentBuilder.new('http://127.0.0.1:4570', 2)
+  non_alpha_rec = {
+    'z_custom' => 'last_letter',
+    'uri' => '/repositories/2/resources/998',
+    'title' => 'Émile Cartailhac 📚 — Société Géologique 中文',
+    'publish' => true,
+    'jsonmodel_type' => 'resource',
+    'repository' => { 'ref' => '/repositories/2' },
+    'notes' => [
+      { 'jsonmodel_type' => 'note_singlepart', 'type' => 'scopecontent', 'publish' => true, 'content' => ['Étude spéléologique.'] }
+    ],
+    'a_custom' => 'first_letter'
+  }
+  inp = {
+    'uri' => non_alpha_rec['uri'],
+    'record_type' => 'resource',
+    'repository' => 2,
+    'record' => non_alpha_rec,
+    'pui_candidate_record' => non_alpha_rec,
+    'prepare_pui_final' => true
+  }
+  envelope = {
+    'id' => non_alpha_rec['uri'],
+    'uri' => non_alpha_rec['uri'],
+    'title' => non_alpha_rec['title'],
+    'primary_type' => 'resource',
+    'types' => ['resource'],
+    'json' => ASUtils.to_json(non_alpha_rec),
+    'suppressed' => false,
+    'publish' => true,
+    'system_generated' => 'false',
+    'repository' => 2,
+    '_archivalist_rust_fields' => [
+      'pui_final_document_metadata',
+      'pui_routing_metadata',
+      'pui_notes_metadata'
+    ],
+    '_archivalist_pui_final' => {
+      'marker' => 'pui_final_document_metadata',
+      'json' => ASUtils.to_json(non_alpha_rec),
+      'fullrecord_published' => IndexerCommon.extract_string_values(non_alpha_rec, :published_only)
+    },
+    '_archivalist_pui_routing' => {
+      'marker' => 'pui_routing_metadata',
+      'id' => "#{non_alpha_rec['uri']}#pui",
+      'pui_parent_id' => non_alpha_rec['uri'],
+      'types' => ['pui', 'pui_resource', 'pui_record', 'pui_only']
+    },
+    '_archivalist_pui_notes' => {
+      'marker' => 'pui_notes_metadata',
+      'notes_published' => IndexerCommon.extract_string_values(non_alpha_rec['notes'], :published_only)
+    }
+  }
+  builder.define_singleton_method(:perform_request) do |_req|
+    Struct.new(:code, :body).new('200', ASUtils.to_json(
+      'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+      'documents' => [envelope]
+    ))
+  end
+  res = builder.build([inp])
+  assert_equal(1, res.length)
+  doc = res.values.first
+  assert_equal(ASUtils.to_json(non_alpha_rec), doc['_archivalist_pui_final']['json'])
+end
+
+test "builder rejects key-scrambled or alphabetically-sorted pui_final json mismatch" do
+  builder = RustIndexDocumentBuilder.new('http://127.0.0.1:4570', 2)
+  non_alpha_rec = {
+    'z_custom' => 'last_letter',
+    'uri' => '/repositories/2/resources/998',
+    'title' => 'Émile Cartailhac 📚 — Société Géologique 中文',
+    'publish' => true,
+    'jsonmodel_type' => 'resource',
+    'repository' => { 'ref' => '/repositories/2' },
+    'notes' => [
+      { 'jsonmodel_type' => 'note_singlepart', 'type' => 'scopecontent', 'publish' => true, 'content' => ['Étude spéléologique.'] }
+    ],
+    'a_custom' => 'first_letter'
+  }
+  inp = {
+    'uri' => non_alpha_rec['uri'],
+    'record_type' => 'resource',
+    'repository' => 2,
+    'record' => non_alpha_rec,
+    'pui_candidate_record' => non_alpha_rec,
+    'prepare_pui_final' => true
+  }
+
+  sorted_rec = Hash[non_alpha_rec.sort]
+  sorted_json = ASUtils.to_json(sorted_rec)
+
+  envelope = {
+    'id' => non_alpha_rec['uri'],
+    'uri' => non_alpha_rec['uri'],
+    'title' => non_alpha_rec['title'],
+    'primary_type' => 'resource',
+    'types' => ['resource'],
+    'json' => ASUtils.to_json(non_alpha_rec),
+    'suppressed' => false,
+    'publish' => true,
+    'system_generated' => 'false',
+    'repository' => 2,
+    '_archivalist_rust_fields' => [
+      'pui_final_document_metadata',
+      'pui_routing_metadata',
+      'pui_notes_metadata'
+    ],
+    '_archivalist_pui_final' => {
+      'marker' => 'pui_final_document_metadata',
+      'json' => sorted_json,
+      'fullrecord_published' => IndexerCommon.extract_string_values(non_alpha_rec, :published_only)
+    },
+    '_archivalist_pui_routing' => {
+      'marker' => 'pui_routing_metadata',
+      'id' => "#{non_alpha_rec['uri']}#pui",
+      'pui_parent_id' => non_alpha_rec['uri'],
+      'types' => ['pui', 'pui_resource', 'pui_record', 'pui_only']
+    },
+    '_archivalist_pui_notes' => {
+      'marker' => 'pui_notes_metadata',
+      'notes_published' => IndexerCommon.extract_string_values(non_alpha_rec['notes'], :published_only)
+    }
+  }
+  builder.define_singleton_method(:perform_request) do |_req|
+    Struct.new(:code, :body).new('200', ASUtils.to_json(
+      'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+      'documents' => [envelope]
+    ))
+  end
+  assert_raises(RuntimeError, /pui final json serialization mismatch/) do
+    builder.build([inp])
+  end
+end
+
+test "cross-language live sidecar integration feeds actual response to Ruby builder with non-alphabetical record" do
+  port = 4596
+  bin = File.expand_path('../target/debug/aspace-shadow-sidecar', __dir__)
+  if File.executable?(bin)
+    pid = Process.spawn(bin, '--port', port.to_s, '--solr-url', 'http://127.0.0.1:8983/solr', '--collection', 'test_collection', out: '/dev/null', err: '/dev/null')
+    begin
+      healthy = false
+      20.times do
+        sleep 0.1
+        begin
+          res = Net::HTTP.get_response(URI("http://127.0.0.1:#{port}/health"))
+          if res.code == '200'
+            healthy = true
+            break
+          end
+        rescue Errno::ECONNREFUSED, Errno::EADDRNOTAVAIL
+        end
+      end
+      assert healthy, "Spawned sidecar must report healthy"
+
+      builder = RustIndexDocumentBuilder.new("http://127.0.0.1:#{port}", 5)
+      rec = {
+        'z_key' => 'omega',
+        'uri' => '/repositories/2/archival_objects/999',
+        'title' => 'Émile Cartailhac 📚 — Société Géologique 中文',
+        'publish' => true,
+        'suppressed' => false,
+        'jsonmodel_type' => 'archival_object',
+        'repository' => { 'ref' => '/repositories/2' },
+        'notes' => [
+          { 'jsonmodel_type' => 'note_singlepart', 'type' => 'scopecontent', 'publish' => true, 'content' => ['Scope note.'] }
+        ],
+        'instances' => [],
+        'a_key' => 'alpha'
+      }
+      input = {
+        'uri' => rec['uri'],
+        'record_type' => 'archival_object',
+        'repository' => 2,
+        'record' => rec,
+        'pui_candidate_record' => rec,
+        'prepare_pui_final' => true
+      }
+
+      res = builder.build([input])
+      assert_equal(1, res.length)
+      doc = res[rec['uri']]
+      assert doc, "Builder must accept live sidecar projection"
+      assert_equal(ASUtils.to_json(rec), doc['_archivalist_pui_final']['json'])
+    ensure
+      if pid
+        Process.kill('TERM', pid) rescue nil
+        Process.waitpid(pid) rescue nil
+      end
+    end
+  end
+end
+
 # --- Group 3: PUIIndexer Helper Overrides & Cache Survival ---
 puts "\n[Group 3: PUIIndexer Helper Overrides & Cache Survival]"
 

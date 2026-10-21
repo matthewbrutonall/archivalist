@@ -470,6 +470,34 @@ When testing `AppConfig[:rust_pui_common_metadata_enabled] = true`, verify that:
 6. Sidecar failure, outage, type mismatch (e.g. integer vs float, boolean vs integer), unknown keys,
    or unexpected projections fall back cleanly to native execution without partial state or leaked markers.
 
+### Step G: JSON key-order preservation and isolated stage integration verification
+
+When validating sidecar JSON serialization and end-to-end PUI indexing under isolated stage cores:
+1. Confirm exact key-order preservation across all JSON structures. Serialized string representations
+   and `fullrecord_published` string arrays must retain exact insertion order, avoiding `BTreeMap`
+   alphabetization and ensuring key removals and merges preserve remaining key order.
+2. The isolated integration stage harness validates multi-pass PUI reindexing on temporary stage cores
+   (`native`, `candidate`, `fallback`) with live Solr and an independently spawned sidecar:
+   - Pass 1 (Native baseline): Establishes baseline Solr index documents and timing metrics.
+   - Pass 2 (Rust candidate): Sidecar-accelerated indexing with active capability projections.
+   - Pass 3 (Outage fallback): Verified stage sidecar termination proving type-strict and field-exact
+     fallback equivalence with baseline native indexing.
+3. Cross-core parity verification runs `compare_pui_index_parity.py` against candidate cores, verifying
+   zero privacy leaks and zero non-private field divergences.
+4. Search verification validates positive term queries (e.g. `Correspondence`, `Astronomical`, `Observatory`,
+   `Dublin`) matching indexed content with exact ID and count equality across all three cores, as well as
+   negative query absences for unpublished and suppressed records under public filters.
+5. All runs operate strictly against unique isolated stage cores and unused local sidecar ports, never
+   mutating production collections or existing processes.
+
+To execute the stage harness:
+
+```bash
+docker exec -e SIDECAR_PORT=4597 -w /archivesspace/build <container> \
+  java -cp "jruby-complete-9.4.9.0.jar:gems/jruby/3.1.0:../lib/*:../common:../common/lib/*:../indexer/app/lib/*" \
+  org.jruby.Main /archivesspace/rust-tools/scripts/integration_stage_harness.rb
+```
+
 ## 9. Rollback
 
 Set all sidecar enable flags, including `rust_index_document_builder_enabled`,
