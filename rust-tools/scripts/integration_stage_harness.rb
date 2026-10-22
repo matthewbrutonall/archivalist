@@ -34,6 +34,7 @@ require 'fileutils'
 require 'time'
 require 'securerandom'
 require 'socket'
+require 'digest'
 
 module ArchivalistHarnessSafety
   ALLOWED_HOSTS = ['127.0.0.1', 'localhost', 'solr', 'solr-test', 'solr-bench'].freeze
@@ -43,6 +44,91 @@ module ArchivalistHarnessSafety
   ALLOWED_ROLES = ['native', 'candidate', 'fallback'].freeze
   ALLOWED_MODES = ['pui', 'staff'].freeze
   FORBIDDEN_KEYWORDS = ['archivesspace', 'archivesspace_shadow', 'production', 'primary', 'live'].freeze
+  RELEASE_SIDECAR_BINARY = '/archivesspace/rust-tools/target/release/aspace-shadow-sidecar'
+  SHA256_PATTERN = /\A[0-9a-f]{64}\z/
+
+  # Cargo profile inferred from the conventional target/<profile>/ path segment.
+  def self.sidecar_build_mode(path)
+    parts = File.expand_path(path.to_s).split('/')
+    idx = parts.rindex('target')
+    profile = idx && parts[idx + 1]
+    ['release', 'debug'].include?(profile) ? profile : 'unknown'
+  end
+
+  # Resolves the benchmark sidecar binary and its fingerprint before anything is spawned.
+  # Without ARCHIVALIST_SIDECAR_BINARY the release build is required; an explicit override may
+  # point anywhere but its inferred build mode is recorded. When ARCHIVALIST_SIDECAR_SHA256 is
+  # supplied (the wrapper passes the hash of the binary it just built) the file must match it.
+  def self.resolve_sidecar_binary(env = ENV)
+    override = env['ARCHIVALIST_SIDECAR_BINARY'].to_s.strip
+    path = override.empty? ? RELEASE_SIDECAR_BINARY : override
+    unless File.file?(path) && File.executable?(path)
+      raise "Sidecar binary missing or not executable at #{path} (build it with: cargo build --release -p aspace-cli --bin aspace-shadow-sidecar)"
+    end
+
+    inferred_mode = sidecar_build_mode(path)
+    declared_mode = env['ARCHIVALIST_SIDECAR_BUILD_MODE'].to_s.strip
+    declared_mode = nil if declared_mode.empty?
+    if declared_mode && declared_mode != inferred_mode
+      raise "Safety violation: declared sidecar build mode '#{declared_mode}' does not match path-inferred mode '#{inferred_mode}' for #{path}"
+    end
+    if override.empty? && inferred_mode != 'release'
+      raise "Safety violation: default benchmark sidecar must be a release build, got '#{inferred_mode}' at #{path}"
+    end
+
+    sha256 = Digest::SHA256.file(path).hexdigest
+    expected = env['ARCHIVALIST_SIDECAR_SHA256'].to_s.strip.downcase
+    expected = nil if expected.empty?
+    if expected
+      raise "Safety violation: ARCHIVALIST_SIDECAR_SHA256 is not a SHA-256 hex digest" unless expected =~ SHA256_PATTERN
+      raise "Safety violation: sidecar binary SHA-256 #{sha256} does not match expected #{expected}" unless sha256 == expected
+    end
+
+    {
+      'path' => path,
+      'real_path' => File.realpath(path),
+      'override' => !override.empty?,
+      'build_mode' => inferred_mode,
+      'build_mode_declared' => !declared_mode.nil?,
+      'sha256' => sha256,
+      'expected_sha256' => expected,
+      'sha256_matches_expected' => expected ? true : nil,
+      'size_bytes' => File.size(path),
+      'mtime' => File.mtime(path).utc.iso8601
+    }
+  end
+
+  # Hashes the executable image actually running as pid (via /proc/<pid>/exe, which stays bound
+  # to the launched inode even if the file on disk is later replaced). Fails closed when /proc
+  # is unavailable or the hash differs.
+  def self.verify_launched_binary(pid, expected_sha256)
+    exe = "/proc/#{pid}/exe"
+    raise "Safety violation: cannot verify launched sidecar binary; #{exe} is unavailable" unless File.exist?(exe)
+
+    launched_sha256 = Digest::SHA256.file(exe).hexdigest
+    unless launched_sha256 == expected_sha256
+      raise "Safety violation: launched sidecar SHA-256 #{launched_sha256} does not match recorded #{expected_sha256}"
+    end
+
+    { 'launched_exe' => File.readlink(exe), 'launched_sha256' => launched_sha256, 'launched_matches_recorded' => true }
+  end
+
+  # Source provenance for the benchmark report. The wrapper computes these on the host and
+  # passes them in; when absent they are reported as unrecorded rather than guessed.
+  def self.source_provenance(env = ENV)
+    commit = env['ARCHIVALIST_GIT_COMMIT'].to_s.strip
+    dirty = env['ARCHIVALIST_GIT_DIRTY'].to_s.strip
+    {
+      'git_commit' => commit.empty? ? 'unrecorded' : commit,
+      'git_dirty' => case dirty
+                     when 'true' then true
+                     when 'false' then false
+                     else 'unrecorded'
+                     end,
+      'git_dirty_paths' => env['ARCHIVALIST_GIT_DIRTY_PATHS'].to_s.split("\n").reject(&:empty?),
+      'build_command' => env['ARCHIVALIST_SIDECAR_BUILD_COMMAND'].to_s.strip.then { |c| c.empty? ? 'unrecorded' : c }
+    }
+  end
 
   def self.generate_run_id
     "#{Time.now.utc.strftime('%Y%m%d_%H%M%S')}_#{Process.pid}_#{SecureRandom.hex(4)}"
@@ -421,7 +507,7 @@ module ArchivalistHarnessSafety
     raise "Safety violation: No unused port available in range #{start_port}..#{end_port}"
   end
 
-  def self.start_stage_sidecar(port:, solr_url:, collection:, run_id:, binary_path: nil)
+  def self.start_stage_sidecar(port:, solr_url:, collection:, run_id:, binary_path: nil, expected_sha256: nil)
     # Check that port is not already occupied before spawning
     port_in_use = false
     begin
@@ -506,6 +592,16 @@ module ArchivalistHarnessSafety
         end
       end
       raise "Stage sidecar failed to report healthy on port #{port} within timeout"
+    end
+
+    if expected_sha256
+      begin
+        state['launched_binary'] = verify_launched_binary(pid, expected_sha256)
+      rescue StandardError
+        Process.kill('TERM', pid) if verify_process_identity(pid, state)
+        raise
+      end
+      File.write(state_file, JSON.generate(state))
     end
 
     state_file

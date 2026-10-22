@@ -120,6 +120,13 @@ if __FILE__ == $PROGRAM_NAME
     raise "Safety violation: Invalid or unapproved Solr URL '#{SOLR_BASE}'"
   end
 
+  # Resolve and fingerprint the sidecar binary before any core is created (fails closed).
+  SIDECAR_BINARY = ArchivalistHarnessSafety.resolve_sidecar_binary
+  SOURCE_PROVENANCE = ArchivalistHarnessSafety.source_provenance
+  puts "Sidecar Binary: #{SIDECAR_BINARY['path']} (#{SIDECAR_BINARY['build_mode']}#{SIDECAR_BINARY['override'] ? ', override' : ''})"
+  puts "Sidecar SHA-256: #{SIDECAR_BINARY['sha256']} (expected: #{SIDECAR_BINARY['expected_sha256'] || 'not supplied'})"
+  puts "Source: commit #{SOURCE_PROVENANCE['git_commit']}, dirty=#{SOURCE_PROVENANCE['git_dirty']}"
+
   # Helper to save incremental evidence immediately
   def save_incremental_step(step_name, data)
     path = File.join(BENCHMARK_DIR, "repo_stage_#{step_name}_#{RUN_ID}.json")
@@ -815,9 +822,13 @@ if __FILE__ == $PROGRAM_NAME
     port: SIDECAR_PORT,
     solr_url: SOLR_BASE,
     collection: CORE_PUI_CANDIDATE,
-    run_id: RUN_ID
+    run_id: RUN_ID,
+    binary_path: SIDECAR_BINARY['path'],
+    expected_sha256: SIDECAR_BINARY['sha256']
   )
+  SIDECAR_BINARY.merge!(JSON.parse(File.read(stage_state_file))['launched_binary'])
   puts "Stage sidecar spawned on port #{SIDECAR_PORT} (State: #{stage_state_file})"
+  puts "Launched sidecar verified: #{SIDECAR_BINARY['launched_exe']} sha256=#{SIDECAR_BINARY['launched_sha256']}"
 
   health_uri = URI("#{SIDECAR_URL}/health")
   health_res = Net::HTTP.get_response(health_uri)
@@ -833,6 +844,8 @@ if __FILE__ == $PROGRAM_NAME
   save_incremental_step('step4_sidecar', {
     'sidecar_url' => SIDECAR_URL,
     'sidecar_port' => SIDECAR_PORT,
+    'sidecar_binary' => SIDECAR_BINARY,
+    'source_provenance' => SOURCE_PROVENANCE,
     'state_file' => stage_state_file,
     'health' => health_json,
     'initial_requests_total' => initial_req_total
@@ -1276,6 +1289,8 @@ if __FILE__ == $PROGRAM_NAME
     'jruby_description' => RUBY_DESCRIPTION,
     'solr_base' => SOLR_BASE,
     'backend_base' => BACKEND_BASE,
+    'sidecar_binary' => SIDECAR_BINARY,
+    'source_provenance' => SOURCE_PROVENANCE,
     'repository' => {
       'id' => REPO_ID,
       'uri' => repo_uri,

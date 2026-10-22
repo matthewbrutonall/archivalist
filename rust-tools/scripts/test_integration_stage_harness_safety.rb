@@ -14,6 +14,7 @@ require 'minitest/autorun'
 require 'net/http'
 require 'uri'
 require 'json'
+require 'tmpdir'
 require_relative 'integration_stage_harness'
 
 class TestIntegrationStageHarnessSafety < Minitest::Test
@@ -592,5 +593,110 @@ class TestIntegrationStageHarnessSafety < Minitest::Test
     assert_equal [], doc['empty_enum_s']
     assert_nil doc['nil_enum_s']
     assert_equal [123, nil], doc['numeric_enum_s']
+  end
+
+  def with_fake_target(profile)
+    Dir.mktmpdir do |dir|
+      bin_dir = File.join(dir, 'rust-tools', 'target', profile)
+      FileUtils.mkdir_p(bin_dir)
+      bin = File.join(bin_dir, 'aspace-shadow-sidecar')
+      File.write(bin, "#!/bin/sh\nexit 0\n")
+      File.chmod(0o755, bin)
+      yield bin, Digest::SHA256.file(bin).hexdigest
+    end
+  end
+
+  def test_sidecar_build_mode_is_inferred_from_target_profile_segment
+    assert_equal 'release', ArchivalistHarnessSafety.sidecar_build_mode('/archivesspace/rust-tools/target/release/aspace-shadow-sidecar')
+    assert_equal 'debug', ArchivalistHarnessSafety.sidecar_build_mode('/archivesspace/rust-tools/target/debug/aspace-shadow-sidecar')
+    assert_equal 'unknown', ArchivalistHarnessSafety.sidecar_build_mode('/usr/local/bin/aspace-shadow-sidecar')
+    assert_equal 'unknown', ArchivalistHarnessSafety.sidecar_build_mode('/x/target/profiling/aspace-shadow-sidecar')
+  end
+
+  def test_default_sidecar_binary_is_release
+    assert_equal 'release', ArchivalistHarnessSafety.sidecar_build_mode(ArchivalistHarnessSafety::RELEASE_SIDECAR_BINARY)
+  end
+
+  def test_resolve_sidecar_binary_records_override_and_fingerprint
+    with_fake_target('release') do |bin, sha|
+      info = ArchivalistHarnessSafety.resolve_sidecar_binary(
+        'ARCHIVALIST_SIDECAR_BINARY' => bin, 'ARCHIVALIST_SIDECAR_SHA256' => sha.upcase,
+        'ARCHIVALIST_SIDECAR_BUILD_MODE' => 'release'
+      )
+      assert_equal bin, info['path']
+      assert_equal sha, info['sha256']
+      assert_equal sha, info['expected_sha256']
+      assert_equal true, info['sha256_matches_expected']
+      assert_equal 'release', info['build_mode']
+      assert_equal true, info['override']
+    end
+  end
+
+  def test_resolve_sidecar_binary_allows_explicit_debug_override_but_records_it
+    with_fake_target('debug') do |bin, _sha|
+      info = ArchivalistHarnessSafety.resolve_sidecar_binary('ARCHIVALIST_SIDECAR_BINARY' => bin)
+      assert_equal 'debug', info['build_mode']
+      assert_nil info['expected_sha256']
+      assert_nil info['sha256_matches_expected']
+    end
+  end
+
+  def test_resolve_sidecar_binary_fails_closed
+    with_fake_target('release') do |bin, sha|
+      err = assert_raises(RuntimeError) do
+        ArchivalistHarnessSafety.resolve_sidecar_binary('ARCHIVALIST_SIDECAR_BINARY' => bin, 'ARCHIVALIST_SIDECAR_SHA256' => sha.reverse)
+      end
+      assert_match(/does not match expected/, err.message)
+
+      err = assert_raises(RuntimeError) do
+        ArchivalistHarnessSafety.resolve_sidecar_binary('ARCHIVALIST_SIDECAR_BINARY' => bin, 'ARCHIVALIST_SIDECAR_SHA256' => 'abc')
+      end
+      assert_match(/not a SHA-256/, err.message)
+
+      err = assert_raises(RuntimeError) do
+        ArchivalistHarnessSafety.resolve_sidecar_binary('ARCHIVALIST_SIDECAR_BINARY' => bin, 'ARCHIVALIST_SIDECAR_BUILD_MODE' => 'debug')
+      end
+      assert_match(/declared sidecar build mode/, err.message)
+    end
+
+    err = assert_raises(RuntimeError) do
+      ArchivalistHarnessSafety.resolve_sidecar_binary('ARCHIVALIST_SIDECAR_BINARY' => '/nonexistent/target/release/aspace-shadow-sidecar')
+    end
+    assert_match(/missing or not executable/, err.message)
+  end
+
+  def test_verify_launched_binary_hashes_running_image
+    skip 'requires /proc' unless File.exist?("/proc/#{Process.pid}/exe")
+    sleep_bin = ENV['PATH'].split(File::PATH_SEPARATOR).map { |d| File.join(d, 'sleep') }.find { |p| File.executable?(p) }
+    skip 'sleep not found on PATH' unless sleep_bin
+    sleep_bin = File.realpath(sleep_bin)
+    pid = Process.spawn(sleep_bin, '5')
+    begin
+      expected = Digest::SHA256.file(sleep_bin).hexdigest
+      info = ArchivalistHarnessSafety.verify_launched_binary(pid, expected)
+      assert_equal expected, info['launched_sha256']
+      assert_equal true, info['launched_matches_recorded']
+
+      err = assert_raises(RuntimeError) { ArchivalistHarnessSafety.verify_launched_binary(pid, '0' * 64) }
+      assert_match(/does not match recorded/, err.message)
+    ensure
+      Process.kill('TERM', pid)
+      Process.wait(pid)
+    end
+  end
+
+  def test_source_provenance_reports_unrecorded_instead_of_guessing
+    prov = ArchivalistHarnessSafety.source_provenance({})
+    assert_equal 'unrecorded', prov['git_commit']
+    assert_equal 'unrecorded', prov['git_dirty']
+    assert_equal [], prov['git_dirty_paths']
+
+    prov = ArchivalistHarnessSafety.source_provenance(
+      'ARCHIVALIST_GIT_COMMIT' => 'abc123', 'ARCHIVALIST_GIT_DIRTY' => 'true',
+      'ARCHIVALIST_GIT_DIRTY_PATHS' => " M a.rb\n?? b.rb\n"
+    )
+    assert_equal 'abc123', prov['git_commit']
+    assert_equal true, prov['git_dirty']
+    assert_equal [' M a.rb', '?? b.rb'], prov['git_dirty_paths']
   end
 end

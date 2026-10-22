@@ -262,6 +262,14 @@ Scripts under `scripts/` are code-only harnesses:
   median shows profiling overhead; `compare_all_staff_docs.py` checks ALL stored STAFF docs
   (the repository comparator alone excludes profile docs). JVM `-Xss` is raised for the whole
   run because wrapped recursive validators otherwise overflow JRuby's 512K stack cap.
+  The sidecar is the **release** build, rebuilt on the host with
+  `cargo build --release --locked` before every run (`SIDECAR_BUILD=0` skips the rebuild). Its
+  SHA-256 is passed to the harness, which refuses a mismatching file and also hashes the
+  running `/proc/<pid>/exe`. `SIDECAR_BINARY=<container path>` is an explicit override (no build
+  or expected hash; its path-inferred build mode is recorded). Binary path, SHA-256, build mode,
+  Git commit, dirty status and dirty paths go into `<prefix>_<ts>.build.json`, the `step4_sidecar`
+  checkpoint and the final report. Runs before this change used the debug sidecar and are not
+  a performance verdict on optimized Rust.
 - Helpers that query records require the caller to provide test-specific values
   through environment variables such as `RESOURCE_URI` and `QUERY`.
 
