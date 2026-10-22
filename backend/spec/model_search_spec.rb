@@ -296,7 +296,7 @@ describe Search do
 
       # 6. filter is present
       expect(Solr).to receive(:search).and_return(mock_solr_response)
-      res = Search.search(sidecar_params.merge(:filter => {"query" => "something"}), repo.id)
+      res = Search.search(sidecar_params.merge(:filter => aq_notes), repo.id)
       expect(res).to eq(mock_solr_response)
 
       # 7. facet is present
