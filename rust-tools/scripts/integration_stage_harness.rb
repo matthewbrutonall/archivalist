@@ -41,7 +41,7 @@ module ArchivalistHarnessSafety
   ALLOWED_PORTS = [8983, 8984, 8985].freeze
   ALLOWED_BACKEND_HOSTS = ['127.0.0.1', 'localhost', 'backend', 'app'].freeze
   ALLOWED_BACKEND_PORTS = [4567, 8089, 3000, 3002, 3003].freeze
-  ALLOWED_ROLES = ['native', 'candidate', 'fallback'].freeze
+  ALLOWED_ROLES = ['native', 'candidate', 'fallback', 'ablation'].freeze
   ALLOWED_MODES = ['pui', 'staff'].freeze
   FORBIDDEN_KEYWORDS = ['archivesspace', 'archivesspace_shadow', 'production', 'primary', 'live'].freeze
   RELEASE_SIDECAR_BINARY = '/archivesspace/rust-tools/target/release/aspace-shadow-sidecar'
@@ -176,7 +176,7 @@ module ArchivalistHarnessSafety
                       core_name.downcase == "stage_pui_#{kw}" ||
                       core_name.downcase == "stage_staff_#{kw}"
     end
-    pattern = /\Astage_(pui|staff)_#{Regexp.escape(expected_run_id)}_(native|candidate|fallback)\z/
+    pattern = /\Astage_(pui|staff)_#{Regexp.escape(expected_run_id)}_(native|candidate|fallback|ablation)\z/
     !(core_name =~ pattern).nil?
   end
 

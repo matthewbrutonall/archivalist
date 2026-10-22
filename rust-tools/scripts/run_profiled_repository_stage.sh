@@ -16,6 +16,9 @@
 # SIDECAR_BINARY=/archivesspace/... (container path) overrides the binary explicitly; no build
 # or expected hash is applied and the harness records the hash and path-inferred build mode.
 # Git commit, dirty status and dirty paths are recorded in <prefix>_<ts>.build.json and the report.
+# WARMUP_PASSES (default 1) sets untimed warmups per mode; their wall times are recorded.
+# PUI_ABLATION=1 adds a no-profiler PUI ablation (each Rust PUI capability alone, adjacent native).
+# PAYLOAD_ACCOUNTING=1 adds dedicated byte-accounting passes (bytes only; timings not comparable).
 # Usage: REPO_ID=4 [REPEATS=3] [PROFILE_REPEATS=3] rust-tools/scripts/run_profiled_repository_stage.sh
 set -uo pipefail
 : "${REPO_ID:?REPO_ID must be set explicitly}"
@@ -58,6 +61,8 @@ CONTAINER_JAVA_OPTS="$(docker exec archivesspaceai-app-1 printenv JAVA_OPTS)"
 SOLR_ENV=(); [ -n "${SOLR_BASE_URL:-}" ] && SOLR_ENV=(-e "SOLR_BASE_URL=$SOLR_BASE_URL")
 docker exec "${SOLR_ENV[@]}" -e REPO_ID="$REPO_ID" -e REPEATS="${REPEATS:-3}" -e PROFILE_REPEATS="${PROFILE_REPEATS:-3}" \
   -e ARCHIVALIST_PROFILE="$PROFILE_FLAG" -e JAVA_OPTS="$CONTAINER_JAVA_OPTS -Xss${PROFILE_XSS:-16m}" \
+  -e WARMUP_PASSES="${WARMUP_PASSES:-1}" -e ARCHIVALIST_PUI_ABLATION="${PUI_ABLATION:-0}" \
+  -e ARCHIVALIST_PAYLOAD_ACCOUNTING="${PAYLOAD_ACCOUNTING:-0}" \
   -e ARCHIVALIST_SIDECAR_BINARY="${SIDECAR_BINARY:-}" -e ARCHIVALIST_SIDECAR_SHA256="$EXPECTED_SHA" \
   -e ARCHIVALIST_SIDECAR_BUILD_MODE="$BUILD_MODE" -e ARCHIVALIST_SIDECAR_BUILD_COMMAND="$BUILD_CMD" \
   -e ARCHIVALIST_GIT_COMMIT="$GIT_COMMIT" -e ARCHIVALIST_GIT_DIRTY="$GIT_DIRTY" -e ARCHIVALIST_GIT_DIRTY_PATHS="$GIT_DIRTY_PATHS" \

@@ -270,6 +270,16 @@ Scripts under `scripts/` are code-only harnesses:
   Git commit, dirty status and dirty paths go into `<prefix>_<ts>.build.json`, the `step4_sidecar`
   checkpoint and the final report. Runs before this change used the debug sidecar and are not
   a performance verdict on optimized Rust.
+  `WARMUP_PASSES` (default 1) sets untimed warmups per mode; their wall times are recorded.
+  `PUI_ABLATION=1` adds a no-profiler PUI ablation into a dedicated `stage_pui_<run>_ablation`
+  core: an adjacent native baseline, builder only, document preparation, preparation plus
+  inheritance candidate, common metadata alone and with preparation, auxiliary documents, and
+  all capabilities. Deltas are against the adjacent native median and are not additive; a
+  configuration whose projections fall back natively is reported `valid_measurement: false`.
+  `PAYLOAD_ACCOUNTING=1` (`archivalist_payload_accounting.rb`) adds dedicated STAFF and PUI
+  passes that count request/response bytes per call kind, per field and per projection, and
+  repeated URIs and identical ancestor entries. It stores aggregates only, and its pass wall
+  times are recorded as not comparable.
 - Helpers that query records require the caller to provide test-specific values
   through environment variables such as `RESOURCE_URI` and `QUERY`.
 

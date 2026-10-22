@@ -55,6 +55,13 @@ if __FILE__ == $PROGRAM_NAME
   end
   REPO_ID = repo_id_raw.to_i
   REPEATS = (ENV['REPEATS'] || '3').to_i
+  # Untimed warmup passes before each measured mode (their wall times are still recorded).
+  WARMUP_PASSES = (ENV['WARMUP_PASSES'] || '1').to_i
+  raise "Safety violation: WARMUP_PASSES must be >= 1" unless WARMUP_PASSES >= 1
+  # Opt-in PUI feature ablation: each Rust PUI capability measured on its own, no profiler.
+  PUI_ABLATION_ENABLED = ENV['ARCHIVALIST_PUI_ABLATION'] == '1'
+  # Opt-in byte accounting on dedicated extra passes whose wall times are not comparable.
+  PAYLOAD_ACCOUNTING_ENABLED = ENV['ARCHIVALIST_PAYLOAD_ACCOUNTING'] == '1'
 
   BENCHMARK_DIR = File.expand_path('../benchmarks', __dir__)
   REPORT_DIR = File.expand_path('../reports/stage_runs', __dir__)
@@ -77,10 +84,13 @@ if __FILE__ == $PROGRAM_NAME
   CORE_PUI_CANDIDATE   = ArchivalistHarnessSafety.stage_core_name(RUN_ID, 'candidate', 'pui')
   CORE_PUI_FALLBACK    = ArchivalistHarnessSafety.stage_core_name(RUN_ID, 'fallback', 'pui')
 
+  CORE_PUI_ABLATION    = PUI_ABLATION_ENABLED ? ArchivalistHarnessSafety.stage_core_name(RUN_ID, 'ablation', 'pui') : nil
+
   ALL_STAGE_CORES = [
     CORE_STAFF_NATIVE, CORE_STAFF_CANDIDATE, CORE_STAFF_FALLBACK,
-    CORE_PUI_NATIVE, CORE_PUI_CANDIDATE, CORE_PUI_FALLBACK
-  ].freeze
+    CORE_PUI_NATIVE, CORE_PUI_CANDIDATE, CORE_PUI_FALLBACK,
+    CORE_PUI_ABLATION
+  ].compact.freeze
 
   AUXILIARY_PRIMARY_TYPES = [
     'resource_ordered_records',
@@ -106,7 +116,9 @@ if __FILE__ == $PROGRAM_NAME
   puts "Backend URL: #{BACKEND_BASE}"
   puts "Solr Base: #{SOLR_BASE}"
   puts "Target Repository ID: #{REPO_ID}"
-  puts "Warm Repeats: #{REPEATS}"
+  puts "Warm Repeats: #{REPEATS} (warmup passes per mode: #{WARMUP_PASSES})"
+  puts "PUI Ablation: #{PUI_ABLATION_ENABLED ? "enabled (core #{CORE_PUI_ABLATION})" : 'disabled'}"
+  puts "Payload Accounting: #{PAYLOAD_ACCOUNTING_ENABLED ? 'enabled (dedicated untimed passes)' : 'disabled'}"
   puts "Sidecar URL: #{SIDECAR_URL}"
   puts "Target Staff Cores: #{CORE_STAFF_NATIVE}, #{CORE_STAFF_CANDIDATE}, #{CORE_STAFF_FALLBACK}"
   puts "Target PUI Cores:   #{CORE_PUI_NATIVE}, #{CORE_PUI_CANDIDATE}, #{CORE_PUI_FALLBACK}"
@@ -433,9 +445,9 @@ if __FILE__ == $PROGRAM_NAME
   save_incremental_step('step1_fetch_provenance', fetch_provenance)
 
   # ============================================================================
-  # STEP 2: Initialize 6 Stage-Owned Unique Solr Cores
+  # STEP 2: Initialize Stage-Owned Unique Solr Cores (6, plus 1 ablation core when enabled)
   # ============================================================================
-  puts "\n--- Step 2: Initializing 6 Stage-Owned Unique Solr Cores ---"
+  puts "\n--- Step 2: Initializing #{ALL_STAGE_CORES.length} Stage-Owned Unique Solr Cores ---"
   ALL_STAGE_CORES.each do |core|
     ArchivalistHarnessSafety.ensure_stage_core(core, RUN_ID, solr_base: SOLR_BASE)
     puts "  [Core] Verified isolated stage core created: #{core}"
@@ -731,10 +743,15 @@ if __FILE__ == $PROGRAM_NAME
     }
   end
 
-  def benchmark_mode(label, repeats: 3, &block)
-    # Warmup pass
-    puts "    [#{label}] Warmup pass..."
-    block.call
+  def benchmark_mode(label, repeats: 3, warmups: WARMUP_PASSES, profile: true, &block)
+    # Warmup passes: excluded from the median, but their wall times are recorded so JIT
+    # warm-up effects stay visible in the evidence.
+    warmup_timings = []
+    warmups.times do |iter|
+      wres = block.call
+      warmup_timings << wres['wall_ms']
+      puts "    [#{label}] Warmup #{iter + 1}/#{warmups}: #{wres['wall_ms']} ms (excluded)"
+    end
 
     timings = []
     last_res = nil
@@ -750,7 +767,7 @@ if __FILE__ == $PROGRAM_NAME
     # Optional profiled repeats AFTER the uninstrumented measurements (same warm process, same
     # snapshot). They rewrite identical documents into the same stage core; `last_res` (used for
     # parity) is always from an uninstrumented repeat.
-    if PROFILE_ENABLED
+    if PROFILE_ENABLED && profile
       profiled = []
       PROFILE_REPEATS.times do |iter|
         PROFILE_STATE[:profile_this_pass] = true
@@ -780,6 +797,8 @@ if __FILE__ == $PROGRAM_NAME
     {
       'label' => label,
       'repeats' => repeats,
+      'warmups' => warmups,
+      'warmup_timings' => warmup_timings,
       'raw_timings' => timings,
       'median_ms' => median,
       'last_result' => last_res
@@ -943,6 +962,95 @@ if __FILE__ == $PROGRAM_NAME
     'pui_instrumentation' => pui_inst,
     'sidecar_delta' => sidecar_delta
   })
+
+  # ============================================================================
+  # STEP 5a (opt-in): PUI Feature Ablation, no profiler
+  # ============================================================================
+  # Each configuration runs the full PUI pass with a subset of Rust capabilities, measured with
+  # the same warmups/repeats as the main modes and an adjacent native baseline, all writing to
+  # the dedicated ablation core. Deltas are against that adjacent native median and are NOT
+  # guaranteed to be additive. The inheritance candidate only activates together with document
+  # preparation (IndexerCommon#rust_pui_record_inheritance_candidate_enabled?). Ablation is
+  # diagnostic: a configuration whose projections are rejected (native fallback) is recorded with
+  # valid_measurement=false instead of aborting the gate; a document-count mismatch still aborts.
+  pui_ablation = nil
+  if PUI_ABLATION_ENABLED
+    puts "\n--- Step 5a: PUI Feature Ablation (no profiler) ---"
+    sidecar_on = { builder_enabled: true, sidecar_url: SIDECAR_URL }
+    ablation_configs = [
+      ['native', { builder_enabled: false }],
+      ['builder_only', sidecar_on],
+      ['document_preparation', sidecar_on.merge(pui_prep_enabled: true)],
+      ['document_preparation+inheritance_candidate', sidecar_on.merge(pui_prep_enabled: true, candidate_enabled: true)],
+      ['common_metadata', sidecar_on.merge(common_meta_enabled: true)],
+      ['document_preparation+common_metadata', sidecar_on.merge(pui_prep_enabled: true, common_meta_enabled: true)],
+      ['auxiliary_documents', sidecar_on.merge(aux_enabled: true)],
+      ['all', pui_candidate_options]
+    ]
+    pui_ablation = { 'core' => CORE_PUI_ABLATION, 'configs' => {} }
+    ablation_configs.each do |name, options|
+      puts "  Ablation config: #{name}"
+      bench = benchmark_mode("pui_ablation_#{name}", repeats: REPEATS, profile: false) do
+        run_pui_indexing_pass(CORE_PUI_ABLATION, pui_records_snapshot, resource_uris, tree_uris, options)
+      end
+      inst = bench['last_result']['instrumentation']
+      doc_count = bench['last_result']['doc_count']
+      puts "    WARNING: #{inst['rejections']} projections rejected (native fallback); not a valid measurement" unless inst['rejections'] == 0
+      unless doc_count == pui_native_bench['last_result']['doc_count']
+        raise "PUI ablation #{name}: doc count #{doc_count} != native #{pui_native_bench['last_result']['doc_count']}"
+      end
+      pui_ablation['configs'][name] = {
+        'flags' => options.reject { |k, _| k == :sidecar_url }.transform_keys(&:to_s),
+        'median_ms' => bench['median_ms'],
+        'raw_timings' => bench['raw_timings'],
+        'warmup_timings' => bench['warmup_timings'],
+        'builder_calls' => inst['builder_calls'],
+        'auxiliary_builder_calls' => inst['auxiliary_builder_calls'],
+        'rejections' => inst['rejections'],
+        'valid_measurement' => inst['rejections'] == 0,
+        'doc_count' => doc_count
+      }
+    end
+    ablation_native = pui_ablation['configs']['native']['median_ms'].to_f
+    pui_ablation['configs'].each do |name, cfg|
+      cfg['delta_vs_adjacent_native_ms'] = (cfg['median_ms'].to_f - ablation_native).round(2)
+      cfg['ratio_vs_adjacent_native'] = (cfg['median_ms'].to_f / ablation_native).round(2)
+      flag = cfg['valid_measurement'] ? '' : '  [INVALID: native fallback]'
+      puts "  #{name.ljust(44)} median #{cfg['median_ms']} ms  delta #{cfg['delta_vs_adjacent_native_ms']} ms  (#{cfg['ratio_vs_adjacent_native']}x)#{flag}"
+    end
+    save_incremental_step('step5a_pui_ablation', pui_ablation)
+  end
+
+  # ============================================================================
+  # STEP 5b (opt-in): Payload Byte Accounting on dedicated untimed passes
+  # ============================================================================
+  # Installed only here, after every timed candidate measurement. Each accounting pass re-parses
+  # all request/response bodies, so its wall time is recorded only as not comparable. The
+  # inactive hook remains installed for the outage-fallback passes (one extra method frame per
+  # sidecar call attempt; documented, not measured).
+  payload_accounting = nil
+  if PAYLOAD_ACCOUNTING_ENABLED
+    puts "\n--- Step 5b: Payload Byte Accounting (dedicated passes, timings not comparable) ---"
+    require_relative 'archivalist_payload_accounting'
+    ArchivalistPayloadAccounting.install!(RustIndexDocumentBuilder)
+    payload_accounting = {}
+    [
+      ['staff_candidate', -> { run_staff_indexing_pass(CORE_STAFF_CANDIDATE, staff_records_snapshot, staff_candidate_options) }],
+      ['pui_candidate', -> { run_pui_indexing_pass(CORE_PUI_CANDIDATE, pui_records_snapshot, resource_uris, tree_uris, pui_candidate_options) }]
+    ].each do |label, pass|
+      res, summary = ArchivalistPayloadAccounting.capture { pass.call }
+      raise "Payload accounting #{label}: rejections detected" unless res['instrumentation']['rejections'] == 0
+      summary['accounting_pass_wall_ms_not_comparable'] = res['wall_ms']
+      payload_accounting[label] = summary
+      puts "  #{label}: #{summary['calls']} calls, request #{summary['request_bytes']} B, response #{summary['response_bytes']} B"
+      top = summary['request_field_bytes'].first(3).map { |k, v| "#{k}=#{v}" }.join(', ')
+      puts "    top request fields: #{top}"
+      dup = summary['duplicates']
+      puts "    inputs #{dup['inputs_with_uri']} for #{dup['distinct_uris']} URIs (max #{dup['max_sends_per_uri']} sends); " \
+           "ancestor entries #{dup['ancestor_entries']} (#{dup['distinct_ancestor_entries']} distinct, #{dup['redundant_identical_ancestor_bytes']} redundant B)"
+    end
+    save_incremental_step('step5b_payload_accounting', payload_accounting)
+  end
 
   # ============================================================================
   # STEP 6: Verified Process Stop & Outage Fallback Indexing
@@ -1320,8 +1428,10 @@ if __FILE__ == $PROGRAM_NAME
         'repeats' => REPEATS,
         'native_median_ms' => staff_native_bench['median_ms'],
         'native_raw_timings' => staff_native_bench['raw_timings'],
+        'native_warmup_timings' => staff_native_bench['warmup_timings'],
         'candidate_median_ms' => staff_cand_bench['median_ms'],
         'candidate_raw_timings' => staff_cand_bench['raw_timings'],
+        'candidate_warmup_timings' => staff_cand_bench['warmup_timings'],
         'fallback_median_ms' => staff_fallback_bench['median_ms'],
         'fallback_raw_timings' => staff_fallback_bench['raw_timings'],
         'candidate_to_native_ratio' => staff_ratio
@@ -1334,13 +1444,18 @@ if __FILE__ == $PROGRAM_NAME
         'repeats' => REPEATS,
         'native_median_ms' => pui_native_bench['median_ms'],
         'native_raw_timings' => pui_native_bench['raw_timings'],
+        'native_warmup_timings' => pui_native_bench['warmup_timings'],
         'candidate_median_ms' => pui_cand_bench['median_ms'],
         'candidate_raw_timings' => pui_cand_bench['raw_timings'],
+        'candidate_warmup_timings' => pui_cand_bench['warmup_timings'],
         'fallback_median_ms' => pui_fallback_bench['median_ms'],
         'fallback_raw_timings' => pui_fallback_bench['raw_timings'],
         'candidate_to_native_ratio' => pui_ratio
-      }
+      },
+      'warmup_passes_per_mode' => WARMUP_PASSES
     },
+    'pui_ablation' => pui_ablation || 'disabled',
+    'payload_accounting' => payload_accounting || 'disabled',
     'sidecar_verification' => {
       'port' => SIDECAR_PORT,
       'requests_delta' => sidecar_delta,

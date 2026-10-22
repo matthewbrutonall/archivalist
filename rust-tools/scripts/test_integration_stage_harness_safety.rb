@@ -366,6 +366,16 @@ class TestIntegrationStageHarnessSafety < Minitest::Test
     assert_equal "stage_staff_#{run_id}_native", ArchivalistHarnessSafety.stage_core_name(run_id, 'native', :staff)
   end
 
+  def test_ablation_core_is_stage_owned_and_run_scoped
+    run_id = ArchivalistHarnessSafety.generate_run_id
+    core = ArchivalistHarnessSafety.stage_core_name(run_id, 'ablation', 'pui')
+    assert_equal "stage_pui_#{run_id}_ablation", core
+    assert ArchivalistHarnessSafety.valid_stage_core_name?(core, run_id)
+    refute ArchivalistHarnessSafety.valid_stage_core_name?(core, ArchivalistHarnessSafety.generate_run_id)
+    refute ArchivalistHarnessSafety.valid_stage_core_name?("stage_pui_#{run_id}_ablation2", run_id)
+    assert_raises(RuntimeError) { ArchivalistHarnessSafety.stage_core_name(run_id, 'shadow') }
+  end
+
   def test_stage_core_name_rejects_invalid_mode
     run_id = ArchivalistHarnessSafety.generate_run_id
     err = assert_raises(RuntimeError) do
