@@ -10,10 +10,16 @@ setup     Starts NEW containers only (it never restarts or modifies existing one
             archivalist-profiling-solr-<id>     Solr with the repository's configset, an
                                                 'archivesspace' core and an identity core
                                                 archivalist_profiling_identity_<id>
-            archivalist-profiling-backend-<id>  the app container's image and mounts, running
-                                                db:migrate then backend:devserver against the
-                                                profiling database only
-          All carry the label archivalist.profiling-stack=<id>, join the app container's
+            archivalist-profiling-backend-<id>  the app container's image with the source checkout
+                                                mounted READ-ONLY, its own build volume (seeded by
+                                                a one-shot container that sees the app's mounts
+                                                read-only) and its own data volume; it runs the
+                                                db:migrate and backend:devserver commands directly
+                                                (no Ant targets, so nothing writes to the source)
+                                                against the profiling database only
+          Both created containers' mounts are checked with docker inspect before they start:
+          setup fails if any writable mount is shared with the app or is not this stack's own
+          volume. All carry the label archivalist.profiling-stack=<id>, join the app container's
           user-defined network under fixed aliases (archivalist-profiling-{db,solr,backend}) and
           publish ports on 127.0.0.1 only. It then creates one identity repository in the new
           database and writes a state file (mode 0600) under rust-tools/benchmarks/.
@@ -29,7 +35,7 @@ verify    Challenge-response proof of database identity. A fresh random nonce is
 status    Shows the labelled containers and the volume.
 
 teardown  Removes only containers carrying this stack's label (double-checked per container).
-          The database volume is preserved unless --delete-db-volume is given explicitly.
+          The stack's db, build and data volumes are preserved unless --delete-volumes is given.
 
 Only the Python standard library and the docker CLI are used.
 """
@@ -52,6 +58,24 @@ LABEL = "archivalist.profiling-stack"
 ROLE_LABEL = "archivalist.profiling-role"
 ALIASES = {"db": "archivalist-profiling-db", "solr": "archivalist-profiling-solr", "backend": "archivalist-profiling-backend"}
 IDENTITY_NAME_PREFIX = "archivalist profiling identity "
+
+# The commands build.xml's db:migrate and backend:devserver run, invoked directly so that nothing is
+# written into the read-only source checkout (backend:copy:templates would). Same JVM options.
+BACKEND_SCRIPT = r"""set -euo pipefail
+JAR=$(ls /archivesspace/build/jruby-complete-*.jar | head -1)
+GEMS=$(ls -d /archivesspace/build/gems/jruby/*/ | head -1)
+CP="$JAR:${GEMS%/}:/archivesspace/lib/*:/archivesspace/common:/archivesspace/common/lib/*"
+export GEM_HOME=/archivesspace/build/gems GEM_PATH= BUNDLE_PATH=/archivesspace/build/gems BUNDLE_GEMFILE= ASPACE_ENV=development
+OPTS="-Djruby.rack.response.swallow_client_abort=false -Djava.security.egd=file:/dev/./urandom -Xmx2048m -Xss2m -Dfile.encoding=UTF-8 \
+ -Daspace.config.search_user_secret=devserver -Daspace.config.public_user_secret=devserver -Daspace.config.staff_user_secret=devserver \
+ -Daspace.devserver=true -Daspace.config.frontend_cookie_secret=devserver -Daspace.config.public_cookie_secret=devserver \
+ --add-opens java.base/sun.nio.ch=ALL-UNNAMED --add-opens java.base/java.io=ALL-UNNAMED"
+cd /archivesspace/build
+java $OPTS ${JAVA_OPTS:-} -cp "$CP" org.jruby.Main -Iapp/lib ../build/scripts/migrate_db.rb
+cd /archivesspace/backend
+exec java -Daspace.service=backend -Daspace.config.backend_url=http://localhost:4567 -Daspace.config.ignore_schema_info_check=true \
+  $OPTS ${JAVA_OPTS:-} -Djruby.debug.fullTrace=true -cp "$CP" org.jruby.Main app/main.rb 4567
+"""
 
 
 class StackError(Exception):
@@ -104,20 +128,44 @@ def app_container_details(app_container):
     networks = [n for n in info["NetworkSettings"]["Networks"] if n not in ("bridge", "host", "none")]
     if not networks:
         raise StackError("app container is not on a user-defined network; network aliases are unavailable")
-    mounts = []
-    for m in info.get("Mounts", []):
-        if m["Type"] == "bind":
-            spec = f"type=bind,src={m['Source']},dst={m['Destination']}"
-        elif m["Type"] == "volume":
-            spec = f"type=volume,src={m['Name']},dst={m['Destination']}"
-        else:
-            continue
-        if not m.get("RW", True):
-            spec += ",readonly"
-        mounts.append(spec)
+    mounts = [m for m in info.get("Mounts", []) if m["Type"] in ("bind", "volume")]
+    sources = [m for m in mounts if m["Destination"] == "/archivesspace"]
+    if len(sources) != 1:
+        raise StackError("app container must have exactly one mount at /archivesspace (the source checkout)")
     env = dict(e.split("=", 1) for e in info["Config"].get("Env", []) if "=" in e)
     return {"image": info["Config"]["Image"] or info["Image"], "network": networks[0], "mounts": mounts,
+            "source_mount": sources[0], "shared": {mount_identity(m) for m in mounts},
             "java_opts": env.get("JAVA_OPTS", "")}
+
+
+def mount_identity(m):
+    """What a mount actually shares: the host path of a bind or the name of a volume."""
+    return ("bind", m["Source"]) if m["Type"] == "bind" else ("volume", m["Name"])
+
+
+def mount_spec(m, destination=None, readonly=False):
+    dst = destination or m["Destination"]
+    spec = (f"type=bind,src={m['Source']},dst={dst}" if m["Type"] == "bind"
+            else f"type=volume,src={m['Name']},dst={dst}")
+    return spec + (",readonly" if readonly else "")
+
+
+def verify_isolated_mounts(container, app_shared, own_volumes):
+    """Inspects a created container's mounts. Every writable mount must be one of this stack's own
+    volumes and none may be shared with the app container; returns a summary for the state file."""
+    info = inspect(container)
+    if info is None:
+        raise StackError(f"cannot inspect {container}")
+    summary = []
+    for m in info.get("Mounts", []):
+        ident = mount_identity(m)
+        writable = bool(m.get("RW", True))
+        summary.append({"type": m["Type"], "source": ident[1], "destination": m["Destination"], "rw": writable})
+        if writable and ident in app_shared:
+            raise StackError(f"{container}: writable mount {ident} is shared with the main app")
+        if writable and not (m["Type"] == "volume" and m.get("Name") in own_volumes):
+            raise StackError(f"{container}: writable mount {ident} is not one of this stack's own volumes")
+    return summary
 
 
 def existing_stacks():
@@ -165,7 +213,8 @@ def setup(args):
     app = app_container_details(args.app_container)
     stack_id = secrets.token_hex(4)
     names = {role: f"{alias}-{stack_id}" for role, alias in ALIASES.items()}
-    volume = f"archivalist-profiling-db-{stack_id}"
+    volumes = {role: f"archivalist-profiling-{role}-{stack_id}" for role in ("db", "build", "data")}
+    volume = volumes["db"]
     db_root_password = secrets.token_hex(16)
     db_password = secrets.token_hex(16)
     labels = ["--label", f"{LABEL}={stack_id}"]
@@ -185,7 +234,7 @@ def setup(args):
 
     state = {"stack_id": stack_id, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
              "app_container": args.app_container, "network": app["network"], "image": app["image"],
-             "containers": names, "db_volume": volume, "db_root_password": db_root_password,
+             "containers": names, "db_volume": volume, "volumes": volumes, "db_root_password": db_root_password,
              "backend_host_url": f"http://127.0.0.1:{args.backend_port}",
              "backend_network_url": f"http://{ALIASES['backend']}:4567",
              "solr_host_url": f"http://127.0.0.1:{args.solr_port}/solr",
@@ -207,18 +256,46 @@ def setup(args):
                   urllib.parse.urlencode({"action": "CREATE", "name": core, "configSet": "archivesspace", "wt": "json"}), timeout=120)
     print(f"Solr ready with cores archivesspace and {state['identity_core']}", flush=True)
 
+    # Own build and data volumes. build/ is seeded by a one-shot container that sees the app's
+    # mounts READ-ONLY; the backend then mounts only the source (read-only) plus its own volumes.
+    for vol in (volumes["build"], volumes["data"]):
+        docker("volume", "create", "--label", f"{LABEL}={stack_id}", vol)
+    own_volumes = set(volumes.values())
+    seed = f"archivalist-profiling-seed-{stack_id}"
+    seed_mounts = [a for m in app["mounts"] for a in ("--mount", mount_spec(m, readonly=True))]
+    docker("create", "--name", seed, *labels, "--label", f"{ROLE_LABEL}=seed", *seed_mounts,
+           "--mount", f"type=volume,src={volumes['build']},dst=/profiling-build",
+           "--entrypoint", "bash", app["image"], "-c", "cp -a /archivesspace/build/. /profiling-build/")
+    try:
+        state["mounts"] = {"seed": verify_isolated_mounts(seed, app["shared"], own_volumes)}
+        docker("start", "-a", seed)
+        exit_code = inspect(seed)["State"]["ExitCode"]
+        if exit_code != 0:
+            raise StackError(f"seeding the build volume failed (exit {exit_code})")
+    finally:
+        docker("rm", "-f", seed, check=False)
+    print(f"Seeded build volume {volumes['build']} from the app's build directory (read-only)", flush=True)
+
     db_url = (f"jdbc:mysql://{ALIASES['db']}:3306/archivesspace?useUnicode=true&characterEncoding=UTF-8"
               f"&user=as&password={db_password}&useSSL=false&allowPublicKeyRetrieval=true")
-    mount_args = [a for spec in app["mounts"] for a in ("--mount", spec)]
-    docker("run", "-d", "--name", names["backend"], *labels, "--label", f"{ROLE_LABEL}=backend",
+    docker("create", "--name", names["backend"], *labels, "--label", f"{ROLE_LABEL}=backend",
            "--network", app["network"], "--network-alias", ALIASES["backend"],
-           "-p", f"127.0.0.1:{args.backend_port}:4567", *mount_args, "-w", "/archivesspace",
+           "-p", f"127.0.0.1:{args.backend_port}:4567",
+           "--mount", mount_spec(app["source_mount"], "/archivesspace", readonly=True),
+           "--mount", f"type=volume,src={volumes['build']},dst=/archivesspace/build",
+           "--mount", f"type=volume,src={volumes['data']},dst=/archivalist-profiling-data",
            "-e", f"APPCONFIG_DB_URL={db_url}", "-e", f"APPCONFIG_SOLR_URL={state['solr_network_url']}/archivesspace",
-           "-e", "APPCONFIG_DATA_DIRECTORY=/tmp/archivalist-profiling-data",
+           "-e", "APPCONFIG_DATA_DIRECTORY=/archivalist-profiling-data",
            "-e", "APPCONFIG_SEARCH_USER_SECRET=devserver", "-e", f"JAVA_OPTS={app['java_opts']}",
-           "--entrypoint", "bash", app["image"], "-c",
-           "cd /archivesspace && ./build/run db:migrate && exec ./build/run backend:devserver")
-    print("Backend container started; running migrations and starting (this can take several minutes)", flush=True)
+           "--entrypoint", "bash", app["image"], "-c", BACKEND_SCRIPT)
+    try:
+        state["mounts"]["backend"] = verify_isolated_mounts(names["backend"], app["shared"], own_volumes)
+    except StackError:
+        docker("rm", "-f", names["backend"], check=False)
+        raise
+    docker("start", names["backend"])
+    print("Backend container verified (source read-only, own build/data volumes) and started; "
+          "migrating and starting (this can take several minutes)", flush=True)
     wait_for("profiling backend", lambda: "databaseProductName" in http_json(state["backend_host_url"] + "/"), args.backend_timeout, 5)
 
     login = urllib.request.Request(f"{state['backend_host_url']}/users/admin/login?password=admin", data=b"", method="POST")
@@ -294,34 +371,41 @@ def status(args):
     for role, name in state["containers"].items():
         info = inspect(name)
         print(f"{role:8} {name:45} {'running' if info and info['State'].get('Running') else 'absent/stopped'}")
-    vol = docker("volume", "inspect", state["db_volume"], check=False)
-    print(f"volume   {state['db_volume']:45} {'present' if vol.returncode == 0 else 'absent'}")
+    for vol_name in (state.get("volumes") or {"db": state["db_volume"]}).values():
+        vol = docker("volume", "inspect", vol_name, check=False)
+        print(f"volume   {vol_name:45} {'present' if vol.returncode == 0 else 'absent'}")
     return 0
 
 
 def teardown(args):
     state = load_state(args.state)
     stack_id = state["stack_id"]
-    for role, name in state["containers"].items():
+    names = list(state["containers"].values())
+    names += [n for n in docker("ps", "-a", "--filter", f"label={LABEL}={stack_id}", "--format", "{{.Names}}").stdout.split()
+              if n not in names]
+    for name in names:
         info = inspect(name)
         if info is None:
             print(f"{name}: already absent")
             continue
         labels = info["Config"].get("Labels") or {}
-        if labels.get(LABEL) != stack_id or labels.get(ROLE_LABEL) != role:
+        if labels.get(LABEL) != stack_id:
             raise StackError(f"refusing to remove {name}: labels {labels} do not match stack {stack_id}")
         docker("rm", "-f", name)
         print(f"removed container {name}")
-    if args.delete_db_volume:
-        vol = docker("volume", "inspect", state["db_volume"], check=False)
-        if vol.returncode == 0:
+    stack_volumes = list((state.get("volumes") or {"db": state["db_volume"]}).values())
+    if args.delete_volumes:
+        for vol_name in stack_volumes:
+            vol = docker("volume", "inspect", vol_name, check=False)
+            if vol.returncode != 0:
+                continue
             vol_labels = json.loads(vol.stdout)[0].get("Labels") or {}
             if vol_labels.get(LABEL) != stack_id:
-                raise StackError(f"refusing to delete volume {state['db_volume']}: not labelled for stack {stack_id}")
-            docker("volume", "rm", state["db_volume"])
-            print(f"deleted volume {state['db_volume']} (explicitly requested)")
+                raise StackError(f"refusing to delete volume {vol_name}: not labelled for stack {stack_id}")
+            docker("volume", "rm", vol_name)
+            print(f"deleted volume {vol_name} (explicitly requested)")
     else:
-        print(f"kept database volume {state['db_volume']} (pass --delete-db-volume to delete it)")
+        print(f"kept volumes {', '.join(stack_volumes)} (pass --delete-volumes to delete them)")
     return 0
 
 
@@ -345,7 +429,7 @@ def main(argv=None):
             p.add_argument("--solr-url", default=None, help="Solr to check (default: the stack's host URL)")
             p.add_argument("--emit-env", action="store_true", help="print the variables the tools re-check")
         if name == "teardown":
-            p.add_argument("--delete-db-volume", action="store_true", help="also delete the database volume (explicit only)")
+            p.add_argument("--delete-volumes", action="store_true", help="also delete the stack's db/build/data volumes (explicit only)")
         p.set_defaults(func=func)
     args = parser.parse_args(argv)
     try:

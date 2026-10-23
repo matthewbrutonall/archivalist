@@ -304,15 +304,19 @@ Scripts under `scripts/` are code-only harnesses:
 - `profiling_stack.py`: provisions and proves a DISPOSABLE profiling stack for full-round
   profiling. `setup --app-container <name>` starts NEW containers only, without restarting or
   modifying existing ones: a MySQL on a new labelled volume, a Solr with the repository configset
-  plus an identity core, and a backend using the app container's image and mounts, migrated
-  against the new database. They are labelled `archivalist.profiling-stack=<id>`, join the app's
+  plus an identity core, and a backend from the app container's image with the source checkout
+  mounted read-only, its own build volume (seeded by a one-shot container that sees the app's
+  mounts read-only) and its own data volume. The backend runs the `db:migrate` and
+  `backend:devserver` commands directly, so nothing writes to the checkout. Both created
+  containers' mounts are checked with `docker inspect` before start, and setup fails if any
+  writable mount is shared with the app or is not one of the stack's own volumes. They are labelled `archivalist.profiling-stack=<id>`, join the app's
   network under `archivalist-profiling-{db,solr,backend}` aliases, publish ports on 127.0.0.1
   only, and the state file goes under `benchmarks/` with mode 0600. `verify` proves database
   identity by challenge and response: it writes a fresh nonce directly into the stack database
   and requires the target backend to return it from an anonymous `GET /repositories/<id>`,
   which writes nothing to the backend being checked. It also requires the stack's Solr identity
-  core. `teardown` removes only containers carrying the stack's label and keeps the database
-  volume unless `--delete-db-volume` is given.
+  core. `teardown` removes only containers carrying the stack's label and keeps the stack's db,
+  build and data volumes unless `--delete-volumes` is given.
 - `seed_large_repository.py`: creates a large, deterministic test repository through the API.
   It requires `--stack-state` and runs the stack identity proof before any login or write, so a
   main or shared test backend is rejected untouched. It sends each collection tree (resource,

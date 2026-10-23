@@ -77,6 +77,33 @@ class VerifyIdentityTests(unittest.TestCase):
                 ps.verify_identity(STATE, STATE["backend_host_url"], STATE["solr_host_url"])
 
 
+class MountIsolationTests(unittest.TestCase):
+    APP_SHARED = {("bind", "/home/me/checkout"), ("volume", "archivesspaceai_build")}
+    OWN = {"archivalist-profiling-build-abcd1234", "archivalist-profiling-data-abcd1234"}
+
+    def check(self, mounts):
+        with mock.patch.object(ps, "inspect", lambda name: {"Mounts": mounts}):
+            return ps.verify_isolated_mounts("c", self.APP_SHARED, self.OWN)
+
+    def test_accepts_read_only_source_and_own_writable_volumes(self):
+        summary = self.check([
+            {"Type": "bind", "Source": "/home/me/checkout", "Destination": "/archivesspace", "RW": False},
+            {"Type": "volume", "Name": "archivalist-profiling-build-abcd1234", "Source": "/v/b", "Destination": "/archivesspace/build", "RW": True},
+            {"Type": "volume", "Name": "archivalist-profiling-data-abcd1234", "Source": "/v/d", "Destination": "/data", "RW": True},
+        ])
+        self.assertEqual([False, True, True], [m["rw"] for m in summary])
+
+    def test_rejects_writable_mount_shared_with_app(self):
+        with self.assertRaisesRegex(ps.StackError, "shared with the main app"):
+            self.check([{"Type": "volume", "Name": "archivesspaceai_build", "Source": "/v/x", "Destination": "/archivesspace/build", "RW": True}])
+        with self.assertRaisesRegex(ps.StackError, "shared with the main app"):
+            self.check([{"Type": "bind", "Source": "/home/me/checkout", "Destination": "/archivesspace", "RW": True}])
+
+    def test_rejects_any_other_writable_mount(self):
+        with self.assertRaisesRegex(ps.StackError, "not one of this stack's own volumes"):
+            self.check([{"Type": "bind", "Source": "/tmp/elsewhere", "Destination": "/x", "RW": True}])
+
+
 class TeardownTests(unittest.TestCase):
     def write_state(self):
         fd, path = tempfile.mkstemp(suffix=".json")
@@ -89,20 +116,28 @@ class TeardownTests(unittest.TestCase):
         path = self.write_state()
         removed = []
         with mock.patch.object(ps, "inspect", lambda name: labelled("db", stack="someone-else")), \
-             mock.patch.object(ps, "docker", lambda *a, **k: removed.append(a)):
+             mock.patch.object(ps, "docker", self.fake_docker(removed)):
             with self.assertRaisesRegex(ps.StackError, "refusing to remove"):
-                ps.teardown(mock.Mock(state=path, delete_db_volume=False))
-        self.assertEqual([], removed)
+                ps.teardown(mock.Mock(state=path, delete_volumes=False))
+        self.assertEqual([], [c for c in removed if c[0] == "rm"])
 
     def test_removes_only_labelled_containers_and_keeps_volume_by_default(self):
         path = self.write_state()
         calls = []
         roles = {v: k for k, v in STATE["containers"].items()}
         with mock.patch.object(ps, "inspect", lambda name: labelled(roles[name])), \
-             mock.patch.object(ps, "docker", lambda *a, **k: calls.append(a)), redirect_stdout(io.StringIO()) as out:
-            ps.teardown(mock.Mock(state=path, delete_db_volume=False))
-        self.assertEqual(sorted(("rm", "-f", n) for n in STATE["containers"].values()), sorted(calls))
-        self.assertIn("kept database volume", out.getvalue())
+             mock.patch.object(ps, "docker", self.fake_docker(calls)), redirect_stdout(io.StringIO()) as out:
+            ps.teardown(mock.Mock(state=path, delete_volumes=False))
+        self.assertEqual(sorted(("rm", "-f", n) for n in STATE["containers"].values()), sorted(c for c in calls if c[0] == "rm"))
+        self.assertFalse([c for c in calls if c[:2] == ("volume", "rm")])
+        self.assertIn("kept volumes", out.getvalue())
+
+    @staticmethod
+    def fake_docker(calls):
+        def run(*args, **kwargs):
+            calls.append(args)
+            return mock.Mock(stdout="", returncode=0)
+        return run
 
 
 if __name__ == "__main__":

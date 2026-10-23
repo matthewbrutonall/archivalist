@@ -43,7 +43,11 @@ def load_profiling_stack():
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiling_stack.py")
     spec = importlib.util.spec_from_file_location("archivalist_profiling_stack", path)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    previous, sys.dont_write_bytecode = sys.dont_write_bytecode, True  # leave no __pycache__ in the checkout
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
     return module
 WORDS = ("correspondence photographs minutes ledgers drawings reports diaries maps sermons "
          "pamphlets accounts surveys petitions transcripts notebooks programmes").split()
