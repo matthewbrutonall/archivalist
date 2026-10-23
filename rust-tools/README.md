@@ -286,6 +286,13 @@ Scripts under `scripts/` are code-only harnesses:
   passes that count request/response bytes per call kind, per field and per projection, and
   repeated URIs and identical ancestor entries. It stores aggregates only, and its pass wall
   times are recorded as not comparable.
+  `SIDECAR_INDEX_TIMING=1` (`archivalist_sidecar_timing.rb`) starts the stage sidecar with its
+  `Server-Timing` header and, for every candidate and ablation pass, records `rust_server_ms`
+  (the sum of server `total`, split into receive, parse, build and serialize), `round_trip_ms`
+  (Ruby-side wall time of the sidecar HTTP calls), `transport_and_http_ms` (the difference,
+  including the server's response write) and `outside_sidecar_ms` (pass wall time minus the
+  round trips). It records per-pass values and medians; the cost per call is one header parse
+  and two clock reads. A run with timing requested but no header returned fails.
 - Helpers that query records require the caller to provide test-specific values
   through environment variables such as `RESOURCE_URI` and `QUERY`.
 

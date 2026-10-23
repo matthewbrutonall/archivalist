@@ -19,6 +19,8 @@
 # WARMUP_PASSES (default 1) sets untimed warmups per mode; their wall times are recorded.
 # PUI_ABLATION=1 adds a no-profiler PUI ablation (each Rust PUI capability alone, adjacent native).
 # PAYLOAD_ACCOUNTING=1 adds dedicated byte-accounting passes (bytes only; timings not comparable).
+# SIDECAR_INDEX_TIMING=1 starts the sidecar with its Server-Timing header and aggregates it per
+# pass: Rust server time, Ruby-side HTTP round trip, and time outside sidecar calls.
 # Usage: REPO_ID=4 [REPEATS=3] [PROFILE_REPEATS=3] rust-tools/scripts/run_profiled_repository_stage.sh
 set -uo pipefail
 : "${REPO_ID:?REPO_ID must be set explicitly}"
@@ -63,6 +65,7 @@ docker exec "${SOLR_ENV[@]}" -e REPO_ID="$REPO_ID" -e REPEATS="${REPEATS:-3}" -e
   -e ARCHIVALIST_PROFILE="$PROFILE_FLAG" -e JAVA_OPTS="$CONTAINER_JAVA_OPTS -Xss${PROFILE_XSS:-16m}" \
   -e WARMUP_PASSES="${WARMUP_PASSES:-1}" -e ARCHIVALIST_PUI_ABLATION="${PUI_ABLATION:-0}" \
   -e ARCHIVALIST_PAYLOAD_ACCOUNTING="${PAYLOAD_ACCOUNTING:-0}" \
+  -e ARCHIVALIST_SIDECAR_INDEX_TIMING="${SIDECAR_INDEX_TIMING:-0}" \
   -e ARCHIVALIST_SIDECAR_BINARY="${SIDECAR_BINARY:-}" -e ARCHIVALIST_SIDECAR_SHA256="$EXPECTED_SHA" \
   -e ARCHIVALIST_SIDECAR_BUILD_MODE="$BUILD_MODE" -e ARCHIVALIST_SIDECAR_BUILD_COMMAND="$BUILD_CMD" \
   -e ARCHIVALIST_GIT_COMMIT="$GIT_COMMIT" -e ARCHIVALIST_GIT_DIRTY="$GIT_DIRTY" -e ARCHIVALIST_GIT_DIRTY_PATHS="$GIT_DIRTY_PATHS" \

@@ -119,6 +119,7 @@ if __FILE__ == $PROGRAM_NAME
   puts "Warm Repeats: #{REPEATS} (warmup passes per mode: #{WARMUP_PASSES})"
   puts "PUI Ablation: #{PUI_ABLATION_ENABLED ? "enabled (core #{CORE_PUI_ABLATION})" : 'disabled'}"
   puts "Payload Accounting: #{PAYLOAD_ACCOUNTING_ENABLED ? 'enabled (dedicated untimed passes)' : 'disabled'}"
+  puts "Sidecar Index Timing: #{ENV['ARCHIVALIST_SIDECAR_INDEX_TIMING'].to_s =~ /\A(1|true|yes|on)\z/i ? 'enabled (Server-Timing header aggregated per pass)' : 'disabled'}"
   puts "Sidecar URL: #{SIDECAR_URL}"
   puts "Target Staff Cores: #{CORE_STAFF_NATIVE}, #{CORE_STAFF_CANDIDATE}, #{CORE_STAFF_FALLBACK}"
   puts "Target PUI Cores:   #{CORE_PUI_NATIVE}, #{CORE_PUI_CANDIDATE}, #{CORE_PUI_FALLBACK}"
@@ -167,6 +168,13 @@ if __FILE__ == $PROGRAM_NAME
   require 'periodic_indexer'
   require 'pui_indexer'
   require 'large_tree_doc_indexer'
+  require_relative 'archivalist_sidecar_timing'
+
+  # Opt-in sidecar Server-Timing aggregation (ARCHIVALIST_SIDECAR_INDEX_TIMING=1). The stage
+  # sidecar inherits the variable and emits the header; this hook only reads it and times each
+  # HTTP round trip. Off by default: nothing is installed.
+  SIDECAR_TIMING_ENABLED = ArchivalistSidecarTiming.enabled?
+  ArchivalistSidecarTiming.install!(RustIndexDocumentBuilder) if SIDECAR_TIMING_ENABLED
 
   # Opt-in aggregate profiling (ARCHIVALIST_PROFILE=1). Off by default: nothing is wrapped and
   # no timing/behavior changes unless explicitly enabled.
@@ -540,6 +548,9 @@ if __FILE__ == $PROGRAM_NAME
     end
 
     profile_snapshot = nil
+    sidecar_timing_on = SIDECAR_TIMING_ENABLED && options[:builder_enabled]
+    timing_calls = nil
+    ArchivalistSidecarTiming.start! if sidecar_timing_on
     start_wall = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     begin
       _, profile_snapshot = run_with_optional_profile do
@@ -548,10 +559,12 @@ if __FILE__ == $PROGRAM_NAME
         end
       end
     ensure
+      timing_calls = ArchivalistSidecarTiming.stop! if sidecar_timing_on
       RustIndexDocumentBuilder.define_method(:build, orig_builder_build)
     end
     end_wall = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     wall_ms = ((end_wall - start_wall) * 1000.0).round(2)
+    sidecar_timing = timing_calls && ArchivalistSidecarTiming.summarize(timing_calls, wall_ms)
 
     if options[:builder_enabled]
       instrumentation['accepted_builder_mappings'] = records_input.length - instrumentation['native_fallbacks']
@@ -566,6 +579,7 @@ if __FILE__ == $PROGRAM_NAME
       'doc_count' => docs.length,
       'docs' => docs,
       'instrumentation' => instrumentation,
+      'sidecar_timing' => sidecar_timing,
       'profile_snapshot' => profile_snapshot
     }
   end
@@ -683,6 +697,9 @@ if __FILE__ == $PROGRAM_NAME
     end
 
     profile_snapshot = nil
+    sidecar_timing_on = SIDECAR_TIMING_ENABLED && options[:builder_enabled]
+    timing_calls = nil
+    ArchivalistSidecarTiming.start! if sidecar_timing_on
     start_wall = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     begin
       _, profile_snapshot = run_with_optional_profile do
@@ -704,11 +721,13 @@ if __FILE__ == $PROGRAM_NAME
         end
       end
     ensure
+      timing_calls = ArchivalistSidecarTiming.stop! if sidecar_timing_on
       RustIndexDocumentBuilder.define_method(:build, orig_builder_build)
       RustIndexDocumentBuilder.define_method(:build_pui_auxiliary, orig_builder_aux)
     end
     end_wall = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     wall_ms = ((end_wall - start_wall) * 1000.0).round(2)
+    sidecar_timing = timing_calls && ArchivalistSidecarTiming.summarize(timing_calls, wall_ms)
 
     commit_solr(target_core)
     all_docs = fetch_all_solr_docs(target_core)
@@ -739,6 +758,7 @@ if __FILE__ == $PROGRAM_NAME
       'auxiliary_docs' => auxiliary_docs,
       'other_ordinary_docs' => other_ordinary_docs,
       'instrumentation' => instrumentation,
+      'sidecar_timing' => sidecar_timing,
       'profile_snapshot' => profile_snapshot
     }
   end
@@ -754,10 +774,12 @@ if __FILE__ == $PROGRAM_NAME
     end
 
     timings = []
+    sidecar_timings = []
     last_res = nil
     repeats.times do |iter|
       res = block.call
       timings << res['wall_ms']
+      sidecar_timings << res['sidecar_timing'] if res['sidecar_timing']
       last_res = res
       puts "    [#{label}] Repeat #{iter + 1}/#{repeats}: #{res['wall_ms']} ms"
     end
@@ -801,6 +823,8 @@ if __FILE__ == $PROGRAM_NAME
       'warmup_timings' => warmup_timings,
       'raw_timings' => timings,
       'median_ms' => median,
+      'sidecar_timing_raw' => sidecar_timings,
+      'sidecar_timing_median' => ArchivalistSidecarTiming.median_summary(sidecar_timings),
       'last_result' => last_res
     }
   end
@@ -899,6 +923,14 @@ if __FILE__ == $PROGRAM_NAME
     run_pui_indexing_pass(CORE_PUI_CANDIDATE, pui_records_snapshot, resource_uris, tree_uris, pui_candidate_options)
   end
   puts "PUI Candidate Median: #{pui_cand_bench['median_ms']} ms"
+  [['STAFF', staff_cand_bench], ['PUI', pui_cand_bench]].each do |mode, bench|
+    st = bench['sidecar_timing_median']
+    next unless st
+
+    phases = st['server_phase_ms'].map { |k, v| "#{k}=#{v}" }.join(' ')
+    puts "#{mode} Candidate Sidecar Timing (medians): #{st['calls']} calls; rust_server=#{st['rust_server_ms']} ms (#{phases}); " \
+         "round_trip=#{st['round_trip_ms']} ms; transport+http=#{st['transport_and_http_ms']} ms; outside_sidecar=#{st['outside_sidecar_ms']} ms"
+  end
 
   post_cand_metrics = get_sidecar_metrics
   post_cand_req_total = post_cand_metrics['archivalist_sidecar_requests_total'] || 0
@@ -960,6 +992,10 @@ if __FILE__ == $PROGRAM_NAME
     'pui_median_ms' => pui_cand_bench['median_ms'],
     'pui_raw_timings' => pui_cand_bench['raw_timings'],
     'pui_instrumentation' => pui_inst,
+    'staff_sidecar_timing_median' => staff_cand_bench['sidecar_timing_median'],
+    'pui_sidecar_timing_median' => pui_cand_bench['sidecar_timing_median'],
+    'staff_sidecar_timing_raw' => staff_cand_bench['sidecar_timing_raw'],
+    'pui_sidecar_timing_raw' => pui_cand_bench['sidecar_timing_raw'],
     'sidecar_delta' => sidecar_delta
   })
 
@@ -1008,6 +1044,7 @@ if __FILE__ == $PROGRAM_NAME
         'auxiliary_builder_calls' => inst['auxiliary_builder_calls'],
         'rejections' => inst['rejections'],
         'valid_measurement' => inst['rejections'] == 0,
+        'sidecar_timing_median' => bench['sidecar_timing_median'],
         'doc_count' => doc_count
       }
     end
@@ -1432,6 +1469,7 @@ if __FILE__ == $PROGRAM_NAME
         'candidate_median_ms' => staff_cand_bench['median_ms'],
         'candidate_raw_timings' => staff_cand_bench['raw_timings'],
         'candidate_warmup_timings' => staff_cand_bench['warmup_timings'],
+        'candidate_sidecar_timing_median' => staff_cand_bench['sidecar_timing_median'],
         'fallback_median_ms' => staff_fallback_bench['median_ms'],
         'fallback_raw_timings' => staff_fallback_bench['raw_timings'],
         'candidate_to_native_ratio' => staff_ratio
@@ -1448,6 +1486,7 @@ if __FILE__ == $PROGRAM_NAME
         'candidate_median_ms' => pui_cand_bench['median_ms'],
         'candidate_raw_timings' => pui_cand_bench['raw_timings'],
         'candidate_warmup_timings' => pui_cand_bench['warmup_timings'],
+        'candidate_sidecar_timing_median' => pui_cand_bench['sidecar_timing_median'],
         'fallback_median_ms' => pui_fallback_bench['median_ms'],
         'fallback_raw_timings' => pui_fallback_bench['raw_timings'],
         'candidate_to_native_ratio' => pui_ratio
