@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
 """Seed a large, deterministic test repository through the ArchivesSpace API.
 
-For profiling only, against an ISOLATED, disposable backend: it creates a new published
+For profiling only, against the DISPOSABLE profiling stack from profiling_stack.py: it creates a new published
 repository with subjects, agents, and per-collection trees (resource -> series -> files ->
 items) carrying notes, dates, extents, subject/agent links and top-container instances, plus a
 fraction of digital objects linked from items. Each collection tree is sent as one
 /batch_imports request, with placeholder URIs that the backend resolves when it saves them.
 
-It refuses to run unless --confirm-isolated-backend is given and the backend URL is loopback.
-It only creates records (in its new repository and the global subject/agent lists); it never
-updates or deletes anything. Uses only the Python standard library.
+Safety: --stack-state (the state file from `profiling_stack.py setup`) is required. Before any
+login or write it runs the stack's database-identity proof: a fresh nonce is written directly into
+the profiling database and the target backend must return it from an anonymous GET; the stack's
+Solr identity core must also be present. A main or shared test backend fails that check and is
+never written to. It only creates records (in its new repository and the global subject/agent
+lists); it never updates or deletes anything. Uses only the Python standard library.
 
 Example:
-  ARCHIVALIST_SEED_PASSWORD=admin python3 rust-tools/scripts/seed_large_repository.py \\
-      --backend-url http://localhost:4567 --preset medium --confirm-isolated-backend
+  python3 rust-tools/scripts/seed_large_repository.py \\
+      --stack-state rust-tools/benchmarks/profiling_stack_<id>.json --preset medium
 """
 
 import argparse
+import importlib.util
 import json
 import os
 import random
@@ -32,7 +36,15 @@ PRESETS = {
     "medium": dict(resources=20, series=10, files=20, items=5, subjects=150, agents=150, containers=60),
     "large": dict(resources=40, series=12, files=25, items=6, subjects=300, agents=300, containers=120),
 }
-LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def load_profiling_stack():
+    """profiling_stack.py from this directory, loaded by path (works under python3 -I)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiling_stack.py")
+    spec = importlib.util.spec_from_file_location("archivalist_profiling_stack", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 WORDS = ("correspondence photographs minutes ledgers drawings reports diaries maps sermons "
          "pamphlets accounts surveys petitions transcripts notebooks programmes").split()
 
@@ -140,7 +152,8 @@ def build_tree_batch(rng, repo_uri, r, cfg, subjects, agents):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--backend-url", default="http://localhost:4567")
+    parser.add_argument("--stack-state", required=True, help="state file from profiling_stack.py setup")
+    parser.add_argument("--backend-url", default=None, help="default: the stack's backend URL")
     parser.add_argument("--user", default="admin")
     parser.add_argument("--preset", choices=sorted(PRESETS), default="small")
     for key in ("resources", "series", "files", "items", "subjects", "agents", "containers"):
@@ -150,15 +163,17 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=20261023)
     parser.add_argument("--repo-code", default=None, help="default SEED-<timestamp>")
     parser.add_argument("--summary-json", default=None, help="write a JSON summary to this path")
-    parser.add_argument("--confirm-isolated-backend", action="store_true",
-                        help="required: confirms the backend is a disposable test stack")
     args = parser.parse_args(argv)
 
-    host = urllib.parse.urlparse(args.backend_url).hostname
-    if not args.confirm_isolated_backend:
-        parser.error("refusing to write: pass --confirm-isolated-backend for a disposable test backend")
-    if host not in LOOPBACK_HOSTS:
-        parser.error(f"refusing non-loopback backend host {host!r}")
+    stack = load_profiling_stack()
+    try:
+        state = stack.load_state(args.stack_state)
+        backend_url = args.backend_url or state["backend_host_url"]
+        stack.verify_identity(state, backend_url, state["solr_host_url"])
+    except (stack.StackError, OSError, ValueError) as err:
+        print(f"ERROR: refusing to seed: {err}", file=sys.stderr)
+        return 2
+    print(f"Verified {backend_url} belongs to profiling stack {state['stack_id']}", flush=True)
 
     cfg = dict(PRESETS[args.preset])
     for key in cfg:
@@ -168,8 +183,8 @@ def main(argv=None):
     cfg["agent_link_fraction"] = args.agent_link_fraction
     rng = random.Random(args.seed)
 
-    backend = Backend(args.backend_url)
-    backend.login(args.user, os.environ.get("ARCHIVALIST_SEED_PASSWORD", "admin"))
+    backend = Backend(backend_url)
+    backend.login(args.user, os.environ.get("ARCHIVALIST_SEED_PASSWORD", state.get("admin_password", "admin")))
     started = time.monotonic()
 
     repo_code = args.repo_code or f"SEED-{int(time.time())}"

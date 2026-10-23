@@ -10,11 +10,13 @@
 # PUI tree work, and the coordinating thread's waiting. Nothing is read from a pre-fetched
 # snapshot, so backend fetching and Solr writes are inside the measured region.
 #
-# Guardrails (shared with the stage harnesses): allowlisted backend and Solr URLs only; cores are
-# created per run as stage_{staff,pui}_<run_id>_native and retained; existing cores and the
-# source database are never written; index state lives in a fresh temporary directory per round.
-# A full round indexes EVERY repository visible to the backend, so use an isolated backend whose
-# data you intend to measure. The inventory in the report lists what was indexed.
+# Guardrails: it only runs against a disposable profiling stack (profiling_stack.py). Before
+# anything else it re-checks the stack's database-identity nonce through BACKEND_URL (anonymous
+# GET) and the stack's identity core through SOLR_BASE_URL, and refuses otherwise, so a main or
+# shared test backend/Solr is rejected before any login, core creation or indexing. URLs must
+# also pass the shared allowlist. Cores are created per run as stage_{staff,pui}_<run_id>_native
+# and retained; index state lives in a fresh temporary directory per round. A full round indexes
+# EVERY repository the (verified) backend can see; the report's inventory lists them.
 #
 # Environment:
 #   SOLR_BASE_URL   allowlisted Solr base (default http://solr:8983/solr)
@@ -46,6 +48,7 @@ require 'tmpdir'
 
 require_relative 'integration_stage_harness'
 require_relative 'archivalist_ruby_side_timing'
+require_relative 'archivalist_profiling_stack'
 
 RUST_FLAGS = %i[
   rust_index_document_builder_enabled rust_index_document_enrichment_enabled
@@ -65,6 +68,9 @@ if __FILE__ == $PROGRAM_NAME
   BACKEND_BASE = ENV['BACKEND_URL'] || 'http://localhost:4567'
   raise "Safety violation: Invalid or unapproved backend URL '#{BACKEND_BASE}'" unless ArchivalistHarnessSafety.valid_backend_url?(BACKEND_BASE)
   raise "Safety violation: Invalid or unapproved Solr URL '#{SOLR_BASE}'" unless ArchivalistHarnessSafety.valid_solr_url?(SOLR_BASE)
+
+  # Database/Solr identity of the disposable profiling stack, before any write or login.
+  STACK_IDENTITY = ArchivalistProfilingStack.verify!(env: ENV, backend_url: BACKEND_BASE, solr_url: SOLR_BASE)
 
   REPEATS = Integer(ENV['REPEATS'] || '1')
   raise 'REPEATS must be >= 1' unless REPEATS >= 1
@@ -116,6 +122,7 @@ if __FILE__ == $PROGRAM_NAME
   puts 'Archivalist Native Indexing Profile'
   puts "Runtime: #{RUBY_DESCRIPTION}"
   puts "Backend: #{BACKEND_BASE}  Solr: #{SOLR_BASE}"
+  puts "Profiling stack: #{STACK_IDENTITY['stack_id']} (database identity and Solr identity core verified)"
   puts "Modes: #{MODES.join(', ')}  Repeats: #{REPEATS}  Timers: #{TIMERS ? 'on' : 'off (wall time only)'}"
   puts "Threads: staff #{AppConfig[:indexer_thread_count]} x #{AppConfig[:indexer_records_per_thread]} records, " \
        "pui #{AppConfig[:pui_indexer_thread_count]} x #{AppConfig[:pui_indexer_records_per_thread]} records"
@@ -205,6 +212,7 @@ if __FILE__ == $PROGRAM_NAME
     'runtime' => RUBY_DESCRIPTION,
     'backend_base' => BACKEND_BASE,
     'solr_base' => SOLR_BASE,
+    'profiling_stack' => STACK_IDENTITY,
     'timers' => TIMERS,
     'threads' => { 'staff' => [AppConfig[:indexer_thread_count], AppConfig[:indexer_records_per_thread]],
                    'pui' => [AppConfig[:pui_indexer_thread_count], AppConfig[:pui_indexer_records_per_thread]] },

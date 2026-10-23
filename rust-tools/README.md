@@ -301,22 +301,36 @@ Scripts under `scripts/` are code-only harnesses:
   (their time lands in their caller), keeping it to roughly ten thousand timer calls per PUI pass.
   The overhead is estimated from a calibration loop and reported, never subtracted. The stdout
   prints a native-versus-candidate table per mode.
-- `seed_large_repository.py`: creates a large, deterministic test repository through the API
-  for profiling, on an isolated, disposable backend only (it requires
-  `--confirm-isolated-backend` and a loopback backend URL, and only creates records). It sends
-  each collection tree (resource, series, files, items with notes, dates, extents, subject/agent
-  links, top-container instances and some digital objects) as one `/batch_imports` request.
-  Presets are `small` (~1.2k archival objects), `medium` (~24k) and `large` (~70k), and each
-  count can be overridden. The password comes from `ARCHIVALIST_SEED_PASSWORD`.
+- `profiling_stack.py`: provisions and proves a DISPOSABLE profiling stack for full-round
+  profiling. `setup --app-container <name>` starts NEW containers only, without restarting or
+  modifying existing ones: a MySQL on a new labelled volume, a Solr with the repository configset
+  plus an identity core, and a backend using the app container's image and mounts, migrated
+  against the new database. They are labelled `archivalist.profiling-stack=<id>`, join the app's
+  network under `archivalist-profiling-{db,solr,backend}` aliases, publish ports on 127.0.0.1
+  only, and the state file goes under `benchmarks/` with mode 0600. `verify` proves database
+  identity by challenge and response: it writes a fresh nonce directly into the stack database
+  and requires the target backend to return it from an anonymous `GET /repositories/<id>`,
+  which writes nothing to the backend being checked. It also requires the stack's Solr identity
+  core. `teardown` removes only containers carrying the stack's label and keeps the database
+  volume unless `--delete-db-volume` is given.
+- `seed_large_repository.py`: creates a large, deterministic test repository through the API.
+  It requires `--stack-state` and runs the stack identity proof before any login or write, so a
+  main or shared test backend is rejected untouched. It sends each collection tree (resource,
+  series, files, items with notes, dates, extents, subject/agent links, top-container instances
+  and some digital objects) as one `/batch_imports` request. Presets are `small` (~1.2k
+  archival objects), `medium` (~24k) and `large` (~70k), and each count can be overridden.
 - `native_indexing_profile.rb` + `run_native_indexing_profile.sh`: complete native
   `run_index_round`s for STAFF and PUI from an empty index state into fresh run-scoped stage
-  cores, with all Rust flags forced off, so backend fetching and Solr writes are measured.
+  cores in the stack's Solr, with all Rust flags forced off, so backend fetching and Solr writes
+  are measured. The wrapper requires `STACK_STATE`, runs `profiling_stack.py verify`, and passes
+  the nonce and the stack's in-network URLs to the profiler. The profiler
+  (`archivalist_profiling_stack.rb`) re-checks the same nonce through its own backend URL and the
+  identity core through its own Solr URL before any login, core creation or indexing.
   `archivalist_ruby_side_timing.rb` attributes the time to backend HTTP, record fetching,
   document preparation, JSON, Solr update/commit/delete HTTP, PUI tree work and the coordinating
-  thread's waiting. Timers are now per-thread, so with several indexer threads the categories
-  sum thread time and can exceed wall time. `TIMERS=0` gives wall time only (compare medians
-  for overhead); `REPEATS`, `MODES`, `STAFF_THREADS` and `PUI_THREADS` are forwarded. A full
-  round indexes every repository the backend can see; the report's inventory lists them.
+  thread's waiting. Timers are per-thread, so with several indexer threads the categories sum
+  thread time and can exceed wall time. `TIMERS=0` gives wall time only (compare medians for
+  overhead); `REPEATS`, `MODES`, `STAFF_THREADS`, `PUI_THREADS` and `APP_CONTAINER` are forwarded.
 - Helpers that query records require the caller to provide test-specific values
   through environment variables such as `RESOURCE_URI` and `QUERY`.
 
