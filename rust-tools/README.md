@@ -301,6 +301,22 @@ Scripts under `scripts/` are code-only harnesses:
   (their time lands in their caller), keeping it to roughly ten thousand timer calls per PUI pass.
   The overhead is estimated from a calibration loop and reported, never subtracted. The stdout
   prints a native-versus-candidate table per mode.
+- `seed_large_repository.py`: creates a large, deterministic test repository through the API
+  for profiling, on an isolated, disposable backend only (it requires
+  `--confirm-isolated-backend` and a loopback backend URL, and only creates records). It sends
+  each collection tree (resource, series, files, items with notes, dates, extents, subject/agent
+  links, top-container instances and some digital objects) as one `/batch_imports` request.
+  Presets are `small` (~1.2k archival objects), `medium` (~24k) and `large` (~70k), and each
+  count can be overridden. The password comes from `ARCHIVALIST_SEED_PASSWORD`.
+- `native_indexing_profile.rb` + `run_native_indexing_profile.sh`: complete native
+  `run_index_round`s for STAFF and PUI from an empty index state into fresh run-scoped stage
+  cores, with all Rust flags forced off, so backend fetching and Solr writes are measured.
+  `archivalist_ruby_side_timing.rb` attributes the time to backend HTTP, record fetching,
+  document preparation, JSON, Solr update/commit/delete HTTP, PUI tree work and the coordinating
+  thread's waiting. Timers are now per-thread, so with several indexer threads the categories
+  sum thread time and can exceed wall time. `TIMERS=0` gives wall time only (compare medians
+  for overhead); `REPEATS`, `MODES`, `STAFF_THREADS` and `PUI_THREADS` are forwarded. A full
+  round indexes every repository the backend can see; the report's inventory lists them.
 - Helpers that query records require the caller to provide test-specific values
   through environment variables such as `RESOURCE_URI` and `QUERY`.
 

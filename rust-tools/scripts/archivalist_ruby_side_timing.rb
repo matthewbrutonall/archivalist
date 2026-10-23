@@ -28,9 +28,14 @@
 # cost seconds per pass); only their non-recursive callers are, so their time lands there. Hooks are prepended and only `build` is left alone, because the harness
 # redefines it via instance_method; the harness times it with ArchivalistRubySideTiming.measure.
 # Overhead is estimated from a calibration loop and reported, never subtracted.
+#
+# Thread-safe: each thread keeps its own stack and tallies (registered under a mutex and merged
+# by stop!). With several threads the categories add up thread time, so their sum can exceed
+# the wall time; summarize reports the number of threads seen.
 
 module ArchivalistRubySideTiming
-  STATE = { active: false, stack: [], totals: Hash.new(0.0), counts: Hash.new(0) }
+  STATE = { active: false, generation: 0, tallies: [] }
+  LOCK = Mutex.new
   BUILDER_CONTEXTS = %w[builder_build].freeze
   BUILDER_VALIDATION_PREFIXES = %w[validate_ compute_expected_ reconstruct_expected_].freeze
   CALIBRATION = { per_call_ms: nil }
@@ -43,10 +48,21 @@ module ArchivalistRubySideTiming
     %w[1 true yes on].include?(env['ARCHIVALIST_RUBY_SIDE_TIMING'].to_s.strip.downcase)
   end
 
+  # This thread's tally for the current collection generation (created and registered on demand).
+  def self.tally
+    current = Thread.current[:archivalist_ruby_side_timing]
+    return current if current && current[:generation] == STATE[:generation]
+
+    fresh = { generation: STATE[:generation], stack: [], totals: Hash.new(0.0), counts: Hash.new(0) }
+    LOCK.synchronize { STATE[:tallies] << fresh }
+    Thread.current[:archivalist_ruby_side_timing] = fresh
+  end
+
   def self.measure(category)
     return yield unless STATE[:active]
 
-    stack = STATE[:stack]
+    current = tally
+    stack = current[:stack]
     frame = [category, 0.0]
     stack.push(frame)
     started = now
@@ -55,14 +71,18 @@ module ArchivalistRubySideTiming
     ensure
       elapsed = now - started
       stack.pop
-      STATE[:totals][category] += elapsed - frame[1]
-      STATE[:counts][category] += 1
+      current[:totals][category] += elapsed - frame[1]
+      current[:counts][category] += 1
       stack.last[1] += elapsed unless stack.empty?
     end
   end
 
+  def self.inside?(categories)
+    tally[:stack].any? { |frame| categories.include?(frame[0]) }
+  end
+
   def self.inside_builder?
-    STATE[:stack].any? { |frame| BUILDER_CONTEXTS.include?(frame[0]) }
+    inside?(BUILDER_CONTEXTS)
   end
 
   def self.wrap_methods(owner, names, category)
@@ -122,26 +142,92 @@ module ArchivalistRubySideTiming
     hooked
   end
 
+  # Solr requests from IndexerCommon#do_http_request, classified by the enclosing operation.
+  module SolrHttpHook
+    def do_http_request(url, req)
+      return super unless ArchivalistRubySideTiming::STATE[:active]
+
+      category = if ArchivalistRubySideTiming.inside?(%w[solr_commit])
+                   'solr_commit_http'
+                 elsif ArchivalistRubySideTiming.inside?(%w[solr_delete_records])
+                   'solr_delete_http'
+                 else
+                   'solr_update_http'
+                 end
+      ArchivalistRubySideTiming.measure(category) { super }
+    end
+  end
+
+  # Native indexing pipeline categories for full index rounds (see native_indexing_profile.rb):
+  #
+  #   index_round_main_thread   run_index_round on the coordinating thread, INCLUDING time spent
+  #                             waiting for worker threads (queue offers and joins)
+  #   backend_http              JSONModel::HTTP.do_http_request (all backend API calls)
+  #   fetch_records             PeriodicIndexer/PUIIndexer#fetch_records excluding HTTP and JSON
+  #                             decoding (JSONModel object construction, PUI direct-only merge
+  #                             appears separately as record_inheritance_merge)
+  #   document_preparation      IndexerCommon#index_records excluding nested categories
+  #   batch_append              IndexBatch#<< (temp-file write; the JSON encode is other_json_encode)
+  #   solr_index_batch          IndexerCommon#index_batch setup excluding its Solr HTTP
+  #   solr_update_http / solr_commit_http / solr_delete_http   Solr requests by operation
+  #   solr_commit / solr_delete_records                         request building around them
+  #   handle_deletes            PeriodicIndexer#handle_deletes excluding nested categories
+  #   pui_tree_round            PUIIndexer#index_round_complete (tree id discovery) exclusive
+  #   pui_infscroll / large_tree  PUI ordered-records and LargeTree document generation
+  def self.install_native_pipeline!(indexer_common:, periodic_indexer:, pui_indexer:, large_tree:, index_batch:, jsonmodel_http:)
+    hooked = {}
+    hooked['backend_http'] = wrap_methods(jsonmodel_http.singleton_class, %w[do_http_request], 'backend_http')
+    indexer_common.prepend(SolrHttpHook) unless indexer_common.ancestors.include?(SolrHttpHook)
+    hooked['solr_http'] = %w[do_http_request]
+    hooked['solr_commit'] = wrap_methods(indexer_common, %w[send_commit], 'solr_commit')
+    hooked['solr_delete_records'] = wrap_methods(indexer_common, %w[delete_records], 'solr_delete_records')
+    hooked['solr_index_batch'] = wrap_methods(indexer_common, %w[index_batch], 'solr_index_batch')
+    hooked['document_preparation'] = wrap_methods(indexer_common, %w[index_records], 'document_preparation')
+    hooked['batch_append'] = wrap_methods(index_batch, %w[<<], 'batch_append')
+    hooked['fetch_records'] = wrap_methods(periodic_indexer, %w[fetch_records], 'fetch_records') +
+                              wrap_methods(pui_indexer, %w[fetch_records], 'fetch_records')
+    hooked['index_round_main_thread'] = wrap_methods(periodic_indexer, %w[run_index_round], 'index_round_main_thread')
+    hooked['handle_deletes'] = wrap_methods(periodic_indexer, %w[handle_deletes], 'handle_deletes')
+    hooked['pui_tree_round'] = wrap_methods(pui_indexer, %w[index_round_complete], 'pui_tree_round')
+    hooked['pui_infscroll'] = wrap_methods(pui_indexer, %w[add_infscroll_docs], 'pui_infscroll')
+    hooked['large_tree'] = wrap_methods(large_tree, %w[add_largetree_docs], 'large_tree')
+    hooked
+  end
+
   # Estimates the cost of one measure call (two clock reads plus bookkeeping).
   def self.calibrate!(iterations = 20_000)
-    saved = { active: STATE[:active], stack: STATE[:stack], totals: STATE[:totals], counts: STATE[:counts] }
-    STATE.merge!(active: true, stack: [], totals: Hash.new(0.0), counts: Hash.new(0))
+    start!
     started = now
     iterations.times { measure('calibration') { nil } }
     CALIBRATION[:per_call_ms] = (now - started) * 1000.0 / iterations
   ensure
-    STATE.merge!(saved)
+    stop!
   end
 
   def self.start!
-    STATE.merge!(active: true, stack: [], totals: Hash.new(0.0), counts: Hash.new(0))
+    LOCK.synchronize do
+      STATE[:generation] += 1
+      STATE[:tallies] = []
+      STATE[:active] = true
+    end
   end
 
-  # Stops collection and returns { totals_ms, counts } for the pass.
+  # Stops collection and returns { totals_ms, counts, threads } merged across threads.
   def self.stop!
-    result = { 'totals_ms' => STATE[:totals].transform_values { |s| s * 1000.0 }, 'counts' => STATE[:counts].dup }
-    STATE.merge!(active: false, stack: [], totals: Hash.new(0.0), counts: Hash.new(0))
-    result
+    tallies = LOCK.synchronize do
+      STATE[:active] = false
+      STATE[:generation] += 1
+      taken = STATE[:tallies]
+      STATE[:tallies] = []
+      taken
+    end
+    totals = Hash.new(0.0)
+    counts = Hash.new(0)
+    tallies.each do |t|
+      t[:totals].each { |k, v| totals[k] += v }
+      t[:counts].each { |k, v| counts[k] += v }
+    end
+    { 'totals_ms' => totals.transform_values { |v| v * 1000.0 }, 'counts' => counts, 'threads' => tallies.length }
   end
 
   def self.summarize(raw, pass_wall_ms)
@@ -154,6 +240,7 @@ module ArchivalistRubySideTiming
       'attributed_ms' => attributed.round(3),
       'unattributed_ms' => (pass_wall_ms - attributed).round(3),
       'timer_calls' => calls,
+      'threads' => raw.fetch('threads', 1),
       'estimated_timer_overhead_ms' => CALIBRATION[:per_call_ms] ? (calls * CALIBRATION[:per_call_ms]).round(3) : nil
     }
   end

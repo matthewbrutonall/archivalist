@@ -99,6 +99,74 @@ FakeTimingBuilder.define_method(:build) do |inputs|
   ArchivalistRubySideTiming.measure('builder_build') { ORIGINAL_FAKE_TIMING_BUILD.bind(self).call(inputs) }
 end
 
+module FakeJsonModelHttp
+  def self.do_http_request(_url, _req)
+    sleep 0.002
+    :backend_response
+  end
+end
+
+class FakePipelineIndexer
+  attr_reader :solr_calls
+
+  def initialize
+    @solr_calls = []
+  end
+
+  def do_http_request(url, _req)
+    @solr_calls << url
+    sleep 0.001
+    :solr_response
+  end
+
+  def send_commit
+    do_http_request('commit', nil)
+  end
+
+  def delete_records(records)
+    records.each { |r| do_http_request("delete #{r}", nil) }
+  end
+
+  def index_batch(_batch)
+    do_http_request('update', nil)
+  end
+
+  def index_records(records)
+    FakeJsonModelHttp.do_http_request('fetch', nil)
+    index_batch(records)
+  end
+
+  def run_index_round
+    index_records([1, 2])
+    send_commit
+    handle_deletes
+  end
+
+  def handle_deletes
+    delete_records(%w[a b])
+  end
+
+  def fetch_records(*); end
+end
+
+class FakePipelinePui < FakePipelineIndexer
+  def index_round_complete(*); end
+  def add_infscroll_docs(*); end
+end
+
+class FakeLargeTree
+  def add_largetree_docs(*); end
+end
+
+class FakeIndexBatchForTiming
+  def <<(_doc); end
+end
+
+PIPELINE_HOOKED = ArchivalistRubySideTiming.install_native_pipeline!(
+  indexer_common: FakePipelineIndexer, periodic_indexer: FakePipelineIndexer, pui_indexer: FakePipelinePui,
+  large_tree: FakeLargeTree, index_batch: FakeIndexBatchForTiming, jsonmodel_http: FakeJsonModelHttp
+)
+
 class TestArchivalistRubySideTiming < Minitest::Test
   def test_install_reports_hooked_methods
     assert_equal ['validate_thing!'], HOOKED['builder_validation']
@@ -112,7 +180,7 @@ class TestArchivalistRubySideTiming < Minitest::Test
   def test_inactive_records_nothing_and_preserves_results
     result = FakePuiIndexer.new.rust_index_documents([{ 'x' => 1 }])
     assert_equal [{ 'x' => 1 }], result
-    assert_empty ArchivalistRubySideTiming::STATE[:totals]
+    assert_empty ArchivalistRubySideTiming::STATE[:tallies]
     assert_equal({ 'a' => 1, 'merged' => true, 'opts' => { remove_ancestors: true } },
                  FakeRecordInheritance.merge({ 'a' => 1 }, remove_ancestors: true))
   end
@@ -147,6 +215,45 @@ class TestArchivalistRubySideTiming < Minitest::Test
     assert_in_delta wall_ms, summary['attributed_ms'] + summary['unattributed_ms'], 0.01
     assert_operator summary['unattributed_ms'], :>=, 0.0
     assert_equal false, ArchivalistRubySideTiming::STATE[:active]
+  end
+
+  def test_threads_keep_separate_stacks_and_tallies_merge
+    ArchivalistRubySideTiming.start!
+    threads = 3.times.map do
+      Thread.new do
+        ArchivalistRubySideTiming.measure('outer') do
+          sleep 0.01
+          ArchivalistRubySideTiming.measure('inner') { sleep 0.01 }
+        end
+      end
+    end
+    threads.each(&:join)
+    raw = ArchivalistRubySideTiming.stop!
+    assert_equal 3, raw['threads']
+    assert_equal 3, raw['counts']['outer']
+    assert_equal 3, raw['counts']['inner']
+    # Exclusive per thread: each outer excludes its own inner (~10 ms each, ~30 ms summed).
+    assert_operator raw['totals_ms']['outer'], :>=, 25.0
+    assert_operator raw['totals_ms']['outer'], :<, 60.0
+    assert_operator raw['totals_ms']['inner'], :>=, 25.0
+    assert_equal false, ArchivalistRubySideTiming::STATE[:active]
+  end
+
+  def test_native_pipeline_classifies_backend_and_solr_requests
+    assert_equal ['do_http_request'], PIPELINE_HOOKED['backend_http']
+    assert_equal ['run_index_round'], PIPELINE_HOOKED['index_round_main_thread']
+    indexer = FakePipelineIndexer.new
+    ArchivalistRubySideTiming.start!
+    indexer.run_index_round
+    raw = ArchivalistRubySideTiming.stop!
+    counts = raw['counts']
+    assert_equal 1, counts['backend_http']
+    assert_equal 1, counts['solr_update_http']
+    assert_equal 1, counts['solr_commit_http']
+    assert_equal 2, counts['solr_delete_http']
+    assert_equal 1, counts['index_round_main_thread']
+    assert_operator raw['totals_ms']['backend_http'], :>=, 2.0
+    assert_equal ['update', 'commit', 'delete a', 'delete b'], indexer.solr_calls
   end
 
   def test_median_summary_handles_missing_categories
