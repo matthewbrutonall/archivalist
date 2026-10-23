@@ -293,6 +293,14 @@ Scripts under `scripts/` are code-only harnesses:
   including the server's response write) and `outside_sidecar_ms` (pass wall time minus the
   round trips). It records per-pass values and medians; the cost per call is one header parse
   and two clock reads. A run with timing requested but no header returned fails.
+  `RUBY_SIDE_TIMING=1` (`archivalist_ruby_side_timing.rb`, use with `PROFILE_MODE=off`) adds
+  coarse exclusive timers to every timed pass, native included: request JSON encoding, reply
+  JSON decoding, builder checks (`validate_*`, `compute_expected_*`, `reconstruct_expected_*`),
+  `apply_rust_pui_*`, `RecordInheritance.merge`/`build_plan`, input preparation, the sidecar round
+  trip and other JSON work. The remainder is `unattributed_ms`. Recursive helpers are not wrapped
+  (their time lands in their caller), keeping it to roughly ten thousand timer calls per PUI pass.
+  The overhead is estimated from a calibration loop and reported, never subtracted. The stdout
+  prints a native-versus-candidate table per mode.
 - Helpers that query records require the caller to provide test-specific values
   through environment variables such as `RESOURCE_URI` and `QUERY`.
 
