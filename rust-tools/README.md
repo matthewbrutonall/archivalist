@@ -106,6 +106,12 @@ The example systemd unit in `deploy/` binds to loopback by default. Put authenti
 and transport security in front of the sidecar before exposing it beyond the local
 host.
 
+`--index-timing` (or `ARCHIVALIST_SIDECAR_INDEX_TIMING=1`) adds a `Server-Timing` header to
+successful `/index/documents` responses with `receive`, `parse`, `build`, `serialize` and
+`total` durations in milliseconds. `total` runs from the start of reading the request to just
+before the response is written, so it excludes writing the response. It is off by default and
+never changes the JSON body.
+
 Release archives can be built reproducibly with
 `scripts/package_sidecar_release.sh`. See `deploy/CANARY.md` for the staged
 non-production rollout, parity gate, outage fallback test, and rollback procedure.
