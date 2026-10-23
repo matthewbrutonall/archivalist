@@ -10,7 +10,11 @@ Dir[File.expand_path('../shared/**/*.rb', __FILE__)].sort.each { |f| require f }
 DEFAULT_WINDOW_WIDTH = 1920
 DEFAULT_WINDOW_HEIGHT = 1080
 
-CHROME_OPTS  = ENV.fetch('CHROME_OPTS', "--headless=new --no-sandbox --enable-logging --log-level=0 --v=1 --incognito --disable-extensions --auto-open-devtools-for-tabs --window-size=#{DEFAULT_WINDOW_WIDTH},#{DEFAULT_WINDOW_HEIGHT} --disable-dev-shm-usage").split(' ')
+# No --auto-open-devtools-for-tabs: the extra DevTools windows break axe-core-rspec's window
+# handling ("Unable to determine window handle") in every accessibility check.
+# No --incognito: Chrome ignores the download directory preference in incognito, so PDF download
+# specs found no file. Selenium already starts each session with a fresh temporary profile.
+CHROME_OPTS  = ENV.fetch('CHROME_OPTS', "--headless=new --no-sandbox --enable-logging --log-level=0 --v=1 --disable-extensions --window-size=#{DEFAULT_WINDOW_WIDTH},#{DEFAULT_WINDOW_HEIGHT} --disable-dev-shm-usage").split(' ')
 
 FIREFOX_OPTS = ENV.fetch('FIREFOX_OPTS', "-headless --width=#{DEFAULT_WINDOW_WIDTH} --height=#{DEFAULT_WINDOW_HEIGHT}").split(' ')
 
@@ -24,6 +28,10 @@ Capybara.register_driver(:chrome) do |app|
     browser: 'ALL', # Capture JavaScript errors
     driver: 'INFO', # Capture WebDriver errors
   }
+
+  # Save downloads (including PDFs) to Dir.tmpdir without prompting, as the Firefox profile does
+  chrome_options.add_preference(:download, default_directory: Dir.tmpdir, prompt_for_download: false)
+  chrome_options.add_preference(:plugins, always_open_pdf_externally: true)
 
   options = {
     browser: :chrome,
