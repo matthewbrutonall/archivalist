@@ -72,6 +72,9 @@ end
 
 # Capybara screenshot
 Capybara.threadsafe = true
+# Must be set before any session exists: with threadsafe sessions each session copies the options
+# when created, and the Chrome log setup in RSpec.configure below creates one at load time.
+Capybara.default_max_wait_time = ENV.fetch('CAPYBARA_DEFAULT_MAX_WAIT_TIME', 20).to_i
 Capybara.save_path = File.join(ASUtils.find_base_directory, "ci_logs")
 Capybara.asset_host = 'http://localhost:3001' # Enables (in theory) viewing of HTML screenshots with assets (provided you run the public devserver)
 Capybara::Screenshot.register_driver(:chrome) do |driver, path|
@@ -184,8 +187,6 @@ Capybara.register_server :as_puma do |app, port, host|
   $puma.run.join
 end
 Capybara.server = :as_puma
-
-Capybara.default_max_wait_time = ENV.fetch('CAPYBARA_DEFAULT_MAX_WAIT_TIME', 20).to_i
 
 cp_logger = Logger.new(File.join(ASUtils.find_base_directory, "ci_logs", "childprocess_gem.out"))
 cp_logger.level = Logger::DEBUG
