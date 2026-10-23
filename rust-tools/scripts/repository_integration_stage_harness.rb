@@ -979,7 +979,11 @@ if __FILE__ == $PROGRAM_NAME
       c = ct['category_ms'].fetch(cat, 0.0)
       puts format('  %-32s %10.1f %10.1f %+10.1f', cat, n, c, c - n)
     end
-    puts format('  %-32s %10.1f %10.1f %+10.1f', 'unattributed', nt['unattributed_ms'], ct['unattributed_ms'], ct['unattributed_ms'] - nt['unattributed_ms'])
+    # Single-threaded passes report unattributed_ms; if worker threads appear, use the coordinating
+    # thread's wall remainder instead (summed thread time has no single wall remainder).
+    nu = nt['unattributed_ms'] || nt['main_thread_unattributed_ms'] || 0.0
+    cu = ct['unattributed_ms'] || ct['main_thread_unattributed_ms'] || 0.0
+    puts format('  %-32s %10.1f %10.1f %+10.1f', 'unattributed', nu, cu, cu - nu)
     puts "  estimated timer overhead: native #{nt['estimated_timer_overhead_ms']} ms (#{nt['timer_calls']} calls), " \
          "candidate #{ct['estimated_timer_overhead_ms']} ms (#{ct['timer_calls']} calls)"
   end

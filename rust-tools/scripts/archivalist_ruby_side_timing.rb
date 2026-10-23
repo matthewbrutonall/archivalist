@@ -53,7 +53,8 @@ module ArchivalistRubySideTiming
     current = Thread.current[:archivalist_ruby_side_timing]
     return current if current && current[:generation] == STATE[:generation]
 
-    fresh = { generation: STATE[:generation], stack: [], totals: Hash.new(0.0), counts: Hash.new(0) }
+    fresh = { generation: STATE[:generation], stack: [], totals: Hash.new(0.0), counts: Hash.new(0),
+              main: Thread.current.equal?(STATE[:main_thread]) }
     LOCK.synchronize { STATE[:tallies] << fresh }
     Thread.current[:archivalist_ruby_side_timing] = fresh
   end
@@ -208,11 +209,13 @@ module ArchivalistRubySideTiming
     LOCK.synchronize do
       STATE[:generation] += 1
       STATE[:tallies] = []
+      STATE[:main_thread] = Thread.current
       STATE[:active] = true
     end
   end
 
-  # Stops collection and returns { totals_ms, counts, threads } merged across threads.
+  # Stops collection and returns totals merged across threads, plus the coordinating (start!)
+  # thread's and the other threads' totals separately.
   def self.stop!
     tallies = LOCK.synchronize do
       STATE[:active] = false
@@ -221,28 +224,51 @@ module ArchivalistRubySideTiming
       STATE[:tallies] = []
       taken
     end
-    totals = Hash.new(0.0)
-    counts = Hash.new(0)
-    tallies.each do |t|
-      t[:totals].each { |k, v| totals[k] += v }
-      t[:counts].each { |k, v| counts[k] += v }
+    merge = lambda do |list|
+      totals = Hash.new(0.0)
+      counts = Hash.new(0)
+      list.each do |t|
+        t[:totals].each { |k, v| totals[k] += v }
+        t[:counts].each { |k, v| counts[k] += v }
+      end
+      [totals.transform_values { |v| v * 1000.0 }, counts]
     end
-    { 'totals_ms' => totals.transform_values { |v| v * 1000.0 }, 'counts' => counts, 'threads' => tallies.length }
+    totals, counts = merge.call(tallies)
+    main_totals, = merge.call(tallies.select { |t| t[:main] })
+    worker_totals, = merge.call(tallies.reject { |t| t[:main] })
+    { 'totals_ms' => totals, 'counts' => counts, 'threads' => tallies.length,
+      'main_totals_ms' => main_totals, 'worker_totals_ms' => worker_totals,
+      'worker_threads' => tallies.count { |t| !t[:main] } }
   end
 
+  # With only the coordinating thread, category_ms is wall-time attribution and unattributed_ms =
+  # wall - categories. With worker threads, category_ms is SUMMED THREAD TIME (overlapping the
+  # coordinating thread's waiting), so unattributed_ms is nil and the meaningful wall remainder is
+  # main_thread_unattributed_ms (wall - the coordinating thread's own categories).
   def self.summarize(raw, pass_wall_ms)
-    totals = raw['totals_ms'].transform_values { |v| v.round(3) }.sort_by { |k, v| [-v, k] }.to_h
+    sorted = ->(h) { h.transform_values { |v| v.round(3) }.sort_by { |k, v| [-v, k] }.to_h }
     attributed = raw['totals_ms'].values.sum
     calls = raw['counts'].values.sum
-    {
-      'category_ms' => totals,
+    workers = raw.fetch('worker_threads', 0)
+    main_totals = raw.fetch('main_totals_ms', raw['totals_ms'])
+    summary = {
+      'category_ms' => sorted.call(raw['totals_ms']),
+      'category_ms_kind' => workers.zero? ? 'wall time (single thread)' : 'summed thread time across threads',
       'category_calls' => raw['counts'].sort.to_h,
       'attributed_ms' => attributed.round(3),
-      'unattributed_ms' => (pass_wall_ms - attributed).round(3),
+      'unattributed_ms' => workers.zero? ? (pass_wall_ms - attributed).round(3) : nil,
       'timer_calls' => calls,
       'threads' => raw.fetch('threads', 1),
+      'worker_threads' => workers,
       'estimated_timer_overhead_ms' => CALIBRATION[:per_call_ms] ? (calls * CALIBRATION[:per_call_ms]).round(3) : nil
     }
+    unless workers.zero?
+      summary['main_thread_category_ms'] = sorted.call(main_totals)
+      summary['main_thread_unattributed_ms'] = (pass_wall_ms - main_totals.values.sum).round(3)
+      summary['worker_category_ms'] = sorted.call(raw.fetch('worker_totals_ms', {}))
+      summary['worker_summed_thread_ms'] = raw.fetch('worker_totals_ms', {}).values.sum.round(3)
+    end
+    summary
   end
 
   # Field-wise medians across passes; categories missing from a pass count as 0.
@@ -254,15 +280,34 @@ module ArchivalistRubySideTiming
       mid = sorted.length / 2
       sorted.length.odd? ? sorted[mid] : ((sorted[mid - 1] + sorted[mid]) / 2.0).round(3)
     end
+    per_category = lambda do |key|
+      present = summaries.select { |s| s[key] }
+      next nil if present.empty?
+
+      cats = present.flat_map { |s| s[key].keys }.uniq
+      cats.to_h { |c| [c, median.call(present.map { |s| s[key].fetch(c, 0.0) })] }.sort_by { |k, v| [-v, k] }.to_h
+    end
+    scalar = lambda do |key|
+      values = summaries.map { |s| s[key] }
+      values.any?(&:nil?) ? nil : median.call(values)
+    end
     categories = summaries.flat_map { |s| s['category_ms'].keys }.uniq
-    category_ms = categories.to_h { |c| [c, median.call(summaries.map { |s| s['category_ms'].fetch(c, 0.0) })] }
-    {
-      'category_ms' => category_ms.sort_by { |k, v| [-v, k] }.to_h,
+    out = {
+      'category_ms' => per_category.call('category_ms'),
+      'category_ms_kind' => summaries.first['category_ms_kind'],
       'category_calls' => categories.to_h { |c| [c, median.call(summaries.map { |s| s['category_calls'].fetch(c, 0) })] },
-      'attributed_ms' => median.call(summaries.map { |s| s['attributed_ms'] }),
-      'unattributed_ms' => median.call(summaries.map { |s| s['unattributed_ms'] }),
-      'timer_calls' => median.call(summaries.map { |s| s['timer_calls'] }),
-      'estimated_timer_overhead_ms' => summaries.first['estimated_timer_overhead_ms'] && median.call(summaries.map { |s| s['estimated_timer_overhead_ms'] })
+      'attributed_ms' => scalar.call('attributed_ms'),
+      'unattributed_ms' => scalar.call('unattributed_ms'),
+      'timer_calls' => scalar.call('timer_calls'),
+      'estimated_timer_overhead_ms' => scalar.call('estimated_timer_overhead_ms')
     }
+    if summaries.any? { |s| s['main_thread_category_ms'] }
+      out['main_thread_category_ms'] = per_category.call('main_thread_category_ms')
+      out['main_thread_unattributed_ms'] = scalar.call('main_thread_unattributed_ms')
+      out['worker_category_ms'] = per_category.call('worker_category_ms')
+      out['worker_summed_thread_ms'] = scalar.call('worker_summed_thread_ms')
+      out['worker_threads'] = scalar.call('worker_threads')
+    end
+    out
   end
 end

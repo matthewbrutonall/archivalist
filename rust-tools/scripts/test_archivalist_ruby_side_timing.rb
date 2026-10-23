@@ -256,6 +256,42 @@ class TestArchivalistRubySideTiming < Minitest::Test
     assert_equal ['update', 'commit', 'delete a', 'delete b'], indexer.solr_calls
   end
 
+  def test_multi_thread_summary_separates_main_thread_from_workers
+    ArchivalistRubySideTiming.start!
+    started = ArchivalistRubySideTiming.now
+    ArchivalistRubySideTiming.measure('coordinate') do
+      workers = 2.times.map { Thread.new { ArchivalistRubySideTiming.measure('work') { sleep 0.03 } } }
+      workers.each(&:join)
+    end
+    wall_ms = (ArchivalistRubySideTiming.now - started) * 1000.0
+    summary = ArchivalistRubySideTiming.summarize(ArchivalistRubySideTiming.stop!, wall_ms)
+
+    assert_equal 2, summary['worker_threads']
+    assert_nil summary['unattributed_ms'], 'no single wall remainder when threads overlap'
+    assert_equal 'summed thread time across threads', summary['category_ms_kind']
+    assert_equal ['coordinate'], summary['main_thread_category_ms'].keys
+    assert_equal ['work'], summary['worker_category_ms'].keys
+    assert_operator summary['worker_summed_thread_ms'], :>=, 55.0 # ~2 x 30 ms
+    assert_operator summary['main_thread_unattributed_ms'], :>=, 0.0
+    assert_in_delta wall_ms, summary['main_thread_category_ms']['coordinate'] + summary['main_thread_unattributed_ms'], 0.01
+    # The old single number would have gone negative: summed thread time exceeds wall time.
+    assert_operator summary['attributed_ms'], :>, wall_ms
+
+    med = ArchivalistRubySideTiming.median_summary([summary, summary])
+    assert_nil med['unattributed_ms']
+    assert_equal summary['main_thread_unattributed_ms'], med['main_thread_unattributed_ms']
+    assert_equal 2, med['worker_threads']
+  end
+
+  def test_single_thread_summary_keeps_wall_unattributed
+    ArchivalistRubySideTiming.start!
+    ArchivalistRubySideTiming.measure('only') { sleep 0.005 }
+    summary = ArchivalistRubySideTiming.summarize(ArchivalistRubySideTiming.stop!, 20.0)
+    assert_equal 0, summary['worker_threads']
+    refute_nil summary['unattributed_ms']
+    refute summary.key?('main_thread_category_ms')
+  end
+
   def test_median_summary_handles_missing_categories
     a = { 'category_ms' => { 'x' => 10.0 }, 'category_calls' => { 'x' => 1 }, 'attributed_ms' => 10.0, 'unattributed_ms' => 5.0, 'timer_calls' => 1, 'estimated_timer_overhead_ms' => 0.1 }
     b = { 'category_ms' => { 'x' => 30.0, 'y' => 4.0 }, 'category_calls' => { 'x' => 1, 'y' => 2 }, 'attributed_ms' => 34.0, 'unattributed_ms' => 7.0, 'timer_calls' => 3, 'estimated_timer_overhead_ms' => 0.3 }

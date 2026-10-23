@@ -185,9 +185,20 @@ if __FILE__ == $PROGRAM_NAME
       summary = TIMERS ? ArchivalistRubySideTiming.summarize(raw, wall_ms) : nil
 
       puts "  wall #{wall_ms} ms, #{doc_count} Solr documents"
+      if summary && summary['worker_threads'].to_i.zero?
+        puts '    categories (wall time, single thread):'
+        summary['category_ms'].first(12).each { |cat, ms| puts format('      %-30s %10.1f ms', cat, ms) }
+        puts format('      %-30s %10.1f ms', 'unattributed', summary['unattributed_ms'])
+      elsif summary
+        puts '    coordinating thread (wall time; index_round_main_thread includes waiting for workers):'
+        summary['main_thread_category_ms'].first(8).each { |cat, ms| puts format('      %-30s %10.1f ms', cat, ms) }
+        puts format('      %-30s %10.1f ms', 'unattributed (main thread)', summary['main_thread_unattributed_ms'])
+        puts "    #{summary['worker_threads']} worker threads (SUMMED thread time, overlaps the waiting above; " \
+             "total #{summary['worker_summed_thread_ms'].round(1)} ms):"
+        summary['worker_category_ms'].first(12).each { |cat, ms| puts format('      %-30s %10.1f ms', cat, ms) }
+      end
       if summary
-        summary['category_ms'].first(12).each { |cat, ms| puts format('    %-30s %10.1f ms', cat, ms) }
-        puts "    threads #{summary['threads']}, timer calls #{summary['timer_calls']}, est. timer overhead #{summary['estimated_timer_overhead_ms']} ms"
+        puts "    timer calls #{summary['timer_calls']}, est. timer overhead #{summary['estimated_timer_overhead_ms']} ms"
       end
       results << { 'repeat' => repeat + 1, 'mode' => mode, 'run_id' => run_id, 'core' => core, 'wall_ms' => wall_ms,
                    'solr_doc_count' => doc_count, 'timing' => summary }
@@ -221,7 +232,7 @@ if __FILE__ == $PROGRAM_NAME
     'results' => results,
     'per_mode' => per_mode,
     'notes' => [
-      'Category times are exclusive and summed across indexer threads; with more than one thread they can exceed wall time.',
+      'With worker threads, category_ms is summed thread time and unattributed_ms is null; use main_thread_category_ms and main_thread_unattributed_ms for wall-time attribution and worker_category_ms for the work itself.',
       'index_round_main_thread includes the coordinating thread waiting for its workers.',
       'A full round indexes every repository visible to the backend.'
     ]
