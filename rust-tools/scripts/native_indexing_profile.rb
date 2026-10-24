@@ -24,6 +24,7 @@
 #   REPEATS         full rounds per mode (default 1; each uses a new run id and new cores)
 #   MODES           staff,pui (default both)
 #   TIMERS          1 (default) attributes categories; 0 measures wall time only (overhead check)
+#   PUI_FETCH_AUDIT 1 (opt-in; default off) accounts for PUI archival_objects batch GETs & overlap
 #   STAFF_THREADS / PUI_THREADS  override indexer_thread_count / pui_indexer_thread_count
 #
 # With more than one indexer thread the category times are summed across threads and can
@@ -49,6 +50,7 @@ require 'tmpdir'
 require_relative 'integration_stage_harness'
 require_relative 'archivalist_ruby_side_timing'
 require_relative 'archivalist_profiling_stack'
+require_relative 'archivalist_pui_fetch_audit'
 
 RUST_FLAGS = %i[
   rust_index_document_builder_enabled rust_index_document_enrichment_enabled
@@ -77,6 +79,7 @@ if __FILE__ == $PROGRAM_NAME
   MODES = (ENV['MODES'] || 'staff,pui').split(',').map(&:strip)
   raise "MODES must be a subset of staff,pui (got #{MODES.inspect})" if MODES.empty? || !(MODES - %w[staff pui]).empty?
   TIMERS = ENV.fetch('TIMERS', '1') != '0'
+  PUI_FETCH_AUDIT = ArchivalistPuiFetchAudit.enabled?(ENV)
 
   BENCHMARK_DIR = File.expand_path('../benchmarks', __dir__)
   FileUtils.mkdir_p(BENCHMARK_DIR)
@@ -118,12 +121,20 @@ if __FILE__ == $PROGRAM_NAME
     ))
   end
 
+  pui_fetch_audit_hooks = nil
+  if PUI_FETCH_AUDIT && MODES.include?('pui')
+    pui_fetch_audit_hooks = ArchivalistPuiFetchAudit.install!(
+      pui_indexer: PUIIndexer, jsonmodel_http: JSONModel::HTTP
+    )
+  end
+
   puts '=' * 80
   puts 'Archivalist Native Indexing Profile'
   puts "Runtime: #{RUBY_DESCRIPTION}"
   puts "Backend: #{BACKEND_BASE}  Solr: #{SOLR_BASE}"
   puts "Profiling stack: #{STACK_IDENTITY['stack_id']} (database identity and Solr identity core verified)"
-  puts "Modes: #{MODES.join(', ')}  Repeats: #{REPEATS}  Timers: #{TIMERS ? 'on' : 'off (wall time only)'}"
+  puts "Modes: #{MODES.join(', ')}  Repeats: #{REPEATS}  Timers: #{TIMERS ? 'on' : 'off (wall time only)'}  " \
+       "PUI fetch audit: #{PUI_FETCH_AUDIT ? 'on (PUI pass only; observational)' : 'off'}"
   puts "Threads: staff #{AppConfig[:indexer_thread_count]} x #{AppConfig[:indexer_records_per_thread]} records, " \
        "pui #{AppConfig[:pui_indexer_thread_count]} x #{AppConfig[:pui_indexer_records_per_thread]} records"
   puts "Rust flags: all false (#{RUST_FLAGS.map { |f| AppConfig[f] }.uniq.inspect})"
@@ -131,6 +142,7 @@ if __FILE__ == $PROGRAM_NAME
     puts "Timer hooks: #{hooks.transform_values(&:length).inspect}; " \
          "calibrated #{(ArchivalistRubySideTiming::CALIBRATION[:per_call_ms] * 1000.0).round(2)} us per timer call"
   end
+  puts "PUI fetch audit hooks: #{pui_fetch_audit_hooks.transform_values(&:length).inspect}" if pui_fetch_audit_hooks
   puts '=' * 80
 
   # Inventory: what a full round will index (counts only).
@@ -173,11 +185,15 @@ if __FILE__ == $PROGRAM_NAME
                 end
 
       puts "\n[repeat #{repeat + 1}/#{REPEATS}] #{mode.upcase} full index round into #{core} ..."
+      audit_this_pass = PUI_FETCH_AUDIT && mode == 'pui'
       ArchivalistRubySideTiming.start! if TIMERS
+      ArchivalistPuiFetchAudit.start! if audit_this_pass
       started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      pui_fetch_audit_summary = nil
       begin
         indexer.run_index_round
       ensure
+        pui_fetch_audit_summary = ArchivalistPuiFetchAudit.stop! if audit_this_pass
         raw = ArchivalistRubySideTiming.stop! if TIMERS
       end
       wall_ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000.0).round(2)
@@ -200,21 +216,53 @@ if __FILE__ == $PROGRAM_NAME
       if summary
         puts "    timer calls #{summary['timer_calls']}, est. timer overhead #{summary['estimated_timer_overhead_ms']} ms"
       end
-      results << { 'repeat' => repeat + 1, 'mode' => mode, 'run_id' => run_id, 'core' => core, 'wall_ms' => wall_ms,
-                   'solr_doc_count' => doc_count, 'timing' => summary }
+      if pui_fetch_audit_summary
+        ord_p = pui_fetch_audit_summary.dig('phases', ArchivalistPuiFetchAudit::PHASE_ORDINARY)
+        tree_p = pui_fetch_audit_summary.dig('phases', ArchivalistPuiFetchAudit::PHASE_TREE_DISCOVERY)
+        ov = pui_fetch_audit_summary['overlap']
+        puts '    pui_fetch_audit (archival_objects batch GETs; IDs requested by HTTP 200 calls; observational only):'
+        puts format('      ordinary_indexing: calls=%d (ok=%d, fail=%d), unique_ok_req_ids=%d, ok_req_ids=%d, req_ids=%d, bytes=%d, summed_call_ms=%.1f',
+                    ord_p['calls'], ord_p['successful_calls'], ord_p['failed_calls'],
+                    ord_p['unique_successful_requested_ids'], ord_p['successful_requested_ids_total'],
+                    ord_p['requested_ids_total'], ord_p['response_bytes'], ord_p['call_duration_sum_ms'])
+        puts format('      tree_discovery:    calls=%d (ok=%d, fail=%d), unique_ok_req_ids=%d, ok_req_ids=%d, req_ids=%d, bytes=%d, summed_call_ms=%.1f',
+                    tree_p['calls'], tree_p['successful_calls'], tree_p['failed_calls'],
+                    tree_p['unique_successful_requested_ids'], tree_p['successful_requested_ids_total'],
+                    tree_p['requested_ids_total'], tree_p['response_bytes'], tree_p['call_duration_sum_ms'])
+        puts format('      requested_id_overlap (HTTP 200): intersection=%d, ordinary_only=%d, tree_discovery_only=%d, union=%d (tree_overlap_ratio=%.4f)',
+                    ov['intersection_successful_requested_ids'], ov['ordinary_only_successful_requested_ids'],
+                    ov['tree_discovery_only_successful_requested_ids'], ov['union_unique_successful_requested_ids'],
+                    ov['tree_discovery_overlap_ratio'])
+      end
+      result_row = { 'repeat' => repeat + 1, 'mode' => mode, 'run_id' => run_id, 'core' => core, 'wall_ms' => wall_ms,
+                     'solr_doc_count' => doc_count, 'timing' => summary }
+      result_row['pui_fetch_audit'] = pui_fetch_audit_summary if audit_this_pass
+      results << result_row
     end
   end
 
   per_mode = MODES.to_h do |mode|
     rows = results.select { |r| r['mode'] == mode }
     timed = rows.map { |r| r['timing'] }.compact
-    [mode, {
+    audited = rows.map { |r| r['pui_fetch_audit'] }.compact
+    mode_summary = {
       'repeats' => rows.length,
       'wall_ms_raw' => rows.map { |r| r['wall_ms'] },
       'wall_ms_median' => native_profile_median(rows.map { |r| r['wall_ms'] }),
       'solr_doc_counts' => rows.map { |r| r['solr_doc_count'] },
       'timing_median' => timed.empty? ? nil : ArchivalistRubySideTiming.median_summary(timed)
-    }]
+    }
+    mode_summary['pui_fetch_audit_median'] = ArchivalistPuiFetchAudit.median_summary(audited) unless audited.empty?
+    [mode, mode_summary]
+  end
+
+  notes = [
+    'With worker threads, category_ms is summed thread time and unattributed_ms is null; use main_thread_category_ms and main_thread_unattributed_ms for wall-time attribution and worker_category_ms for the work itself.',
+    'index_round_main_thread includes the coordinating thread waiting for its workers.',
+    'A full round indexes every repository visible to the backend.'
+  ]
+  if PUI_FETCH_AUDIT
+    notes << 'pui_fetch_audit is observational accounting of backend archival_objects batch GETs (id_set) only; ID sets and overlap measure IDs requested by successful HTTP 200 calls (without parsing JSON response bodies to verify returned records), and cannot imply safe cache reuse or deduplication across phases because records and ancestor trees may change between ordinary indexing and tree discovery or across checkpoints.'
   end
 
   report = {
@@ -225,17 +273,14 @@ if __FILE__ == $PROGRAM_NAME
     'solr_base' => SOLR_BASE,
     'profiling_stack' => STACK_IDENTITY,
     'timers' => TIMERS,
+    'pui_fetch_audit' => PUI_FETCH_AUDIT,
     'threads' => { 'staff' => [AppConfig[:indexer_thread_count], AppConfig[:indexer_records_per_thread]],
                    'pui' => [AppConfig[:pui_indexer_thread_count], AppConfig[:pui_indexer_records_per_thread]] },
     'rust_flags' => RUST_FLAGS.to_h { |f| [f.to_s, AppConfig[f]] },
     'inventory' => inventory,
     'results' => results,
     'per_mode' => per_mode,
-    'notes' => [
-      'With worker threads, category_ms is summed thread time and unattributed_ms is null; use main_thread_category_ms and main_thread_unattributed_ms for wall-time attribution and worker_category_ms for the work itself.',
-      'index_round_main_thread includes the coordinating thread waiting for its workers.',
-      'A full round indexes every repository visible to the backend.'
-    ]
+    'notes' => notes
   }
   path = File.join(BENCHMARK_DIR, "native_profile_#{first_run_id}.json")
   File.write(path, JSON.pretty_generate(report))

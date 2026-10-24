@@ -334,7 +334,21 @@ Scripts under `scripts/` are code-only harnesses:
   document preparation, JSON, Solr update/commit/delete HTTP, PUI tree work and the coordinating
   thread's waiting. Timers are per-thread, so with several indexer threads the categories sum
   thread time and can exceed wall time. `TIMERS=0` gives wall time only (compare medians for
-  overhead); `REPEATS`, `MODES`, `STAFF_THREADS`, `PUI_THREADS` and `APP_CONTAINER` are forwarded.
+  overhead); `REPEATS`, `MODES`, `STAFF_THREADS`, `PUI_THREADS`, `PUI_FETCH_AUDIT` and `APP_CONTAINER` are forwarded.
+  `PUI_FETCH_AUDIT=1` (`archivalist_pui_fetch_audit.rb`, default off; installs no wrapper when off)
+  adds observational accounting of actual backend `/repositories/:repo_id/archival_objects` batch
+  `GET` requests (`id_set`, excluding `all_ids`) during the PUI pass only (never during pre-pass
+  inventory or STAFF passes). It attributes calls by execution context (`PUIIndexer#fetch_records`
+  for `ordinary_indexing` versus `PUIIndexer#index_round_complete` for `tree_discovery`, not merely
+  `resolve[]` query values), records successful and failed calls, unique and total IDs requested by
+  successful HTTP 200 calls (`unique_successful_requested_ids`, `successful_requested_ids_total`,
+  without parsing JSON response bodies to verify which requested records were returned),
+  response-body bytes, summed call duration across threads (`call_duration_sum_ms`, not wall time),
+  and per-repository/round intersection and phase-only counts of successful-request ID sets
+  (`test_archivalist_pui_fetch_audit.rb`).
+  This accounting is strictly observational and cannot imply safe cache reuse or deduplication
+  across phases because records and ancestor trees may change between ordinary indexing and tree
+  discovery or across checkpoints.
 - Helpers that query records require the caller to provide test-specific values
   through environment variables such as `RESOURCE_URI` and `QUERY`.
 

@@ -10,9 +10,9 @@
 # through the in-network backend URL and the stack's Solr identity core before any login, core
 # creation or indexing. BACKEND_URL / SOLR_BASE_URL are taken from the stack and cannot be
 # overridden. Options forwarded: REPEATS (default 1), MODES (staff,pui), TIMERS (1 = category
-# timers, 0 = wall time only), STAFF_THREADS, PUI_THREADS. APP_CONTAINER defaults to
-# archivesspaceai-app-1.
-# Usage: STACK_STATE=rust-tools/benchmarks/profiling_stack_<id>.json [REPEATS=3] \
+# timers, 0 = wall time only), STAFF_THREADS, PUI_THREADS, PUI_FETCH_AUDIT (1 = PUI archival_object
+# fetch audit, default off). APP_CONTAINER defaults to archivesspaceai-app-1.
+# Usage: STACK_STATE=rust-tools/benchmarks/profiling_stack_<id>.json [REPEATS=3] [PUI_FETCH_AUDIT=1] \
 #          rust-tools/scripts/run_native_indexing_profile.sh
 set -uo pipefail
 : "${STACK_STATE:?STACK_STATE must point to the profiling_stack.py state file}"
@@ -46,7 +46,7 @@ printf '{\n  "git_commit": "%s",\n  "git_dirty": "%s",\n  "stack_state": "%s"\n}
 
 CONTAINER_JAVA_OPTS="$(docker exec "$APP_CONTAINER" printenv JAVA_OPTS)"
 OPT_ENV=()
-for var in REPEATS MODES TIMERS STAFF_THREADS PUI_THREADS; do
+for var in REPEATS MODES TIMERS STAFF_THREADS PUI_THREADS PUI_FETCH_AUDIT; do
   [ -n "${!var:-}" ] && OPT_ENV+=(-e "$var=${!var}")
 done
 docker exec "${STACK_ARGS[@]}" "${OPT_ENV[@]}" -e JAVA_OPTS="$CONTAINER_JAVA_OPTS -Xss${PROFILE_XSS:-16m}" \
