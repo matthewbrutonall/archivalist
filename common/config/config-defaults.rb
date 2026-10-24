@@ -171,6 +171,11 @@ AppConfig[:pui_indexing_frequency_seconds] = 30
 # indexing process (more cores and/or more records per thread means more memory used).
 AppConfig[:pui_indexer_records_per_thread] = 25
 
+# The batch size of node records fetched during PUI tree discovery (PUIIndexer#index_round_complete).
+# Defaults to preserving current behavior (uses captured @records_per_thread from instance initialization when unset or nil).
+# Clamped safe range for explicit overrides is 1..200; invalid, zero, or negative values fail closed to baseline.
+AppConfig[:pui_tree_discovery_batch_size] = nil
+
 # The number of worker-thread to be used by the PUI indexer. More worker-threads means that more CPU cores will be used.
 AppConfig[:pui_indexer_thread_count] = 1
 

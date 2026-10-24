@@ -382,4 +382,133 @@ class TestArchivalistPuiFetchAuditJRuby < Minitest::Test
     end
     assert_match(/Network call attempted in offline test/, socket_err.message)
   end
+
+  def test_pui_tree_discovery_batch_size_resolution_and_identical_ordering
+    # 1. Test batch size resolution in JRuby
+    assert_equal 25, PUIIndexer.resolve_tree_discovery_batch_size(nil, 25)
+    assert_equal 25, PUIIndexer.resolve_tree_discovery_batch_size(0, 25)
+    assert_equal 25, PUIIndexer.resolve_tree_discovery_batch_size(-5, 25)
+    assert_equal 25, PUIIndexer.resolve_tree_discovery_batch_size('bad', 25)
+    assert_equal 25, PUIIndexer.resolve_tree_discovery_batch_size('0', 25)
+    assert_equal 50, PUIIndexer.resolve_tree_discovery_batch_size(50, 25)
+    assert_equal 200, PUIIndexer.resolve_tree_discovery_batch_size(200, 25)
+    assert_equal 200, PUIIndexer.resolve_tree_discovery_batch_size(250, 25)
+    assert_equal 200, PUIIndexer.resolve_tree_discovery_batch_size('500', 25)
+
+    # 2. Test index_round_complete batching and identical ordering across batch sizes
+    run_simulation = lambda do |batch_override|
+      captured_batches = []
+      captured_tree_uris = nil
+
+      indexer = build_dummy_indexer
+      indexer.define_singleton_method(:tree_discovery_batch_size) { batch_override }
+      indexer.define_singleton_method(:add_infscroll_docs) { |*_args| }
+      indexer.define_singleton_method(:index_batch) { |*_args| }
+      indexer.define_singleton_method(:send_commit) {}
+      indexer.define_singleton_method(:delete_records) { |*_args| }
+      indexer.define_singleton_method(:handle_deletes) { |*_args| }
+      indexer.define_singleton_method(:log) { |*_args| }
+
+      mock_tree_indexer = Object.new
+      mock_tree_indexer.define_singleton_method(:deletes) { [] }
+      mock_tree_indexer.define_singleton_method(:add_largetree_docs) { |uris| captured_tree_uris = uris }
+
+      # In-process mock handler for OfflineJRubyHttpStub
+      OfflineJRubyHttpStub.handler = lambda do |url|
+        u = url.to_s
+        if u.include?('/archival_objects?all_ids=true')
+          OfflineJRubyHttpStub.make_response('200', JSON.generate((1..100).to_a))
+        elsif u.include?('/archival_objects?id_set=')
+          id_set_raw = u.split('id_set=')[1].split('&')[0]
+          id_set_decoded = URI.decode_www_form_component(id_set_raw)
+          ids = id_set_decoded.split(',').map(&:to_i)
+          captured_batches << ids
+          records = ids.map do |ao_id|
+            root_id = if ao_id <= 40
+                        10
+                      elsif ao_id <= 80
+                        20
+                      else
+                        30
+                      end
+            {
+              'uri' => "/repositories/2/archival_objects/#{ao_id}",
+              'resource' => { 'ref' => "/repositories/2/resources/#{root_id}" }
+            }
+          end
+          OfflineJRubyHttpStub.make_response('200', JSON.generate(records))
+        else
+          OfflineJRubyHttpStub.make_response('200', '[]')
+        end
+      end
+
+      orig_new = LargeTreeDocIndexer.method(:new)
+      LargeTreeDocIndexer.define_singleton_method(:new) { |*_args| mock_tree_indexer }
+      repo = Struct.new(:id, :repo_code).new(2, 'test_repo')
+      begin
+        indexer.index_round_complete(repo)
+      ensure
+        LargeTreeDocIndexer.define_singleton_method(:new, orig_new)
+      end
+
+      [captured_batches, captured_tree_uris]
+    end
+
+    b25, uris25 = run_simulation.call(25)
+    b50, uris50 = run_simulation.call(50)
+    b100, uris100 = run_simulation.call(100)
+
+    assert_equal 4, b25.length
+    assert_equal [25, 25, 25, 25], b25.map(&:length)
+    assert_equal (1..100).to_a, b25.flatten
+
+    assert_equal 2, b50.length
+    assert_equal [50, 50], b50.map(&:length)
+    assert_equal (1..100).to_a, b50.flatten
+
+    assert_equal 1, b100.length
+    assert_equal [100], b100.map(&:length)
+    assert_equal (1..100).to_a, b100.flatten
+
+    expected_uris = [
+      '/repositories/2/resources/10',
+      '/repositories/2/resources/20',
+      '/repositories/2/resources/30'
+    ]
+    assert_equal expected_uris, uris25
+    assert_equal expected_uris, uris50
+    assert_equal expected_uris, uris100
+  end
+
+  def test_pui_tree_discovery_batch_size_captures_records_per_thread_when_nil_override
+    orig_override = AppConfig[:pui_tree_discovery_batch_size] rescue nil
+    orig_records = AppConfig[:pui_indexer_records_per_thread] rescue nil
+    begin
+      AppConfig[:pui_indexer_records_per_thread] = 25
+      AppConfig[:pui_tree_discovery_batch_size] = nil
+      indexer = build_dummy_indexer
+      assert_equal 25, indexer.instance_variable_get(:@records_per_thread)
+
+      # Mutate AppConfig after instance construction
+      AppConfig[:pui_indexer_records_per_thread] = 99
+
+      # tree_discovery_batch_size must use the instance's captured @records_per_thread exactly
+      assert_equal 25, indexer.tree_discovery_batch_size
+
+      # With explicit valid override, explicit override is used
+      AppConfig[:pui_tree_discovery_batch_size] = 150
+      assert_equal 150, indexer.tree_discovery_batch_size
+
+      # With explicit clamped override, 200 is used
+      AppConfig[:pui_tree_discovery_batch_size] = 300
+      assert_equal 200, indexer.tree_discovery_batch_size
+
+      # With invalid override, fails closed to captured @records_per_thread
+      AppConfig[:pui_tree_discovery_batch_size] = 'bad'
+      assert_equal 25, indexer.tree_discovery_batch_size
+    ensure
+      AppConfig[:pui_tree_discovery_batch_size] = orig_override
+      AppConfig[:pui_indexer_records_per_thread] = orig_records
+    end
+  end
 end

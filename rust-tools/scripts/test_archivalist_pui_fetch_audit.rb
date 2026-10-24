@@ -475,25 +475,30 @@ class TestArchivalistPuiFetchAudit < Minitest::Test
         'TIMERS' => nil,
         'STAFF_THREADS' => nil,
         'PUI_THREADS' => nil,
-        'PUI_FETCH_AUDIT' => nil
+        'PUI_FETCH_AUDIT' => nil,
+        'PUI_TREE_BATCH_SIZE' => nil
       }
 
-      # 1. When PUI_FETCH_AUDIT is unset, docker exec argv must omit PUI_FETCH_AUDIT
+      # 1. When PUI_FETCH_AUDIT and PUI_TREE_BATCH_SIZE are unset, docker exec argv must omit them
       out1, err1, st1 = Open3.capture3(base_env, File.join(scripts_dir, 'run_native_indexing_profile.sh'))
       assert st1.success?, "wrapper failed when unset: stdout=#{out1} stderr=#{err1}"
       argv_unset = JSON.parse(File.read(docker_log))
       assert_equal 'exec', argv_unset.first
       refute argv_unset.any? { |arg| arg.include?('PUI_FETCH_AUDIT') },
              "expected PUI_FETCH_AUDIT to be omitted when unset, got: #{argv_unset.inspect}"
+      refute argv_unset.any? { |arg| arg.include?('PUI_TREE_BATCH_SIZE') },
+             "expected PUI_TREE_BATCH_SIZE to be omitted when unset, got: #{argv_unset.inspect}"
 
-      # 2. When PUI_FETCH_AUDIT=1 is set, docker exec argv must contain `-e PUI_FETCH_AUDIT=1`
+      # 2. When PUI_FETCH_AUDIT=1 and PUI_TREE_BATCH_SIZE=200 are set, docker exec argv must contain them
       FileUtils.rm_f(docker_log)
-      env_set = base_env.merge('PUI_FETCH_AUDIT' => '1', 'MODES' => 'pui')
+      env_set = base_env.merge('PUI_FETCH_AUDIT' => '1', 'PUI_TREE_BATCH_SIZE' => '200', 'MODES' => 'pui')
       out2, err2, st2 = Open3.capture3(env_set, File.join(scripts_dir, 'run_native_indexing_profile.sh'))
       assert st2.success?, "wrapper failed when set: stdout=#{out2} stderr=#{err2}"
       argv_set = JSON.parse(File.read(docker_log))
       idx = argv_set.each_index.find { |i| argv_set[i] == '-e' && argv_set[i + 1] == 'PUI_FETCH_AUDIT=1' }
       refute_nil idx, "expected `-e PUI_FETCH_AUDIT=1` in docker exec argv, got: #{argv_set.inspect}"
+      tree_idx = argv_set.each_index.find { |i| argv_set[i] == '-e' && argv_set[i + 1] == 'PUI_TREE_BATCH_SIZE=200' }
+      refute_nil tree_idx, "expected `-e PUI_TREE_BATCH_SIZE=200` in docker exec argv, got: #{argv_set.inspect}"
     end
   end
 end

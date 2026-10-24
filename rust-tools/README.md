@@ -334,7 +334,7 @@ Scripts under `scripts/` are code-only harnesses:
   document preparation, JSON, Solr update/commit/delete HTTP, PUI tree work and the coordinating
   thread's waiting. Timers are per-thread, so with several indexer threads the categories sum
   thread time and can exceed wall time. `TIMERS=0` gives wall time only (compare medians for
-  overhead); `REPEATS`, `MODES`, `STAFF_THREADS`, `PUI_THREADS`, `PUI_FETCH_AUDIT` and `APP_CONTAINER` are forwarded.
+  overhead); `REPEATS`, `MODES`, `STAFF_THREADS`, `PUI_THREADS`, `PUI_FETCH_AUDIT`, `PUI_TREE_BATCH_SIZE` and `APP_CONTAINER` are forwarded.
   `PUI_FETCH_AUDIT=1` (`archivalist_pui_fetch_audit.rb`, default off; installs no wrapper when off)
   adds observational accounting of actual backend `/repositories/:repo_id/archival_objects` batch
   `GET` requests (`id_set`, excluding `all_ids`) during the PUI pass only (never during pre-pass
@@ -349,6 +349,12 @@ Scripts under `scripts/` are code-only harnesses:
   This accounting is strictly observational and cannot imply safe cache reuse or deduplication
   across phases because records and ancestor trees may change between ordinary indexing and tree
   discovery or across checkpoints.
+  `PUI_TREE_BATCH_SIZE=<n>` overrides the PUI tree-discovery batch size during profiler runs
+  (sets `AppConfig[:pui_tree_discovery_batch_size]`, clamped to safe range 1..200; invalid, zero, or
+  negative values fail closed to baseline `pui_indexer_records_per_thread`). The report records
+  `pui_tree_batch_size` so future comparison is attributable. Caveat: fewer backend GET calls and
+  reduced GET call duration are a hypothesis until verified by an isolated 25-vs-200 full-round
+  comparison; do not claim speedup.
 - Helpers that query records require the caller to provide test-specific values
   through environment variables such as `RESOURCE_URI` and `QUERY`.
 

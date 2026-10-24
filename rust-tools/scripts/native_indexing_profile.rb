@@ -25,6 +25,7 @@
 #   MODES           staff,pui (default both)
 #   TIMERS          1 (default) attributes categories; 0 measures wall time only (overhead check)
 #   PUI_FETCH_AUDIT 1 (opt-in; default off) accounts for PUI archival_objects batch GETs & overlap
+#   PUI_TREE_BATCH_SIZE override PUI tree-discovery batch size (clamped 1..200; default unchanged)
 #   STAFF_THREADS / PUI_THREADS  override indexer_thread_count / pui_indexer_thread_count
 #
 # With more than one indexer thread the category times are summed across threads and can
@@ -95,6 +96,9 @@ if __FILE__ == $PROGRAM_NAME
   AppConfig[:search_user_secret] = ENV['SEARCH_USER_SECRET'] || 'devserver'
   AppConfig[:indexer_thread_count] = Integer(ENV['STAFF_THREADS']) if ENV['STAFF_THREADS']
   AppConfig[:pui_indexer_thread_count] = Integer(ENV['PUI_THREADS']) if ENV['PUI_THREADS']
+  if ENV['PUI_TREE_BATCH_SIZE'] && !ENV['PUI_TREE_BATCH_SIZE'].empty?
+    AppConfig[:pui_tree_discovery_batch_size] = ENV['PUI_TREE_BATCH_SIZE']
+  end
   RUST_FLAGS.each { |flag| AppConfig[flag] = false }
 
   require 'index_state'
@@ -109,6 +113,11 @@ if __FILE__ == $PROGRAM_NAME
   require 'index_batch'
 
   include JSONModel
+
+  effective_pui_tree_batch_size = PUIIndexer.resolve_tree_discovery_batch_size(
+    AppConfig.has_key?(:pui_tree_discovery_batch_size) ? AppConfig[:pui_tree_discovery_batch_size] : nil,
+    AppConfig[:pui_indexer_records_per_thread]
+  )
 
   hooks = nil
   if TIMERS
@@ -136,7 +145,8 @@ if __FILE__ == $PROGRAM_NAME
   puts "Modes: #{MODES.join(', ')}  Repeats: #{REPEATS}  Timers: #{TIMERS ? 'on' : 'off (wall time only)'}  " \
        "PUI fetch audit: #{PUI_FETCH_AUDIT ? 'on (PUI pass only; observational)' : 'off'}"
   puts "Threads: staff #{AppConfig[:indexer_thread_count]} x #{AppConfig[:indexer_records_per_thread]} records, " \
-       "pui #{AppConfig[:pui_indexer_thread_count]} x #{AppConfig[:pui_indexer_records_per_thread]} records"
+       "pui #{AppConfig[:pui_indexer_thread_count]} x #{AppConfig[:pui_indexer_records_per_thread]} records " \
+       "(tree discovery batch: #{effective_pui_tree_batch_size})"
   puts "Rust flags: all false (#{RUST_FLAGS.map { |f| AppConfig[f] }.uniq.inspect})"
   if TIMERS
     puts "Timer hooks: #{hooks.transform_values(&:length).inspect}; " \
@@ -236,6 +246,10 @@ if __FILE__ == $PROGRAM_NAME
       end
       result_row = { 'repeat' => repeat + 1, 'mode' => mode, 'run_id' => run_id, 'core' => core, 'wall_ms' => wall_ms,
                      'solr_doc_count' => doc_count, 'timing' => summary }
+      if mode == 'pui'
+        result_row['pui_tree_batch_size'] = indexer.tree_discovery_batch_size
+        result_row['pui_tree_discovery_batch_size'] = indexer.tree_discovery_batch_size
+      end
       result_row['pui_fetch_audit'] = pui_fetch_audit_summary if audit_this_pass
       results << result_row
     end
@@ -274,6 +288,8 @@ if __FILE__ == $PROGRAM_NAME
     'profiling_stack' => STACK_IDENTITY,
     'timers' => TIMERS,
     'pui_fetch_audit' => PUI_FETCH_AUDIT,
+    'pui_tree_batch_size' => effective_pui_tree_batch_size,
+    'pui_tree_discovery_batch_size' => effective_pui_tree_batch_size,
     'threads' => { 'staff' => [AppConfig[:indexer_thread_count], AppConfig[:indexer_records_per_thread]],
                    'pui' => [AppConfig[:pui_indexer_thread_count], AppConfig[:pui_indexer_records_per_thread]] },
     'rust_flags' => RUST_FLAGS.to_h { |f| [f.to_s, AppConfig[f]] },

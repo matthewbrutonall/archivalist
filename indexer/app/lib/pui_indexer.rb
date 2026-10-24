@@ -37,6 +37,41 @@ class PUIIndexer < PeriodicIndexer
     end
   end
 
+  def self.resolve_tree_discovery_batch_size(raw_override, baseline = nil)
+    safe_baseline = if baseline.is_a?(Integer) && baseline > 0
+                      baseline
+                    elsif baseline.is_a?(String) && baseline =~ /\A\s*[+-]?\d+\s*\z/ && baseline.to_i > 0
+                      baseline.to_i
+                    elsif AppConfig.has_key?(:pui_indexer_records_per_thread)
+                      cfg = AppConfig[:pui_indexer_records_per_thread]
+                      cfg = cfg.call if cfg.respond_to?(:call)
+                      (cfg.is_a?(Integer) && cfg > 0) ? cfg : 25
+                    else
+                      25
+                    end
+
+    raw = raw_override.respond_to?(:call) ? raw_override.call : raw_override
+    return safe_baseline if raw.nil?
+
+    parsed = if raw.is_a?(Integer)
+               raw
+             elsif raw.is_a?(String) && raw =~ /\A\s*[+-]?\d+\s*\z/
+               raw.to_i
+             else
+               nil
+             end
+
+    return safe_baseline if parsed.nil? || parsed <= 0
+
+    [parsed, 200].min
+  end
+
+  def tree_discovery_batch_size
+    raw = AppConfig.has_key?(:pui_tree_discovery_batch_size) ? AppConfig[:pui_tree_discovery_batch_size] : nil
+
+    self.class.resolve_tree_discovery_batch_size(raw, @records_per_thread)
+  end
+
   def self.get_indexer(state = nil, name = "PUI Indexer")
     indexer = self.new(state, name)
   end
@@ -656,7 +691,7 @@ class PUIIndexer < PeriodicIndexer
       root_node_ids = Set.new(JSONModel::HTTP.get_json(JSONModel(root_type).uri_for, :all_ids => true, :modified_since => last_root_node_mtime))
       node_ids = JSONModel::HTTP.get_json(JSONModel(node_type).uri_for, :all_ids => true, :modified_since => last_node_mtime)
 
-      node_ids.each_slice(@records_per_thread) do |ids|
+      node_ids.each_slice(tree_discovery_batch_size) do |ids|
         node_records = JSONModel(node_type).all(:id_set => ids.join(","), 'resolve[]' => [])
 
         node_records.each do |record|

@@ -287,9 +287,199 @@ describe "PUI indexer" do
       # def skip_index_doc?(doc)
     end
   end
-  describe "index_round_complete" do
-    it "determines when the index round is complete" do
-      # def index_round_complete(repository)
+  describe "tree discovery batch size resolution and index_round_complete" do
+    describe ".resolve_tree_discovery_batch_size" do
+      it "returns baseline when override is nil" do
+        expect(PUIIndexer.resolve_tree_discovery_batch_size(nil, 25)).to eq(25)
+      end
+
+      it "returns baseline when override is zero, negative, or non-numeric (fail closed)" do
+        expect(PUIIndexer.resolve_tree_discovery_batch_size(0, 25)).to eq(25)
+        expect(PUIIndexer.resolve_tree_discovery_batch_size(-10, 25)).to eq(25)
+        expect(PUIIndexer.resolve_tree_discovery_batch_size("0", 25)).to eq(25)
+        expect(PUIIndexer.resolve_tree_discovery_batch_size("-5", 25)).to eq(25)
+        expect(PUIIndexer.resolve_tree_discovery_batch_size("invalid", 25)).to eq(25)
+        expect(PUIIndexer.resolve_tree_discovery_batch_size("", 25)).to eq(25)
+        expect(PUIIndexer.resolve_tree_discovery_batch_size("25.5", 25)).to eq(25)
+        expect(PUIIndexer.resolve_tree_discovery_batch_size(25.5, 25)).to eq(25)
+        expect(PUIIndexer.resolve_tree_discovery_batch_size(:sym, 25)).to eq(25)
+        expect(PUIIndexer.resolve_tree_discovery_batch_size([100], 25)).to eq(25)
+      end
+
+      it "returns exact integer when within safe range 1..200" do
+        expect(PUIIndexer.resolve_tree_discovery_batch_size(1, 25)).to eq(1)
+        expect(PUIIndexer.resolve_tree_discovery_batch_size(50, 25)).to eq(50)
+        expect(PUIIndexer.resolve_tree_discovery_batch_size(200, 25)).to eq(200)
+        expect(PUIIndexer.resolve_tree_discovery_batch_size("50", 25)).to eq(50)
+        expect(PUIIndexer.resolve_tree_discovery_batch_size("200", 25)).to eq(200)
+      end
+
+      it "clamps values above 200 to 200" do
+        expect(PUIIndexer.resolve_tree_discovery_batch_size(201, 25)).to eq(200)
+        expect(PUIIndexer.resolve_tree_discovery_batch_size(500, 25)).to eq(200)
+        expect(PUIIndexer.resolve_tree_discovery_batch_size("1000", 25)).to eq(200)
+      end
+
+      it "evaluates proc overrides and preserves custom baseline" do
+        expect(PUIIndexer.resolve_tree_discovery_batch_size(proc { 75 }, 30)).to eq(75)
+        expect(PUIIndexer.resolve_tree_discovery_batch_size(proc { -1 }, 30)).to eq(30)
+        expect(PUIIndexer.resolve_tree_discovery_batch_size(proc { nil }, 30)).to eq(30)
+      end
+    end
+
+    describe "#tree_discovery_batch_size" do
+      it "uses baseline records_per_thread when no explicit override is configured" do
+        orig = AppConfig[:pui_tree_discovery_batch_size] rescue nil
+        begin
+          AppConfig[:pui_tree_discovery_batch_size] = nil
+          idx = PUIIndexer.new(AppConfig[:backend_url], nil, 'PUIIndexer')
+          expect(idx.tree_discovery_batch_size).to eq(AppConfig[:pui_indexer_records_per_thread].to_i)
+        ensure
+          AppConfig[:pui_tree_discovery_batch_size] = orig
+        end
+      end
+
+      it "uses instance captured records_per_thread when override is nil even if AppConfig changes later" do
+        orig_override = AppConfig[:pui_tree_discovery_batch_size] rescue nil
+        orig_records = AppConfig[:pui_indexer_records_per_thread] rescue nil
+        begin
+          AppConfig[:pui_indexer_records_per_thread] = 25
+          AppConfig[:pui_tree_discovery_batch_size] = nil
+          idx = PUIIndexer.new(AppConfig[:backend_url], nil, 'PUIIndexer')
+          expect(idx.instance_variable_get(:@records_per_thread)).to eq(25)
+
+          # Change AppConfig after instance construction
+          AppConfig[:pui_indexer_records_per_thread] = 99
+          expect(idx.tree_discovery_batch_size).to eq(25)
+        ensure
+          AppConfig[:pui_tree_discovery_batch_size] = orig_override
+          AppConfig[:pui_indexer_records_per_thread] = orig_records
+        end
+      end
+
+      it "uses valid override when configured" do
+        orig = AppConfig[:pui_tree_discovery_batch_size] rescue nil
+        begin
+          AppConfig[:pui_tree_discovery_batch_size] = 150
+          idx = PUIIndexer.new(AppConfig[:backend_url], nil, 'PUIIndexer')
+          expect(idx.tree_discovery_batch_size).to eq(150)
+        ensure
+          AppConfig[:pui_tree_discovery_batch_size] = orig
+        end
+      end
+
+      it "clamps configured override above 200 to 200" do
+        orig = AppConfig[:pui_tree_discovery_batch_size] rescue nil
+        begin
+          AppConfig[:pui_tree_discovery_batch_size] = 500
+          idx = PUIIndexer.new(AppConfig[:backend_url], nil, 'PUIIndexer')
+          expect(idx.tree_discovery_batch_size).to eq(200)
+        ensure
+          AppConfig[:pui_tree_discovery_batch_size] = orig
+        end
+      end
+
+      it "fails closed to baseline on invalid configured override" do
+        orig = AppConfig[:pui_tree_discovery_batch_size] rescue nil
+        begin
+          AppConfig[:pui_tree_discovery_batch_size] = "not_a_number"
+          idx = PUIIndexer.new(AppConfig[:backend_url], nil, 'PUIIndexer')
+          expect(idx.tree_discovery_batch_size).to eq(AppConfig[:pui_indexer_records_per_thread].to_i)
+        ensure
+          AppConfig[:pui_tree_discovery_batch_size] = orig
+        end
+      end
+    end
+
+    describe "index_round_complete grouping and root ordering" do
+      it "slices node IDs by tree_discovery_batch_size and yields identical ordered root IDs across batch sizes" do
+        repo_type = Struct.new(:id, :repo_code)
+
+        run_simulation = lambda do |batch_size|
+          dummy_state = Object.new
+          def dummy_state.get_last_mtime(*_args); 0; end
+          def dummy_state.set_last_mtime(*_args); end
+
+          test_indexer = PUIIndexer.new(AppConfig[:backend_url], dummy_state, 'TestIndexer')
+          test_indexer.define_singleton_method(:tree_discovery_batch_size) { batch_size }
+          test_indexer.define_singleton_method(:add_infscroll_docs) { |*_args| }
+          test_indexer.define_singleton_method(:index_batch) { |*_args| }
+          test_indexer.define_singleton_method(:send_commit) {}
+          test_indexer.define_singleton_method(:delete_records) { |*_args| }
+          test_indexer.define_singleton_method(:handle_deletes) { |*_args| }
+          test_indexer.define_singleton_method(:log) { |*_args| }
+
+          repo = repo_type.new(2, 'test_repo')
+          captured_batches = []
+          captured_tree_uris = nil
+
+          mock_tree_indexer = Object.new
+          mock_tree_indexer.define_singleton_method(:deletes) { [] }
+          mock_tree_indexer.define_singleton_method(:add_largetree_docs) { |uris| captured_tree_uris = uris }
+
+          allow(LargeTreeDocIndexer).to receive(:new).and_return(mock_tree_indexer)
+
+          allow(JSONModel::HTTP).to receive(:get_json) do |uri, _params|
+            if uri.to_s.include?('/archival_objects')
+              (1..100).to_a
+            else
+              []
+            end
+          end
+
+          allow(JSONModel(:archival_object)).to receive(:all) do |params|
+            id_set_str = params[:id_set]
+            ids = id_set_str.split(',').map(&:to_i)
+            captured_batches << ids
+            ids.map do |ao_id|
+              root_id = if ao_id <= 40
+                          10
+                        elsif ao_id <= 80
+                          20
+                        else
+                          30
+                        end
+              {
+                'uri' => "/repositories/2/archival_objects/#{ao_id}",
+                'resource' => { 'ref' => "/repositories/2/resources/#{root_id}" }
+              }
+            end
+          end
+
+          test_indexer.index_round_complete(repo)
+
+          [captured_batches, captured_tree_uris]
+        end
+
+        batches_25, uris_25 = run_simulation.call(25)
+        batches_50, uris_50 = run_simulation.call(50)
+        batches_100, uris_100 = run_simulation.call(100)
+
+        # Baseline: 100 node IDs in slices of 25 = 4 batches
+        expect(batches_25.length).to eq(4)
+        expect(batches_25.map(&:length)).to eq([25, 25, 25, 25])
+        expect(batches_25.flatten).to eq((1..100).to_a)
+
+        # Override 50: 100 node IDs in slices of 50 = 2 batches
+        expect(batches_50.length).to eq(2)
+        expect(batches_50.map(&:length)).to eq([50, 50])
+        expect(batches_50.flatten).to eq((1..100).to_a)
+
+        # Override 100: 100 node IDs in 1 slice of 100
+        expect(batches_100.length).to eq(1)
+        expect(batches_100.map(&:length)).to eq([100])
+        expect(batches_100.flatten).to eq((1..100).to_a)
+
+        # Root IDs and tree URIs MUST be identical in content and order across all batch sizes!
+        expected_uris = [
+          JSONModel(:resource).uri_for(10),
+          JSONModel(:resource).uri_for(20),
+          JSONModel(:resource).uri_for(30)
+        ]
+        expect(uris_25).to eq(expected_uris)
+        expect(uris_50).to eq(expected_uris)
+        expect(uris_100).to eq(expected_uris)
+      end
     end
   end
   describe "stage_unpublished_for_deletion" do
