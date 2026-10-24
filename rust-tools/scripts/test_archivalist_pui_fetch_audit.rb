@@ -5,6 +5,16 @@
 # and run_native_indexing_profile.sh environment forwarding (stubbed external commands).
 # Run with MRI or JRuby: ruby rust-tools/scripts/test_archivalist_pui_fetch_audit.rb
 
+require 'rubygems'
+if defined?(JRUBY_VERSION) && File.directory?('/archivesspace/build/gems/jruby/3.1.0')
+  ENV['GEM_HOME'] ||= '/archivesspace/build/gems/jruby/3.1.0'
+  ENV['GEM_PATH'] ||= '/archivesspace/build/gems/jruby/3.1.0'
+  Gem.paths = {
+    'GEM_HOME' => '/archivesspace/build/gems/jruby/3.1.0',
+    'GEM_PATH' => '/archivesspace/build/gems/jruby/3.1.0'
+  }
+end
+
 require 'minitest/autorun'
 require 'json'
 require 'uri'
