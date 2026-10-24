@@ -1687,18 +1687,74 @@ class IndexerCommon
     nil
   end
 
+  def pui_projections_store
+    store = Thread.current[:archivalist_pui_projections]
+    store && store[object_id]
+  end
+
+  def init_thread_pui_projections
+    projections = {
+      :final => {},
+      :routing => {},
+      :notes => {},
+      :availability => {},
+      :candidate => {},
+      :common => {},
+    }
+    store = (Thread.current[:archivalist_pui_projections] ||= {})
+    prior = store[object_id]
+    store[object_id] = projections
+    prior
+  end
+
+  def restore_thread_pui_projections(prior)
+    store = Thread.current[:archivalist_pui_projections]
+    if prior
+      store ||= (Thread.current[:archivalist_pui_projections] = {})
+      store[object_id] = prior
+    elsif store
+      store.delete(object_id)
+      Thread.current[:archivalist_pui_projections] = nil if store.empty?
+    end
+  end
+
+  def pui_final_projections
+    store = pui_projections_store
+    store ? store[:final] : @pui_final_projections
+  end
+
+  def pui_routing_projections
+    store = pui_projections_store
+    store ? store[:routing] : @pui_routing_projections
+  end
+
+  def pui_notes_projections
+    store = pui_projections_store
+    store ? store[:notes] : @pui_notes_projections
+  end
+
+  def pui_availability_projections
+    store = pui_projections_store
+    store ? store[:availability] : @pui_availability_projections
+  end
+
+  def pui_candidate_projections
+    store = pui_projections_store
+    store ? store[:candidate] : @pui_candidate_projections
+  end
+
+  def pui_common_projections
+    store = pui_projections_store
+    store ? store[:common] : @pui_common_projections
+  end
+
   def index_records(records, timing = IndexerTiming.new)
     batch = IndexBatch.new
-    @pui_final_projections = {}
-    @pui_routing_projections = {}
-    @pui_notes_projections = {}
-    @pui_availability_projections = {}
-    @pui_candidate_projections = {}
-    @pui_common_projections = {}
-
-    records = dedupe_by_uri(records)
+    prior_projections = init_thread_pui_projections
 
     begin
+      records = dedupe_by_uri(records)
+
       timing.time_block(:conversion_ms) do
         prepared_records = []
         records.each do |record|
@@ -1738,27 +1794,27 @@ class IndexerCommon
 
           if doc.has_key?('_archivalist_pui_candidate')
             pui_candidate = doc.delete('_archivalist_pui_candidate')
-            @pui_candidate_projections[uri] = pui_candidate if pui_candidate
+            pui_candidate_projections[uri] = pui_candidate if pui_candidate
           end
           if doc.has_key?('_archivalist_pui_final')
             pui_final = doc.delete('_archivalist_pui_final')
-            @pui_final_projections[uri] = pui_final if pui_final
+            pui_final_projections[uri] = pui_final if pui_final
           end
           if doc.has_key?('_archivalist_pui_routing')
             pui_routing = doc.delete('_archivalist_pui_routing')
-            @pui_routing_projections[uri] = pui_routing if pui_routing
+            pui_routing_projections[uri] = pui_routing if pui_routing
           end
           if doc.has_key?('_archivalist_pui_notes')
             pui_notes = doc.delete('_archivalist_pui_notes')
-            @pui_notes_projections[uri] = pui_notes if pui_notes
+            pui_notes_projections[uri] = pui_notes if pui_notes
           end
           if doc.has_key?('_archivalist_pui_availability')
             pui_availability = doc.delete('_archivalist_pui_availability')
-            @pui_availability_projections[uri] = pui_availability if pui_availability
+            pui_availability_projections[uri] = pui_availability if pui_availability
           end
           if doc.has_key?('_archivalist_pui_common')
             pui_common = doc.delete('_archivalist_pui_common')
-            @pui_common_projections[uri] = pui_common if pui_common
+            pui_common_projections[uri] = pui_common if pui_common
           end
           if doc['_archivalist_rust_fields'].is_a?(Array)
             doc['_archivalist_rust_fields'].delete('pui_record_inheritance_candidate_metadata')
@@ -1801,12 +1857,7 @@ class IndexerCommon
         end
       end
     ensure
-      @pui_final_projections = nil
-      @pui_routing_projections = nil
-      @pui_notes_projections = nil
-      @pui_availability_projections = nil
-      @pui_candidate_projections = nil
-      @pui_common_projections = nil
+      restore_thread_pui_projections(prior_projections)
     end
 
     index_batch(batch, timing)
@@ -1892,9 +1943,10 @@ class IndexerCommon
   end
 
   def discard_pui_availability(*uris)
-    if @pui_availability_projections
+    availability_projections = pui_availability_projections
+    if availability_projections
       uris.flatten.compact.each do |uri|
-        @pui_availability_projections.delete(uri) if uri.is_a?(String)
+        availability_projections.delete(uri) if uri.is_a?(String)
       end
     end
     false
@@ -1935,8 +1987,9 @@ class IndexerCommon
     end
 
     # 5. Plan projection presence in batch map
-    return false unless @pui_availability_projections && @pui_availability_projections.key?(uri)
-    projection = @pui_availability_projections[uri]
+    availability_projections = pui_availability_projections
+    return false unless availability_projections && availability_projections.key?(uri)
+    projection = availability_projections[uri]
     return discard_pui_availability(uri) unless projection.is_a?(Hash)
 
     # 6. Exact key set validation: reject missing or extra keys, including non-string keys
@@ -1990,7 +2043,7 @@ class IndexerCommon
       end
     end
 
-    @pui_availability_projections.delete(uri)
+    availability_projections.delete(uri)
     true
   rescue StandardError => e
     Log.warn("PUI availability plan application failed for #{uri || doc_uri}: #{e.class}: #{e.message}; falling back to native")

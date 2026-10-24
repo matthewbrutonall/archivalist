@@ -1173,7 +1173,8 @@ test "index_records executes common-only request, checks payload, verifies helpe
   assert_equal(['2 --- boxes'], doc['extents'])
   assert(doc.keys.none? { |k| k.start_with?('_archivalist_') }, "Handoff keys leaked to batch")
 
-  # 5. Assert batch cache cleaned up to nil
+  # 5. Assert batch cache cleaned up to nil and shared instance variable untouched
+  assert_nil(indexer.pui_common_projections)
   assert_nil(indexer.instance_variable_get(:@pui_common_projections))
 end
 
@@ -1248,6 +1249,7 @@ test "combined flags prepare_pui_final + prepare_pui_common_metadata with #pui r
     assert_equal("#{uri}#pui", comb_doc['id'])
     assert_equal(['Church History', 'Archives'], comb_doc['subjects'])
     assert(comb_doc.keys.none? { |k| k.start_with?('_archivalist_') })
+    assert_nil(indexer.pui_common_projections)
     assert_nil(indexer.instance_variable_get(:@pui_common_projections))
   ensure
     AppConfig[:rust_pui_document_preparation_enabled] = false
@@ -1278,6 +1280,7 @@ test "transport outage raises in perform_request and falls back cleanly to nativ
   assert_equal(1, outage_docs.length)
   doc = outage_docs.first
   assert_equal(['Church History', 'Archives'], doc['subjects'])
+  assert_nil(indexer.pui_common_projections)
   assert_nil(indexer.instance_variable_get(:@pui_common_projections))
 end
 
@@ -1316,6 +1319,7 @@ test "batch cache cleanup to nil on hook exception" do
     exploding_indexer.index_records([{ 'record' => sample_rec, 'uri' => uri }])
   end
 
+  assert_nil(exploding_indexer.pui_common_projections, "Thread cache not cleared after hook exception")
   assert_nil(exploding_indexer.instance_variable_get(:@pui_common_projections), "Cache not cleared after hook exception")
 end
 
@@ -1366,6 +1370,7 @@ test "index_records detects pre-hook mutation before common helpers and falls ba
   doc = captured_docs.first
   assert_equal(['Pre-Hook Mutated Subject'], doc['subjects'])
   assert_equal(['/subjects/pre'], doc['subject_uris'])
+  assert_nil(indexer.pui_common_projections)
   assert_nil(indexer.instance_variable_get(:@pui_common_projections))
 end
 
@@ -1425,6 +1430,7 @@ test "index_records preserves pre-existing doc values when patch fields are abse
   assert_equal(['Pre-existing Creator'], doc['creators'])
   assert_equal('18501850', doc['year_sort'])
   assert_equal('Pre-existing Summary', doc['summary'])
+  assert_nil(indexer.pui_common_projections)
   assert_nil(indexer.instance_variable_get(:@pui_common_projections))
 end
 
@@ -1440,6 +1446,252 @@ test "add_level maps otherlevel to other_level" do
   indexer.add_level(doc, { 'record' => other_rec, 'uri' => uri })
   assert_equal('fonds', doc['level'])
   assert(!indexer.instance_variable_get(:@pui_common_projections)[uri].nil?)
+end
+
+test "dedupe_by_uri exception cleans up per-thread PUI projections and preserves exception" do
+  indexer = PUIIndexer.new('http://localhost:8089', DummyIndexState.new, 'PUIIndexer')
+  seen_store = nil
+  indexer.define_singleton_method(:dedupe_by_uri) do |_records|
+    seen_store = pui_projections_store
+    raise RuntimeError, "Simulated dedupe_by_uri failure"
+  end
+
+  assert_raises(RuntimeError, /Simulated dedupe_by_uri failure/) do
+    indexer.index_records([{ 'record' => build_sample_resource, 'uri' => '/repositories/2/resources/777' }])
+  end
+
+  assert(seen_store.is_a?(Hash), "Expected active thread projection map during dedupe_by_uri")
+  assert_nil(indexer.pui_projections_store)
+  assert_nil(Thread.current[:archivalist_pui_projections])
+end
+
+test "nested index_records on the same indexer and thread preserves and restores outer projection map" do
+  AppConfig[:rust_pui_document_preparation_enabled] = true
+  begin
+    indexer = PUIIndexer.new('http://localhost:8089', DummyIndexState.new, 'PUIIndexer')
+    outer_uris = ['/repositories/2/resources/601', '/repositories/2/resources/602']
+    inner_uri = '/repositories/2/resources/699'
+    all_uris = outer_uris + [inner_uri]
+
+    records_by_uri = {}
+    envelopes_by_uri = {}
+    all_uris.each_with_index do |u, idx|
+      rec = build_sample_resource(u).merge('title' => "Nested Resource #{idx}")
+      records_by_uri[u] = { 'record' => rec, 'uri' => u }
+      envelopes_by_uri[u] = {
+        'id' => u,
+        'uri' => u,
+        'title' => rec['title'],
+        'primary_type' => 'resource',
+        'types' => ['resource'],
+        'json' => ASUtils.to_json(rec),
+        'suppressed' => false,
+        'publish' => true,
+        'system_generated' => 'false',
+        'repository' => 2,
+        '_archivalist_rust_fields' => [
+          'pui_final_document_metadata',
+          'pui_routing_metadata',
+          'pui_notes_metadata',
+          'pui_common_metadata'
+        ],
+        '_archivalist_pui_final' => {
+          'marker' => 'pui_final_document_metadata',
+          'json' => ASUtils.to_json(rec),
+          'fullrecord_published' => IndexerCommon.extract_string_values(rec, :published_only)
+        },
+        '_archivalist_pui_routing' => {
+          'marker' => 'pui_routing_metadata',
+          'id' => "#{u}#pui",
+          'pui_parent_id' => u,
+          'types' => ['pui', 'pui_resource', 'pui_record', 'pui_only']
+        },
+        '_archivalist_pui_notes' => {
+          'marker' => 'pui_notes_metadata',
+          'notes_published' => IndexerCommon.extract_string_values(rec['notes'], :published_only)
+        },
+        '_archivalist_pui_common' => build_valid_projection(u)
+      }
+    end
+
+    RustIndexDocumentBuilder.class_eval do
+      define_method(:perform_request) do |req|
+        payload = ASUtils.json_parse(req.body)
+        docs = payload['records'].map do |r|
+          Marshal.load(Marshal.dump(envelopes_by_uri.fetch(r['uri'])))
+        end
+        Struct.new(:code, :body).new('200', ASUtils.to_json(
+          'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+          'documents' => docs
+        ))
+      end
+    end
+
+    captured_docs = []
+    indexer.define_singleton_method(:index_batch) do |batch, _timing = nil, _opts = {}|
+      batch.each { |doc| captured_docs << doc }
+    end
+
+    nested_triggered = false
+    nested_hook = proc do |_doc, rec|
+      if rec['uri'] == outer_uris.first && !nested_triggered
+        nested_triggered = true
+        indexer.index_records([Marshal.load(Marshal.dump(records_by_uri[inner_uri]))])
+      end
+    end
+    indexer.instance_variable_get(:@document_prepare_hooks).unshift(nested_hook)
+
+    indexer.index_records(outer_uris.map { |u| Marshal.load(Marshal.dump(records_by_uri[u])) })
+
+    assert_equal(true, nested_triggered)
+    assert_equal(["#{inner_uri}#pui", "#{outer_uris[0]}#pui", "#{outer_uris[1]}#pui"], captured_docs.map { |d| d['id'] })
+    captured_docs.each do |doc|
+      assert_equal(['Church History', 'Archives'], doc['subjects'])
+      assert(doc.keys.none? { |k| k.start_with?('_archivalist_') })
+    end
+    assert_nil(indexer.pui_projections_store)
+    assert_nil(Thread.current[:archivalist_pui_projections])
+  ensure
+    AppConfig[:rust_pui_document_preparation_enabled] = false
+  end
+end
+
+test "concurrent index_records across 4 worker threads isolates PUI projections without nil race or clobbering" do
+  AppConfig[:rust_pui_document_preparation_enabled] = true
+  workers = []
+  release_queue = Queue.new
+  thread_count = 4
+  begin
+    indexer = PUIIndexer.new('http://localhost:8089', DummyIndexState.new, 'PUIIndexer')
+    records_by_thread = (0...thread_count).map do |t_idx|
+      uri = "/repositories/2/resources/#{500 + t_idx}"
+      rec = build_sample_resource(uri).merge('title' => "Concurrent Resource #{t_idx}")
+      { 'record' => rec, 'uri' => uri }
+    end
+
+    envelopes_by_uri = {}
+    records_by_thread.each do |wrapper|
+      rec = wrapper['record']
+      uri = wrapper['uri']
+      envelopes_by_uri[uri] = {
+        'id' => uri,
+        'uri' => uri,
+        'title' => rec['title'],
+        'primary_type' => 'resource',
+        'types' => ['resource'],
+        'json' => ASUtils.to_json(rec),
+        'suppressed' => false,
+        'publish' => true,
+        'system_generated' => 'false',
+        'repository' => 2,
+        '_archivalist_rust_fields' => [
+          'pui_final_document_metadata',
+          'pui_routing_metadata',
+          'pui_notes_metadata',
+          'pui_common_metadata'
+        ],
+        '_archivalist_pui_final' => {
+          'marker' => 'pui_final_document_metadata',
+          'json' => ASUtils.to_json(rec),
+          'fullrecord_published' => IndexerCommon.extract_string_values(rec, :published_only)
+        },
+        '_archivalist_pui_routing' => {
+          'marker' => 'pui_routing_metadata',
+          'id' => "#{uri}#pui",
+          'pui_parent_id' => uri,
+          'types' => ['pui', 'pui_resource', 'pui_record', 'pui_only']
+        },
+        '_archivalist_pui_notes' => {
+          'marker' => 'pui_notes_metadata',
+          'notes_published' => IndexerCommon.extract_string_values(rec['notes'], :published_only)
+        },
+        '_archivalist_pui_common' => build_valid_projection(uri)
+      }
+    end
+
+    arrived_queue = Queue.new
+    pop_with_timeout = lambda do |queue, timeout_sec, label|
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout_sec
+      loop do
+        begin
+          return queue.pop(true)
+        rescue ThreadError
+          if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+            raise "Timed out after #{timeout_sec}s waiting on #{label}"
+          end
+          sleep 0.01
+        end
+      end
+    end
+
+    RustIndexDocumentBuilder.class_eval do
+      define_method(:perform_request) do |req|
+        payload = ASUtils.json_parse(req.body)
+        docs = payload['records'].map do |r|
+          Marshal.load(Marshal.dump(envelopes_by_uri.fetch(r['uri'])))
+        end
+        if Thread.current[:worker_idx] && Thread.current[:worker_idx] < thread_count - 1
+          arrived_queue << Thread.current[:worker_idx]
+          pop_with_timeout.call(release_queue, 5.0, "release_queue for worker #{Thread.current[:worker_idx]}")
+        end
+        Struct.new(:code, :body).new('200', ASUtils.to_json(
+          'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+          'documents' => docs
+        ))
+      end
+    end
+
+    batch_mutex = Mutex.new
+    captured_docs = []
+    indexer.define_singleton_method(:index_batch) do |batch, _timing = nil, _opts = {}|
+      docs = []
+      batch.each { |doc| docs << doc }
+      batch_mutex.synchronize { captured_docs.concat(docs) }
+    end
+
+    workers = (0...(thread_count - 1)).map do |t_idx|
+      Thread.new do
+        Thread.current.report_on_exception = false if Thread.current.respond_to?(:report_on_exception=)
+        Thread.current[:worker_idx] = t_idx
+        indexer.index_records([Marshal.load(Marshal.dump(records_by_thread[t_idx]))])
+      end
+    end
+
+    (thread_count - 1).times do |i|
+      pop_with_timeout.call(arrived_queue, 5.0, "arrived_queue (#{i + 1}/#{thread_count - 1})")
+    end
+
+    Thread.current[:worker_idx] = thread_count - 1
+    indexer.index_records([Marshal.load(Marshal.dump(records_by_thread[thread_count - 1]))])
+    Thread.current[:worker_idx] = nil
+
+    (thread_count - 1).times { release_queue << :go }
+    workers.each do |w|
+      raise "Timed out joining worker thread" unless w.join(5.0)
+      w.value
+    end
+
+    assert_equal(thread_count, captured_docs.length)
+    captured_docs.each do |doc|
+      assert(doc['id'].end_with?('#pui'), "Expected #pui suffix on #{doc['id']}")
+      assert_equal(['Church History', 'Archives'], doc['subjects'])
+      assert(doc.keys.none? { |k| k.start_with?('_archivalist_') })
+    end
+    assert_nil(indexer.instance_variable_get(:@pui_final_projections))
+    assert_nil(indexer.instance_variable_get(:@pui_routing_projections))
+    assert_nil(indexer.instance_variable_get(:@pui_notes_projections))
+    assert_nil(indexer.instance_variable_get(:@pui_availability_projections))
+    assert_nil(indexer.instance_variable_get(:@pui_candidate_projections))
+    assert_nil(indexer.instance_variable_get(:@pui_common_projections))
+    assert_nil(Thread.current[:archivalist_pui_projections])
+  ensure
+    Thread.current[:worker_idx] = nil
+    (thread_count - 1).times { release_queue << :abort }
+    workers.each do |w|
+      w.kill unless w.join(2.0)
+    end
+    AppConfig[:rust_pui_document_preparation_enabled] = false
+  end
 end
 
 # --- 5. Summary & Exit ---

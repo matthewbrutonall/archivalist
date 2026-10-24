@@ -55,4 +55,17 @@ describe "indexer timing" do
       expect(metrics["metric"].to_i).to be_within(10).of(sleep_time * 1000)
     end
   end
+
+  describe "thread safety" do
+    it "accumulates metrics across concurrent worker threads without lost updates" do
+      threads = (0...4).map do
+        Thread.new do
+          250.times { @it.add(:record_fetch_ms, 3) }
+        end
+      end
+      threads.each(&:join)
+      expect(@it.instance_variable_get(:@metrics)[:record_fetch_ms]).to eq(4 * 250 * 3)
+      expect(@it.to_s).to eq("3000 ms (record_fetch_ms: 3000)")
+    end
+  end
 end

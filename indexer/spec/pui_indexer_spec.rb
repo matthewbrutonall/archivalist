@@ -2290,7 +2290,7 @@ describe "PUI indexer" do
         projection_present_during_hooks = nil
         plugin_saw_pui_common_marker = nil
         plugin_hook = proc do |doc, rec|
-          projection_present_during_hooks = !test_indexer.instance_variable_get(:@pui_common_projections)[uri].nil?
+          projection_present_during_hooks = !test_indexer.pui_common_projections[uri].nil?
           plugin_saw_pui_common_marker = doc.has_key?('_archivalist_pui_common')
         end
 
@@ -2340,6 +2340,7 @@ describe "PUI indexer" do
         expect(final_doc.keys.none? { |k| k.to_s.start_with?('_archivalist_') }).to be(true)
 
         # Batch cache is cleaned up to nil after index_records
+        expect(test_indexer.pui_common_projections).to be_nil
         expect(test_indexer.instance_variable_get(:@pui_common_projections)).to be_nil
       ensure
         AppConfig[:record_inheritance] = saved_inheritance_config
@@ -2434,6 +2435,7 @@ describe "PUI indexer" do
         expect(comb_doc['id']).to eq("#{uri}#pui")
         expect(comb_doc['subjects']).to eq(['Church History', 'Archives'])
         expect(comb_doc.keys.none? { |k| k.to_s.start_with?('_archivalist_') }).to be(true)
+        expect(test_indexer.pui_common_projections).to be_nil
         expect(test_indexer.instance_variable_get(:@pui_common_projections)).to be_nil
       ensure
         AppConfig[:record_inheritance] = saved_inheritance_config
@@ -2477,6 +2479,7 @@ describe "PUI indexer" do
         expect(outage_batch.length).to eq(1)
         fallback_doc = outage_batch.first
         expect(fallback_doc['subjects']).to eq(['Church History', 'Archives'])
+        expect(test_indexer.pui_common_projections).to be_nil
         expect(test_indexer.instance_variable_get(:@pui_common_projections)).to be_nil
       ensure
         AppConfig[:record_inheritance] = saved_inheritance_config
@@ -2544,6 +2547,7 @@ describe "PUI indexer" do
         final_doc = mutated_batch.first
         expect(final_doc['subjects']).to eq(['Pre-Hook Mutated Subject'])
         expect(final_doc['subject_uris']).to eq(['/subjects/pre_hook'])
+        expect(test_indexer.pui_common_projections).to be_nil
         expect(test_indexer.instance_variable_get(:@pui_common_projections)).to be_nil
       ensure
         AppConfig[:record_inheritance] = saved_inheritance_config
@@ -2632,6 +2636,7 @@ describe "PUI indexer" do
         expect(final_doc['creators']).to eq(['Pre-existing Creator'])
         expect(final_doc['year_sort']).to eq('18501850')
         expect(final_doc['summary']).to eq('Pre-existing Summary')
+        expect(test_indexer.pui_common_projections).to be_nil
         expect(test_indexer.instance_variable_get(:@pui_common_projections)).to be_nil
       ensure
         AppConfig[:record_inheritance] = saved_inheritance_config
@@ -2681,11 +2686,336 @@ describe "PUI indexer" do
 
         exploding_indexer.instance_variable_get(:@document_prepare_hooks) << proc { raise "Boom inside hook" }
         expect { exploding_indexer.index_records([record_input]) }.to raise_error(/Boom inside hook/)
+        expect(exploding_indexer.pui_common_projections).to be_nil
         expect(exploding_indexer.instance_variable_get(:@pui_common_projections)).to be_nil
       ensure
         AppConfig[:record_inheritance] = saved_inheritance_config
         AppConfig[:rust_index_document_builder_enabled] = false
         AppConfig[:rust_pui_common_metadata_enabled] = false
+      end
+    end
+
+    it "cleans up thread projection state when dedupe_by_uri raises an exception" do
+      test_indexer = PUIIndexer.new(AppConfig[:backend_url], nil, 'PUIIndexer')
+      state_during_dedupe = nil
+      allow(test_indexer).to receive(:dedupe_by_uri) do |_records|
+        state_during_dedupe = test_indexer.pui_projections_store
+        raise "Boom inside dedupe_by_uri"
+      end
+
+      expect { test_indexer.index_records([{ 'uri' => '/repositories/2/resources/1', 'record' => sample_common_record.dup }]) }.to raise_error(/Boom inside dedupe_by_uri/)
+      expect(state_during_dedupe).to be_a(Hash)
+      expect(test_indexer.pui_projections_store).to be_nil
+      expect(Thread.current[:archivalist_pui_projections]).to be_nil
+    end
+
+    it "preserves and restores outer per-thread projection map across nested index_records calls on the same indexer" do
+      saved_inheritance_config = AppConfig[:record_inheritance]
+      begin
+        AppConfig[:rust_index_document_builder_enabled] = true
+        AppConfig[:rust_pui_document_preparation_enabled] = true
+        AppConfig[:rust_pui_common_metadata_enabled] = true
+        AppConfig[:record_inheritance] = (saved_inheritance_config || {}).merge(
+          :resource => {
+            :inherited_fields => [
+              { :property => 'title', :inherit_directly => true }
+            ]
+          }
+        )
+
+        test_indexer = PUIIndexer.new(AppConfig[:backend_url], nil, 'PUIIndexer')
+        captured_docs = []
+        test_indexer.define_singleton_method(:index_batch) do |batch, _timing = nil, _opts = {}|
+          batch.each { |doc| captured_docs << doc }
+        end
+
+        outer_uris = ['/repositories/2/resources/801', '/repositories/2/resources/802']
+        inner_uri = '/repositories/2/resources/899'
+        all_uris = outer_uris + [inner_uri]
+
+        records_by_uri = {}
+        envelopes_by_uri = {}
+        all_uris.each_with_index do |u, idx|
+          rec = sample_common_record.dup.merge('uri' => u, 'title' => "Nested Resource #{idx}")
+          records_by_uri[u] = { 'record' => rec, 'uri' => u }
+          envelopes_by_uri[u] = {
+            'id' => u,
+            'uri' => u,
+            'title' => rec['title'],
+            'primary_type' => 'resource',
+            'types' => ['resource'],
+            'json' => ASUtils.to_json(rec),
+            'suppressed' => false,
+            'publish' => true,
+            'system_generated' => 'false',
+            'repository' => '/repositories/2',
+            '_archivalist_rust_fields' => [
+              'pui_final_document_metadata',
+              'pui_routing_metadata',
+              'pui_notes_metadata',
+              'pui_common_metadata'
+            ],
+            '_archivalist_pui_final' => {
+              'marker' => 'pui_final_document_metadata',
+              'json' => ASUtils.to_json(rec),
+              'fullrecord_published' => IndexerCommon.extract_string_values(rec, :published_only)
+            },
+            '_archivalist_pui_routing' => {
+              'marker' => 'pui_routing_metadata',
+              'id' => "#{u}#pui",
+              'pui_parent_id' => u,
+              'types' => ['pui', 'pui_resource', 'pui_record', 'pui_only']
+            },
+            '_archivalist_pui_notes' => {
+              'marker' => 'pui_notes_metadata',
+              'notes_published' => IndexerCommon.extract_string_values(rec['notes'], :published_only)
+            },
+            '_archivalist_pui_common' => valid_pui_common_projection.dup.merge('uri' => u)
+          }
+        end
+
+        allow_any_instance_of(RustIndexDocumentBuilder).to receive(:perform_request) do |_builder, req|
+          payload = ASUtils.json_parse(req.body)
+          docs = payload['records'].map do |r|
+            Marshal.load(Marshal.dump(envelopes_by_uri.fetch(r['uri'])))
+          end
+          Struct.new(:code, :body).new('200', ASUtils.to_json(
+            'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+            'documents' => docs
+          ))
+        end
+
+        nested_called = false
+        nested_hook = proc do |_doc, rec|
+          if rec['uri'] == outer_uris.first && !nested_called
+            nested_called = true
+            test_indexer.index_records([Marshal.load(Marshal.dump(records_by_uri[inner_uri]))])
+          end
+        end
+        test_indexer.instance_variable_get(:@document_prepare_hooks).unshift(nested_hook)
+
+        test_indexer.index_records(outer_uris.map { |u| Marshal.load(Marshal.dump(records_by_uri[u])) })
+
+        expect(nested_called).to be(true)
+        expect(captured_docs.map { |d| d['id'] }).to eq([
+          "#{inner_uri}#pui",
+          "#{outer_uris[0]}#pui",
+          "#{outer_uris[1]}#pui"
+        ])
+        captured_docs.each do |doc|
+          expect(doc['subjects']).to eq(['Church History', 'Archives'])
+          expect(doc.keys.none? { |k| k.to_s.start_with?('_archivalist_') }).to be(true)
+        end
+        expect(test_indexer.pui_projections_store).to be_nil
+        expect(Thread.current[:archivalist_pui_projections]).to be_nil
+      ensure
+        AppConfig[:record_inheritance] = saved_inheritance_config
+        AppConfig[:rust_index_document_builder_enabled] = false
+        AppConfig[:rust_pui_document_preparation_enabled] = false
+        AppConfig[:rust_pui_common_metadata_enabled] = false
+      end
+    end
+
+    it "isolates per-batch PUI projections across 4 concurrent worker threads on a shared PUIIndexer instance" do
+      saved_inheritance_config = AppConfig[:record_inheritance]
+      workers = []
+      release_queue = Queue.new
+      thread_count = 4
+      begin
+        AppConfig[:rust_index_document_builder_enabled] = true
+        AppConfig[:rust_pui_document_preparation_enabled] = true
+        AppConfig[:rust_pui_record_inheritance_candidate_enabled] = true
+        AppConfig[:rust_pui_common_metadata_enabled] = true
+        AppConfig[:record_inheritance] = (saved_inheritance_config || {}).merge(
+          :resource => {
+            :inherited_fields => [
+              { :property => 'title', :inherit_directly => true }
+            ]
+          },
+          :archival_object => {
+            :inherited_fields => [
+              { :property => 'title', :inherit_directly => true }
+            ]
+          }
+        )
+
+        shared_indexer = PUIIndexer.new(AppConfig[:backend_url], nil, 'PUIIndexer')
+        batch_mutex = Mutex.new
+        captured_docs = []
+        shared_indexer.define_singleton_method(:index_batch) do |batch, _timing = nil, _opts = {}|
+          docs = []
+          batch.each { |doc| docs << doc }
+          batch_mutex.synchronize { captured_docs.concat(docs) }
+        end
+
+        records_by_thread = (0...thread_count).map do |t_idx|
+          [1, 2].map do |item_idx|
+            uri = "/repositories/2/archival_objects/#{9000 + (t_idx * 10) + item_idx}"
+            rec_hash = sample_common_record.dup.merge(
+              'uri' => uri,
+              'jsonmodel_type' => 'archival_object',
+              'title' => "Concurrent AO #{t_idx}-#{item_idx}",
+              'ancestors' => [
+                {
+                  'ref' => '/repositories/2/resources/99',
+                  'level' => 'collection',
+                  '_resolved' => {
+                    'uri' => '/repositories/2/resources/99',
+                    'jsonmodel_type' => 'resource',
+                    'title' => 'Parent Resource',
+                    'publish' => true,
+                    'suppressed' => false
+                  }
+                }
+              ]
+            )
+            { 'record' => rec_hash, 'uri' => uri }
+          end
+        end
+
+        envelopes_by_uri = {}
+        records_by_thread.flatten.each do |rec_wrapper|
+          rec_hash = rec_wrapper['record']
+          uri = rec_wrapper['uri']
+          expected_merged = RecordInheritance.merge(shared_indexer.deep_copy_record_candidate(rec_hash))
+          expected_clean = shared_indexer.deep_copy_record_candidate(expected_merged)
+          expected_clean.delete('ancestors')
+
+          common_proj = valid_pui_common_projection.dup.merge(
+            'uri' => uri,
+            'primary_type' => 'archival_object',
+            'level' => { 'level' => 'subfonds' }
+          )
+
+          envelopes_by_uri[uri] = {
+            'id' => uri,
+            'uri' => uri,
+            'title' => rec_hash['title'],
+            'primary_type' => 'archival_object',
+            'types' => ['archival_object'],
+            'json' => ASUtils.to_json(rec_hash),
+            'suppressed' => false,
+            'publish' => true,
+            'system_generated' => 'false',
+            'repository' => '/repositories/2',
+            '_archivalist_rust_fields' => [
+              'pui_final_document_metadata',
+              'pui_routing_metadata',
+              'pui_notes_metadata',
+              'pui_record_inheritance_candidate_metadata',
+              'pui_common_metadata'
+            ],
+            '_archivalist_pui_candidate' => {
+              'marker' => 'pui_record_inheritance_candidate_metadata',
+              'record' => expected_merged
+            },
+            '_archivalist_pui_final' => {
+              'marker' => 'pui_final_document_metadata',
+              'json' => ASUtils.to_json(expected_clean),
+              'fullrecord_published' => IndexerCommon.extract_string_values(expected_clean, :published_only)
+            },
+            '_archivalist_pui_routing' => {
+              'marker' => 'pui_routing_metadata',
+              'id' => "#{uri}#pui",
+              'pui_parent_id' => uri,
+              'types' => ['pui', 'pui_archival_object', 'pui_record', 'pui_only']
+            },
+            '_archivalist_pui_notes' => {
+              'marker' => 'pui_notes_metadata',
+              'notes_published' => IndexerCommon.extract_string_values(rec_hash['notes'], :published_only)
+            },
+            '_archivalist_pui_common' => common_proj
+          }
+        end
+
+        # Deterministic bounded overlapping synchronization:
+        # Hold threads 0..2 after rust_index_documents returns while thread 3 runs index_records
+        # all the way through its ensure block, then release threads 0..2 so they populate and
+        # consume projections after thread 3's ensure has already executed.
+        arrived_queue = Queue.new
+        pop_with_timeout = lambda do |queue, timeout_sec, label|
+          deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout_sec
+          loop do
+            begin
+              return queue.pop(true)
+            rescue ThreadError
+              if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+                raise "Timed out after #{timeout_sec}s waiting on #{label}"
+              end
+              sleep 0.01
+            end
+          end
+        end
+
+        allow_any_instance_of(RustIndexDocumentBuilder).to receive(:perform_request) do |_builder, req|
+          payload = ASUtils.json_parse(req.body)
+          docs = payload['records'].map do |r|
+            Marshal.load(Marshal.dump(envelopes_by_uri.fetch(r['uri'])))
+          end
+          if Thread.current[:worker_idx] && Thread.current[:worker_idx] < thread_count - 1
+            arrived_queue << Thread.current[:worker_idx]
+            pop_with_timeout.call(release_queue, 5.0, "release_queue for worker #{Thread.current[:worker_idx]}")
+          end
+          Struct.new(:code, :body).new('200', ASUtils.to_json(
+            'served_by' => RustIndexDocumentBuilder::EXPECTED_SERVER,
+            'documents' => docs
+          ))
+        end
+
+        workers = (0...(thread_count - 1)).map do |t_idx|
+          Thread.new do
+            Thread.current.report_on_exception = false if Thread.current.respond_to?(:report_on_exception=)
+            Thread.current[:worker_idx] = t_idx
+            shared_indexer.index_records(Marshal.load(Marshal.dump(records_by_thread[t_idx])))
+          end
+        end
+
+        (thread_count - 1).times do |i|
+          pop_with_timeout.call(arrived_queue, 5.0, "arrived_queue (#{i + 1}/#{thread_count - 1})")
+        end
+
+        # Thread 3 runs to completion (including its ensure block) while threads 0..2 are mid-index_records
+        Thread.current[:worker_idx] = thread_count - 1
+        shared_indexer.index_records(Marshal.load(Marshal.dump(records_by_thread[thread_count - 1])))
+        Thread.current[:worker_idx] = nil
+
+        # Release threads 0..2 to populate projections and run prepare hooks concurrently
+        (thread_count - 1).times { release_queue << :go }
+        workers.each do |w|
+          raise "Timed out joining worker thread" unless w.join(5.0)
+          w.value
+        end
+
+        expect(captured_docs.length).to eq(thread_count * 2)
+        captured_docs.each do |doc|
+          expect(doc['id']).to end_with('#pui')
+          expect(doc['pui_parent_id']).to eq(doc['uri'])
+          expect(doc.has_key?('ancestors')).to be(false)
+          parsed_json = ASUtils.json_parse(doc['json'])
+          expect(parsed_json.has_key?('ancestors')).to be(false)
+          expect(doc['subjects']).to eq(['Church History', 'Archives'])
+          expect(doc['types']).to include('pui', 'pui_archival_object', 'pui_record', 'pui_only')
+          expect(doc.keys.none? { |k| k.to_s.start_with?('_archivalist_') }).to be(true)
+        end
+        expect(shared_indexer.instance_variable_get(:@pui_final_projections)).to be_nil
+        expect(shared_indexer.instance_variable_get(:@pui_routing_projections)).to be_nil
+        expect(shared_indexer.instance_variable_get(:@pui_notes_projections)).to be_nil
+        expect(shared_indexer.instance_variable_get(:@pui_availability_projections)).to be_nil
+        expect(shared_indexer.instance_variable_get(:@pui_candidate_projections)).to be_nil
+        expect(shared_indexer.instance_variable_get(:@pui_common_projections)).to be_nil
+        expect(Thread.current[:archivalist_pui_projections]).to be_nil
+      ensure
+        Thread.current[:worker_idx] = nil
+        (thread_count - 1).times { release_queue << :abort }
+        workers.each do |w|
+          w.kill unless w.join(2.0)
+        end
+        AppConfig[:record_inheritance] = saved_inheritance_config
+        AppConfig[:rust_index_document_builder_enabled] = false
+        AppConfig[:rust_pui_document_preparation_enabled] = false
+        AppConfig[:rust_pui_record_inheritance_candidate_enabled] = false
+        AppConfig[:rust_pui_common_metadata_enabled] = false
+        AppConfig[:rust_pui_availability_preparation_enabled] = false
       end
     end
   end

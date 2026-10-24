@@ -133,7 +133,8 @@ class PUIIndexer < PeriodicIndexer
     return false unless rec_type.is_a?(String) && rec_type == doc['primary_type']
 
     uri = rec_uri
-    projection = @pui_final_projections && @pui_final_projections[uri]
+    final_projections = pui_final_projections
+    projection = final_projections && final_projections[uri]
     return discard_pui_final(uri) unless projection.is_a?(Hash)
 
     # 1. Capability marker & structure validation
@@ -198,7 +199,8 @@ class PUIIndexer < PeriodicIndexer
     return discard_pui_final(uri) unless projection['fullrecord_published'] == expected_fullrecord
 
     if rust_pui_record_inheritance_candidate_enabled? && RecordInheritance.has_type?(record['record']['jsonmodel_type'])
-      cand_proj = @pui_candidate_projections && @pui_candidate_projections[uri]
+      candidate_projections = pui_candidate_projections
+      cand_proj = candidate_projections && candidate_projections[uri]
       return discard_pui_final(uri) unless cand_proj.is_a?(Hash)
       return discard_pui_final(uri) if cand_proj.keys.any? { |k| !k.is_a?(String) }
       missing_cand_keys = RustIndexDocumentBuilder::PUI_CANDIDATE_FIELDS - cand_proj.keys
@@ -249,25 +251,30 @@ class PUIIndexer < PeriodicIndexer
   end
 
   def discard_pui_final(uri)
-    @pui_final_projections.delete(uri) if @pui_final_projections && uri
-    @pui_candidate_projections.delete(uri) if @pui_candidate_projections && uri
+    final_projections = pui_final_projections
+    candidate_projections = pui_candidate_projections
+    final_projections.delete(uri) if final_projections && uri
+    candidate_projections.delete(uri) if candidate_projections && uri
     false
   end
 
   def discard_pui_routing(uri)
-    @pui_routing_projections.delete(uri) if @pui_routing_projections && uri
+    routing_projections = pui_routing_projections
+    routing_projections.delete(uri) if routing_projections && uri
     false
   end
 
   def discard_pui_notes(uri)
-    @pui_notes_projections.delete(uri) if @pui_notes_projections && uri
+    notes_projections = pui_notes_projections
+    notes_projections.delete(uri) if notes_projections && uri
     false
   end
 
   def discard_pui_common(*uris)
-    if @pui_common_projections
+    common_projections = pui_common_projections
+    if common_projections
       uris.flatten.compact.each do |uri|
-        @pui_common_projections.delete(uri) if uri.is_a?(String)
+        common_projections.delete(uri) if uri.is_a?(String)
       end
     end
     false
@@ -284,8 +291,9 @@ class PUIIndexer < PeriodicIndexer
     return discard_pui_routing(uri) unless rec_type.is_a?(String) && rec_type == doc['primary_type']
     return discard_pui_routing(uri) unless RecordInheritance.has_type?(doc['primary_type'])
 
-    if @pui_routing_projections && @pui_routing_projections.key?(uri)
-      projection = @pui_routing_projections[uri]
+    routing_projections = pui_routing_projections
+    if routing_projections && routing_projections.key?(uri)
+      projection = routing_projections[uri]
       return discard_pui_routing(uri) unless projection.is_a?(Hash)
     else
       return false
@@ -321,11 +329,11 @@ class PUIIndexer < PeriodicIndexer
     doc['types'] ||= []
     doc['types'].concat(projection['types'])
 
-    @pui_routing_projections.delete(uri)
+    routing_projections.delete(uri)
     true
   rescue StandardError => e
     Log.warn("PUI routing projection validation failed for #{uri}: #{e.class}: #{e.message}; using native fallback")
-    @pui_routing_projections.delete(uri) if @pui_routing_projections
+    discard_pui_routing(uri)
     false
   end
 
@@ -340,8 +348,9 @@ class PUIIndexer < PeriodicIndexer
     return discard_pui_notes(uri) unless rec_type.is_a?(String) && rec_type == doc['primary_type']
     return discard_pui_notes(uri) unless RecordInheritance.has_type?(doc['primary_type'])
 
-    if @pui_notes_projections && @pui_notes_projections.key?(uri)
-      projection = @pui_notes_projections[uri]
+    notes_projections = pui_notes_projections
+    if notes_projections && notes_projections.key?(uri)
+      projection = notes_projections[uri]
       return discard_pui_notes(uri) unless projection.is_a?(Hash)
     else
       return false
@@ -362,7 +371,7 @@ class PUIIndexer < PeriodicIndexer
       # Preserve absence behavior exactly when notes is absent/nil/false
       return discard_pui_notes(uri) unless projection['notes_published'].nil?
       # Do not set doc['notes_published']
-      @pui_notes_projections.delete(uri)
+      notes_projections.delete(uri)
       return true
     end
 
@@ -377,11 +386,11 @@ class PUIIndexer < PeriodicIndexer
 
     # 5. Apply projection safely
     doc['notes_published'] = projection['notes_published']
-    @pui_notes_projections.delete(uri)
+    notes_projections.delete(uri)
     true
   rescue StandardError => e
     Log.warn("PUI notes projection validation failed for #{uri}: #{e.class}: #{e.message}; using native fallback")
-    @pui_notes_projections.delete(uri) if @pui_notes_projections
+    discard_pui_notes(uri)
     false
   end
 
@@ -428,8 +437,9 @@ class PUIIndexer < PeriodicIndexer
       return discard_pui_common(uri)
     end
 
-    if @pui_common_projections && @pui_common_projections.key?(uri)
-      projection = @pui_common_projections[uri]
+    common_projections = pui_common_projections
+    if common_projections && common_projections.key?(uri)
+      projection = common_projections[uri]
       return discard_pui_common(uri) unless projection.is_a?(Hash)
     else
       return false
