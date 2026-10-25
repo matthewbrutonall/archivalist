@@ -369,6 +369,29 @@ Scripts under `scripts/` are code-only harnesses:
   (`/admin/info/system?wt=json`) after stack identity verification, recording null and a sanitized
   diagnostic on error. All memory snapshots are point-in-time boundary measurements, not continuous
   samples of peak heap or per-pass RSS.
+- `native_archival_object_profile.rb` + `run_native_archival_object_profile.sh`: Isolated Gate 2
+  Step 2 native baseline profiling harness for strictly repository 4's `:archival_object` IDs.
+  Invokes the real `PeriodicIndexer#start_worker_thread` native worker path into run-scoped stage cores
+  (`stage_staff_<run_id>_native`) with all seven Rust flags forced off, no sidecar, and no profiler wrappers
+  or category timers. Requires `STACK_STATE` and verifies profiling stack database and Solr identity before
+  any core creation, login, or indexing (fails closed on mismatch). Rejects foreign repositories or record
+  types before indexing. The timed measurement envelope strictly measures AO ID enumeration (`:all_ids => true`,
+  `:modified_since => 0`), 25-id batched backend fetching with full `resolved_attributes`, native document
+  mapping (`index_records`), Solr updates, and final hard commit (`indexer.send_commit(:hard)`). Backend login,
+  Solr stage core provisioning, and pre-pass memory snapshots are excluded from the timed region; repository
+  and non-AO document preamble is strictly excluded. Executes 4 repeats (repeat 1 = warmup, repeats 2-4 =
+  measured) and outputs JSON report containing raw wall and CPU times, medians over measured repeats, Solr
+  document and AO counts, stack ID, repo ID, git commit/dirty provenance, Java/JRuby versions, core names,
+  process RSS/HWM snapshots (`/proc/self/status`, labeled with process-lifetime high-water mark semantics),
+  Solr JVM heap snapshots (`/admin/info/system`), and parity comparison plan targeting `compare_staff_index_parity.py`.
+  Document counts alone do not establish document parity. Aligns required constant setup sequence with proven
+  launchers (`native_indexing_profile.rb`, `indexer/app/main.rb`) by loading `rust_index_document_builder`,
+  `periodic_indexer`, `pui_indexer`, `large_tree_doc_indexer`, and `index_batch`, ensuring constants such as
+  `PUIIndexer` are defined before worker document prepare hooks execute (`IndexerCommon` line 1130).
+  Offline tests: `test_native_archival_object_profile.rb` (verifies harness dispatch contract via test double
+  under MRI, validates missing, nil, and configured sidecar endpoint fail-closed safety, executes actual
+  `PeriodicIndexer#start_worker_thread` under JRuby without backend/Solr writes, and verifies real
+  `PeriodicIndexer` instantiates with `PUIIndexer` constant defined before executing staff AO document rules).
 - `benchmark_native_search_and_tree.py`: Small Gate 1 read-only backend API latency
   probe against the isolated profiling stack from `profiling_stack.py`. Discloses preflight
   setup mutation (`verify_identity` writes an isolated challenge nonce to the profiling DB
