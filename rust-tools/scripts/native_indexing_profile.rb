@@ -61,10 +61,193 @@ RUST_FLAGS = %i[
   rust_pui_auxiliary_documents_enabled
 ].freeze
 
+module NativeIndexingProfile
+  VM_HWM_SEMANTICS = 'PROCESS-LIFETIME high-water mark (not per-pass peak; later repeats may inherit earlier high)'
+
+  def self.median(values)
+    return nil if values.nil? || values.empty?
+
+    sorted = values.sort
+    mid = sorted.length / 2
+    sorted.length.odd? ? sorted[mid] : ((sorted[mid - 1] + sorted[mid]) / 2.0).round(3)
+  end
+
+  def self.compute_cpu_delta(t_start, t_end)
+    return { 'cpu_user_ms' => nil, 'cpu_system_ms' => nil } if t_start.nil? || t_end.nil?
+
+    u_delta = t_end.utime - t_start.utime
+    s_delta = t_end.stime - t_start.stime
+    {
+      'cpu_user_ms' => [((u_delta) * 1000.0).round(2), 0.0].max,
+      'cpu_system_ms' => [((s_delta) * 1000.0).round(2), 0.0].max
+    }
+  rescue StandardError
+    { 'cpu_user_ms' => nil, 'cpu_system_ms' => nil }
+  end
+
+  def self.read_proc_status(path = '/proc/self/status')
+    unless File.exist?(path)
+      return {
+        'vm_rss_kib' => nil,
+        'vm_hwm_kib' => nil,
+        'vm_hwm_semantics' => VM_HWM_SEMANTICS,
+        'diagnostic' => "proc status file not found: #{path}"
+      }
+    end
+
+    rss = nil
+    hwm = nil
+    File.foreach(path) do |line|
+      if (m = line.match(/\AVmRSS:\s*(\d+)\s*kB/i))
+        rss = Integer(m[1], 10)
+      elsif (m = line.match(/\AVmHWM:\s*(\d+)\s*kB/i))
+        hwm = Integer(m[1], 10)
+      end
+      break if rss && hwm
+    end
+
+    diagnostic = nil
+    if rss.nil? || hwm.nil?
+      missing = []
+      missing << 'VmRSS' if rss.nil?
+      missing << 'VmHWM' if hwm.nil?
+      diagnostic = "Missing #{missing.join(', ')} from #{path}"
+    end
+
+    {
+      'vm_rss_kib' => rss,
+      'vm_hwm_kib' => hwm,
+      'vm_hwm_semantics' => VM_HWM_SEMANTICS,
+      'diagnostic' => diagnostic
+    }
+  rescue StandardError => e
+    {
+      'vm_rss_kib' => nil,
+      'vm_hwm_kib' => nil,
+      'vm_hwm_semantics' => VM_HWM_SEMANTICS,
+      'diagnostic' => "Error reading #{path}: #{sanitize_error_message(e)}"
+    }
+  end
+
+  def self.parse_solr_jvm_heap(json_or_data)
+    data = json_or_data.is_a?(String) ? JSON.parse(json_or_data) : json_or_data
+    raw = data.is_a?(Hash) ? data.dig('jvm', 'memory', 'raw') : nil
+    unless raw.is_a?(Hash)
+      return {
+        'used_bytes' => nil,
+        'committed_bytes' => nil,
+        'max_bytes' => nil,
+        'diagnostic' => 'jvm.memory.raw missing from Solr system response'
+      }
+    end
+
+    used = raw['used']
+    committed = raw['total'] || raw['committed']
+    max = raw['max']
+
+    {
+      'used_bytes' => used ? Integer(used) : nil,
+      'committed_bytes' => committed ? Integer(committed) : nil,
+      'max_bytes' => max ? Integer(max) : nil,
+      'diagnostic' => nil
+    }
+  rescue StandardError => e
+    {
+      'used_bytes' => nil,
+      'committed_bytes' => nil,
+      'max_bytes' => nil,
+      'diagnostic' => "Failed to parse Solr JVM heap: #{sanitize_error_message(e)}"
+    }
+  end
+
+  def self.fetch_solr_jvm_heap(solr_base, getter: nil)
+    unless ArchivalistHarnessSafety.valid_solr_url?(solr_base)
+      return {
+        'used_bytes' => nil,
+        'committed_bytes' => nil,
+        'max_bytes' => nil,
+        'diagnostic' => "Safety violation: Invalid or unapproved Solr URL '#{solr_base}'"
+      }
+    end
+
+    url = "#{solr_base.chomp('/')}/admin/info/system?wt=json"
+    if getter
+      res_body = getter.call(url)
+      return parse_solr_jvm_heap(res_body)
+    end
+
+    uri = URI.parse(url)
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.open_timeout = 5
+    http.read_timeout = 10
+    http.use_ssl = (uri.scheme == 'https')
+
+    req = Net::HTTP::Get.new(uri.request_uri)
+    res = http.request(req)
+    unless res.is_a?(Net::HTTPSuccess)
+      return {
+        'used_bytes' => nil,
+        'committed_bytes' => nil,
+        'max_bytes' => nil,
+        'diagnostic' => "Solr system API returned HTTP #{res.code}"
+      }
+    end
+
+    parse_solr_jvm_heap(res.body)
+  rescue StandardError => e
+    {
+      'used_bytes' => nil,
+      'committed_bytes' => nil,
+      'max_bytes' => nil,
+      'diagnostic' => "Solr system API error: #{sanitize_error_message(e)}"
+    }
+  end
+
+  def self.sanitize_error_message(err)
+    return nil if err.nil?
+
+    msg = "#{err.class}: #{err.message}"
+    msg.gsub(/:\/\/([^:]+):([^@]+)@/, '://***:***@').slice(0, 120)
+  end
+
+  def self.resource_fields(*args, **kwargs)
+    cpu_delta = kwargs.fetch(:cpu_delta, args[0])
+    proc_mem_before = kwargs.fetch(:proc_mem_before, args[1])
+    proc_mem_after = kwargs.fetch(:proc_mem_after, args[2])
+    solr_heap_before = kwargs.fetch(:solr_heap_before, args[3])
+    solr_heap_after = kwargs.fetch(:solr_heap_after, args[4])
+
+    proc_before = proc_mem_before || {}
+    proc_after = proc_mem_after || {}
+    proc_diag = [proc_before['diagnostic'], proc_after['diagnostic']].compact.uniq
+
+    proc_mem = {
+      'vm_rss_before_kib' => proc_before['vm_rss_kib'],
+      'vm_rss_after_kib' => proc_after['vm_rss_kib'],
+      'vm_hwm_before_kib' => proc_before['vm_hwm_kib'],
+      'vm_hwm_after_kib' => proc_after['vm_hwm_kib'],
+      'vm_hwm_semantics' => VM_HWM_SEMANTICS,
+      'diagnostic' => proc_diag.empty? ? nil : proc_diag.join('; ')
+    }
+
+    solr_heap = {
+      'before' => solr_heap_before,
+      'after' => solr_heap_after
+    }
+
+    cpu = cpu_delta || {}
+
+    {
+      'cpu_user_ms' => cpu['cpu_user_ms'],
+      'cpu_system_ms' => cpu['cpu_system_ms'],
+      'process_memory' => proc_mem,
+      'solr_jvm_heap' => solr_heap
+    }
+  end
+end
+
 def native_profile_median(values)
-  sorted = values.sort
-  mid = sorted.length / 2
-  sorted.length.odd? ? sorted[mid] : ((sorted[mid - 1] + sorted[mid]) / 2.0).round(3)
+  NativeIndexingProfile.median(values)
 end
 
 def validate_pui_records_per_thread(raw)
@@ -220,8 +403,13 @@ if __FILE__ == $PROGRAM_NAME
 
       puts "\n[repeat #{repeat + 1}/#{REPEATS}] #{mode.upcase} full index round into #{core} ..."
       audit_this_pass = PUI_FETCH_AUDIT && mode == 'pui'
+
+      proc_mem_before = NativeIndexingProfile.read_proc_status
+      solr_heap_before = NativeIndexingProfile.fetch_solr_jvm_heap(SOLR_BASE)
+
       ArchivalistRubySideTiming.start! if TIMERS
       ArchivalistPuiFetchAudit.start! if audit_this_pass
+      cpu_start = Process.times
       started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       pui_fetch_audit_summary = nil
       begin
@@ -231,10 +419,28 @@ if __FILE__ == $PROGRAM_NAME
         raw = ArchivalistRubySideTiming.stop! if TIMERS
       end
       wall_ms = ((Process.clock_gettime(Process::CLOCK_MONOTONIC) - started) * 1000.0).round(2)
+      cpu_end = Process.times
+      cpu_delta = NativeIndexingProfile.compute_cpu_delta(cpu_start, cpu_end)
+
+      proc_mem_after = NativeIndexingProfile.read_proc_status
+      solr_heap_after = NativeIndexingProfile.fetch_solr_jvm_heap(SOLR_BASE)
+
       doc_count = stage_doc_count(core)
       summary = TIMERS ? ArchivalistRubySideTiming.summarize(raw, wall_ms) : nil
 
-      puts "  wall #{wall_ms} ms, #{doc_count} Solr documents"
+      puts "  wall #{wall_ms} ms, CPU user #{cpu_delta['cpu_user_ms'] || 'null'} ms, system #{cpu_delta['cpu_system_ms'] || 'null'} ms, #{doc_count} Solr documents"
+      if proc_mem_after['vm_rss_kib'] || proc_mem_after['vm_hwm_kib']
+        puts "    process memory (KiB): VmRSS before=#{proc_mem_before['vm_rss_kib'].inspect}, after=#{proc_mem_after['vm_rss_kib'].inspect} | " \
+             "VmHWM after=#{proc_mem_after['vm_hwm_kib'].inspect} (process-lifetime high)"
+      elsif proc_mem_before['diagnostic'] || proc_mem_after['diagnostic']
+        puts "    process memory: unavailable (#{proc_mem_after['diagnostic'] || proc_mem_before['diagnostic']})"
+      end
+      if solr_heap_after['used_bytes']
+        puts "    Solr JVM heap (bytes): used before=#{solr_heap_before['used_bytes']}, after=#{solr_heap_after['used_bytes']} | " \
+             "committed=#{solr_heap_after['committed_bytes']} | max=#{solr_heap_after['max_bytes']}"
+      elsif solr_heap_after['diagnostic'] || solr_heap_before['diagnostic']
+        puts "    Solr JVM heap: unavailable (#{solr_heap_after['diagnostic'] || solr_heap_before['diagnostic']})"
+      end
       if summary && summary['worker_threads'].to_i.zero?
         puts '    categories (wall time, single thread):'
         summary['category_ms'].first(12).each { |cat, ms| puts format('      %-30s %10.1f ms', cat, ms) }
@@ -268,8 +474,23 @@ if __FILE__ == $PROGRAM_NAME
                     ov['tree_discovery_only_successful_requested_ids'], ov['union_unique_successful_requested_ids'],
                     ov['tree_discovery_overlap_ratio'])
       end
-      result_row = { 'repeat' => repeat + 1, 'mode' => mode, 'run_id' => run_id, 'core' => core, 'wall_ms' => wall_ms,
-                     'solr_doc_count' => doc_count, 'timing' => summary }
+      res_fields = NativeIndexingProfile.resource_fields(
+        cpu_delta: cpu_delta,
+        proc_mem_before: proc_mem_before,
+        proc_mem_after: proc_mem_after,
+        solr_heap_before: solr_heap_before,
+        solr_heap_after: solr_heap_after
+      )
+      result_row = {
+        'repeat' => repeat + 1,
+        'mode' => mode,
+        'run_id' => run_id,
+        'core' => core,
+        'wall_ms' => wall_ms
+      }.merge(res_fields).merge(
+        'solr_doc_count' => doc_count,
+        'timing' => summary
+      )
       if mode == 'pui'
         result_row['pui_records_per_thread'] = indexer.instance_variable_get(:@records_per_thread)
         result_row['pui_tree_batch_size'] = indexer.tree_discovery_batch_size
@@ -284,10 +505,16 @@ if __FILE__ == $PROGRAM_NAME
     rows = results.select { |r| r['mode'] == mode }
     timed = rows.map { |r| r['timing'] }.compact
     audited = rows.map { |r| r['pui_fetch_audit'] }.compact
+    cpu_users = rows.map { |r| r['cpu_user_ms'] }.compact
+    cpu_systems = rows.map { |r| r['cpu_system_ms'] }.compact
     mode_summary = {
       'repeats' => rows.length,
       'wall_ms_raw' => rows.map { |r| r['wall_ms'] },
       'wall_ms_median' => native_profile_median(rows.map { |r| r['wall_ms'] }),
+      'cpu_user_ms_raw' => cpu_users,
+      'cpu_user_ms_median' => cpu_users.empty? ? nil : native_profile_median(cpu_users),
+      'cpu_system_ms_raw' => cpu_systems,
+      'cpu_system_ms_median' => cpu_systems.empty? ? nil : native_profile_median(cpu_systems),
       'solr_doc_counts' => rows.map { |r| r['solr_doc_count'] },
       'timing_median' => timed.empty? ? nil : ArchivalistRubySideTiming.median_summary(timed)
     }
@@ -303,6 +530,8 @@ if __FILE__ == $PROGRAM_NAME
   if PUI_FETCH_AUDIT
     notes << 'pui_fetch_audit is observational accounting of backend archival_objects batch GETs (id_set) only; ID sets and overlap measure IDs requested by successful HTTP 200 calls (without parsing JSON response bodies to verify returned records), and cannot imply safe cache reuse or deduplication across phases because records and ancestor trees may change between ordinary indexing and tree discovery or across checkpoints.'
   end
+  notes << 'process_memory records Linux /proc/self/status VmRSS and VmHWM snapshots in KiB before and after each pass; snapshots are point-in-time and are not continuous samples of peak per-pass RSS. VmHWM is the operating system process-lifetime high-water mark since process startup, not a per-pass peak, so later repeats may inherit earlier highs.'
+  notes << 'solr_jvm_heap records point-in-time snapshots of isolated Solr JVM heap used, committed, and max bytes before and after each pass via the bounded read-only Solr system API; snapshots are not continuous samples of peak heap usage during the indexing round.'
 
   report = {
     'run_id' => first_run_id,

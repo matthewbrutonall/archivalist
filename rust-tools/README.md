@@ -358,6 +358,17 @@ Scripts under `scripts/` are code-only harnesses:
   `PUI_RECORDS_PER_THREAD=<n>` overrides the ordinary PUI batch size during profiler runs
   (sets `AppConfig[:pui_indexer_records_per_thread]`, validated in range 1..200; invalid values fail
   before stack mutation). The report records `pui_records_per_thread` in results and metadata.
+  Always-on low-overhead resource measurements capture CPU, process memory, and Solr heap metrics
+  outside the monotonic wall timing region without altering timing boundaries or measured workload:
+  `cpu_user_ms` and `cpu_system_ms` record `Process.times` user/system CPU deltas across `run_index_round`.
+  `process_memory` captures Linux `/proc/self/status` `VmRSS` and `VmHWM` snapshots in KiB before and
+  after each pass; `VmHWM` represents the process-lifetime high-water mark (not a per-pass peak; later
+  repeats inherit earlier highs), and unavailable proc metrics record null with a diagnostic without
+  failing indexing. `solr_jvm_heap` captures isolated Solr JVM heap `used_bytes`, `committed_bytes`,
+  and `max_bytes` before and after each pass via the bounded read-only Solr system API
+  (`/admin/info/system?wt=json`) after stack identity verification, recording null and a sanitized
+  diagnostic on error. All memory snapshots are point-in-time boundary measurements, not continuous
+  samples of peak heap or per-pass RSS.
 - Helpers that query records require the caller to provide test-specific values
   through environment variables such as `RESOURCE_URI` and `QUERY`.
 
