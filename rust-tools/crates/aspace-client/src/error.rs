@@ -12,6 +12,12 @@ pub enum ASpaceError {
     NotAuthenticated,
     #[error("Solr error (HTTP {status}): {message}")]
     Solr { status: u16, message: String },
+    #[error("Batch size exceeded: requested {requested}, maximum allowed {max}")]
+    BatchSizeExceeded { requested: usize, max: usize },
+    #[error("Invalid request: {0}")]
+    InvalidRequest(String),
+    #[error("Hydration validation failed: {0}")]
+    HydrationValidation(String),
 }
 
 pub type Result<T> = std::result::Result<T, ASpaceError>;
