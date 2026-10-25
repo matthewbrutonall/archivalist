@@ -369,6 +369,21 @@ Scripts under `scripts/` are code-only harnesses:
   (`/admin/info/system?wt=json`) after stack identity verification, recording null and a sanitized
   diagnostic on error. All memory snapshots are point-in-time boundary measurements, not continuous
   samples of peak heap or per-pass RSS.
+- `benchmark_native_search_and_tree.py`: Small Gate 1 read-only backend API latency
+  probe against the isolated profiling stack from `profiling_stack.py`. Discloses preflight
+  setup mutation (`verify_identity` writes an isolated challenge nonce to the profiling DB
+  repository record to prove backend connectivity) while all benchmark measurement and
+  discovery requests are strictly read-only HTTP GETs (preceded by an admin login POST).
+  Measures a fixed backend API query set against caller-specified `--repo-id` and `--resource-id`:
+  2 repository searches (wildcard `q=*` and keyword `q=papers`) and 3 resource tree routes
+  (root, waypoint 0, and node URI discovered from root `precomputed_waypoints` or waypoint 0).
+  Because the isolated profiling stack provisions backend, Solr, and database containers but lacks
+  Rails staff and public UI tiers, timings are backend API proxy measurements only (measuring connection,
+  request dispatch, response headers, and full response body transfer via `resp.read()`, excluding client-side
+  JSON decode); user-facing UI routes remain unmeasured. Outputs pure JSON containing stack ID, git commit/dirty provenance,
+  host load, route parameters, raw warmup and repeat durations, p50/p95 percentiles (defaulting to
+  >=20 measured samples), status/blocker details, and response result counts. Network/HTTP errors
+  are captured per route to preserve completed measurements and partial route durations. Offline tests: `test_benchmark_native_search_and_tree.py`.
 - Helpers that query records require the caller to provide test-specific values
   through environment variables such as `RESOURCE_URI` and `QUERY`.
 
