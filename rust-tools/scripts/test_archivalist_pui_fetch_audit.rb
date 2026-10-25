@@ -476,10 +476,11 @@ class TestArchivalistPuiFetchAudit < Minitest::Test
         'STAFF_THREADS' => nil,
         'PUI_THREADS' => nil,
         'PUI_FETCH_AUDIT' => nil,
-        'PUI_TREE_BATCH_SIZE' => nil
+        'PUI_TREE_BATCH_SIZE' => nil,
+        'PUI_RECORDS_PER_THREAD' => nil
       }
 
-      # 1. When PUI_FETCH_AUDIT and PUI_TREE_BATCH_SIZE are unset, docker exec argv must omit them
+      # 1. When PUI_FETCH_AUDIT, PUI_TREE_BATCH_SIZE, and PUI_RECORDS_PER_THREAD are unset, docker exec argv must omit them
       out1, err1, st1 = Open3.capture3(base_env, File.join(scripts_dir, 'run_native_indexing_profile.sh'))
       assert st1.success?, "wrapper failed when unset: stdout=#{out1} stderr=#{err1}"
       argv_unset = JSON.parse(File.read(docker_log))
@@ -488,10 +489,17 @@ class TestArchivalistPuiFetchAudit < Minitest::Test
              "expected PUI_FETCH_AUDIT to be omitted when unset, got: #{argv_unset.inspect}"
       refute argv_unset.any? { |arg| arg.include?('PUI_TREE_BATCH_SIZE') },
              "expected PUI_TREE_BATCH_SIZE to be omitted when unset, got: #{argv_unset.inspect}"
+      refute argv_unset.any? { |arg| arg.include?('PUI_RECORDS_PER_THREAD') },
+             "expected PUI_RECORDS_PER_THREAD to be omitted when unset, got: #{argv_unset.inspect}"
 
-      # 2. When PUI_FETCH_AUDIT=1 and PUI_TREE_BATCH_SIZE=200 are set, docker exec argv must contain them
+      # 2. When PUI_FETCH_AUDIT=1, PUI_TREE_BATCH_SIZE=200, and PUI_RECORDS_PER_THREAD=100 are set, docker exec argv must contain them
       FileUtils.rm_f(docker_log)
-      env_set = base_env.merge('PUI_FETCH_AUDIT' => '1', 'PUI_TREE_BATCH_SIZE' => '200', 'MODES' => 'pui')
+      env_set = base_env.merge(
+        'PUI_FETCH_AUDIT' => '1',
+        'PUI_TREE_BATCH_SIZE' => '200',
+        'PUI_RECORDS_PER_THREAD' => '100',
+        'MODES' => 'pui'
+      )
       out2, err2, st2 = Open3.capture3(env_set, File.join(scripts_dir, 'run_native_indexing_profile.sh'))
       assert st2.success?, "wrapper failed when set: stdout=#{out2} stderr=#{err2}"
       argv_set = JSON.parse(File.read(docker_log))
@@ -499,6 +507,72 @@ class TestArchivalistPuiFetchAudit < Minitest::Test
       refute_nil idx, "expected `-e PUI_FETCH_AUDIT=1` in docker exec argv, got: #{argv_set.inspect}"
       tree_idx = argv_set.each_index.find { |i| argv_set[i] == '-e' && argv_set[i + 1] == 'PUI_TREE_BATCH_SIZE=200' }
       refute_nil tree_idx, "expected `-e PUI_TREE_BATCH_SIZE=200` in docker exec argv, got: #{argv_set.inspect}"
+      rpt_idx = argv_set.each_index.find { |i| argv_set[i] == '-e' && argv_set[i + 1] == 'PUI_RECORDS_PER_THREAD=100' }
+      refute_nil rpt_idx, "expected `-e PUI_RECORDS_PER_THREAD=100` in docker exec argv, got: #{argv_set.inspect}"
     end
+  end
+
+  def test_validate_pui_records_per_thread_accepted_values
+    require_relative 'native_indexing_profile'
+
+    # Integers
+    assert_equal 1, validate_pui_records_per_thread(1)
+    assert_equal 25, validate_pui_records_per_thread(25)
+    assert_equal 100, validate_pui_records_per_thread(100)
+    assert_equal 200, validate_pui_records_per_thread(200)
+
+    # Valid numeric strings
+    assert_equal 1, validate_pui_records_per_thread('1')
+    assert_equal 25, validate_pui_records_per_thread('25')
+    assert_equal 100, validate_pui_records_per_thread('100')
+    assert_equal 200, validate_pui_records_per_thread('200')
+    assert_equal 50, validate_pui_records_per_thread('  50  ')
+  end
+
+  def test_validate_pui_records_per_thread_default_values
+    require_relative 'native_indexing_profile'
+
+    assert_nil validate_pui_records_per_thread(nil)
+    assert_nil validate_pui_records_per_thread('')
+    assert_nil validate_pui_records_per_thread('   ')
+  end
+
+  def test_validate_pui_records_per_thread_rejected_values
+    require_relative 'native_indexing_profile'
+
+    # Below range (1..200)
+    assert_raises(ArgumentError) { validate_pui_records_per_thread(0) }
+    assert_raises(ArgumentError) { validate_pui_records_per_thread('0') }
+    assert_raises(ArgumentError) { validate_pui_records_per_thread(-1) }
+    assert_raises(ArgumentError) { validate_pui_records_per_thread('-1') }
+
+    # Above range (1..200)
+    assert_raises(ArgumentError) { validate_pui_records_per_thread(201) }
+    assert_raises(ArgumentError) { validate_pui_records_per_thread('201') }
+    assert_raises(ArgumentError) { validate_pui_records_per_thread(500) }
+    assert_raises(ArgumentError) { validate_pui_records_per_thread('500') }
+
+    # Non-integers / invalid formatting
+    assert_raises(ArgumentError) { validate_pui_records_per_thread('abc') }
+    assert_raises(ArgumentError) { validate_pui_records_per_thread('25.5') }
+    assert_raises(ArgumentError) { validate_pui_records_per_thread(25.5) }
+    assert_raises(ArgumentError) { validate_pui_records_per_thread('100 trailing') }
+    assert_raises(ArgumentError) { validate_pui_records_per_thread(true) }
+    assert_raises(ArgumentError) { validate_pui_records_per_thread([100]) }
+  end
+
+  def test_native_indexing_profile_fails_before_stack_mutation_on_invalid_pui_records_per_thread
+    scripts_dir = File.expand_path('../scripts', __dir__)
+    profile_script = File.join(scripts_dir, 'native_indexing_profile.rb')
+
+    # Execute directly with invalid PUI_RECORDS_PER_THREAD
+    env = {
+      'PUI_RECORDS_PER_THREAD' => '999',
+      'SOLR_BASE_URL' => 'http://solr:8983/solr',
+      'BACKEND_URL' => 'http://localhost:4567'
+    }
+    out, err, st = Open3.capture3(env, 'ruby', profile_script)
+    refute st.success?, "expected failure on invalid PUI_RECORDS_PER_THREAD, got success: stdout=#{out} stderr=#{err}"
+    assert_match(/PUI_RECORDS_PER_THREAD must be between 1 and 200 \(got 999\)/, err)
   end
 end

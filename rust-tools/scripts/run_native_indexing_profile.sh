@@ -12,6 +12,7 @@
 # overridden. Options forwarded: REPEATS (default 1), MODES (staff,pui), TIMERS (1 = category
 # timers, 0 = wall time only), STAFF_THREADS, PUI_THREADS, PUI_FETCH_AUDIT (1 = PUI archival_object
 # fetch audit, default off), PUI_TREE_BATCH_SIZE (tree-discovery batch size override, clamped 1..200,
+# default unchanged), PUI_RECORDS_PER_THREAD (ordinary PUI records-per-thread override, 1..200,
 # default unchanged). APP_CONTAINER defaults to archivesspaceai-app-1.
 # Usage: STACK_STATE=rust-tools/benchmarks/profiling_stack_<id>.json [REPEATS=3] [PUI_FETCH_AUDIT=1] \
 #          rust-tools/scripts/run_native_indexing_profile.sh
@@ -47,7 +48,7 @@ printf '{\n  "git_commit": "%s",\n  "git_dirty": "%s",\n  "stack_state": "%s"\n}
 
 CONTAINER_JAVA_OPTS="$(docker exec "$APP_CONTAINER" printenv JAVA_OPTS)"
 OPT_ENV=()
-for var in REPEATS MODES TIMERS STAFF_THREADS PUI_THREADS PUI_FETCH_AUDIT PUI_TREE_BATCH_SIZE; do
+for var in REPEATS MODES TIMERS STAFF_THREADS PUI_THREADS PUI_FETCH_AUDIT PUI_TREE_BATCH_SIZE PUI_RECORDS_PER_THREAD; do
   [ -n "${!var:-}" ] && OPT_ENV+=(-e "$var=${!var}")
 done
 docker exec "${STACK_ARGS[@]}" "${OPT_ENV[@]}" -e JAVA_OPTS="$CONTAINER_JAVA_OPTS -Xss${PROFILE_XSS:-16m}" \

@@ -26,6 +26,7 @@
 #   TIMERS          1 (default) attributes categories; 0 measures wall time only (overhead check)
 #   PUI_FETCH_AUDIT 1 (opt-in; default off) accounts for PUI archival_objects batch GETs & overlap
 #   PUI_TREE_BATCH_SIZE override PUI tree-discovery batch size (clamped 1..200; default unchanged)
+#   PUI_RECORDS_PER_THREAD override PUI records per thread (range 1..200; default unchanged)
 #   STAFF_THREADS / PUI_THREADS  override indexer_thread_count / pui_indexer_thread_count
 #
 # With more than one indexer thread the category times are summed across threads and can
@@ -66,11 +67,31 @@ def native_profile_median(values)
   sorted.length.odd? ? sorted[mid] : ((sorted[mid - 1] + sorted[mid]) / 2.0).round(3)
 end
 
+def validate_pui_records_per_thread(raw)
+  return nil if raw.nil? || (raw.respond_to?(:to_str) && raw.to_str.strip.empty?)
+
+  val = if raw.is_a?(Integer)
+          raw
+        elsif raw.is_a?(String) && raw.strip =~ /\A[+-]?\d+\z/
+          Integer(raw.strip, 10)
+        else
+          raise ArgumentError, "PUI_RECORDS_PER_THREAD must be an integer in 1..200 (got #{raw.inspect})"
+        end
+
+  unless val.between?(1, 200)
+    raise ArgumentError, "PUI_RECORDS_PER_THREAD must be between 1 and 200 (got #{val})"
+  end
+
+  val
+end
+
 if __FILE__ == $PROGRAM_NAME
   SOLR_BASE = ENV['SOLR_BASE_URL'] || 'http://solr:8983/solr'
   BACKEND_BASE = ENV['BACKEND_URL'] || 'http://localhost:4567'
   raise "Safety violation: Invalid or unapproved backend URL '#{BACKEND_BASE}'" unless ArchivalistHarnessSafety.valid_backend_url?(BACKEND_BASE)
   raise "Safety violation: Invalid or unapproved Solr URL '#{SOLR_BASE}'" unless ArchivalistHarnessSafety.valid_solr_url?(SOLR_BASE)
+
+  PUI_RECORDS_PER_THREAD_OVERRIDE = validate_pui_records_per_thread(ENV['PUI_RECORDS_PER_THREAD'])
 
   # Database/Solr identity of the disposable profiling stack, before any write or login.
   STACK_IDENTITY = ArchivalistProfilingStack.verify!(env: ENV, backend_url: BACKEND_BASE, solr_url: SOLR_BASE)
@@ -96,6 +117,9 @@ if __FILE__ == $PROGRAM_NAME
   AppConfig[:search_user_secret] = ENV['SEARCH_USER_SECRET'] || 'devserver'
   AppConfig[:indexer_thread_count] = Integer(ENV['STAFF_THREADS']) if ENV['STAFF_THREADS']
   AppConfig[:pui_indexer_thread_count] = Integer(ENV['PUI_THREADS']) if ENV['PUI_THREADS']
+  if PUI_RECORDS_PER_THREAD_OVERRIDE
+    AppConfig[:pui_indexer_records_per_thread] = PUI_RECORDS_PER_THREAD_OVERRIDE
+  end
   if ENV['PUI_TREE_BATCH_SIZE'] && !ENV['PUI_TREE_BATCH_SIZE'].empty?
     AppConfig[:pui_tree_discovery_batch_size] = ENV['PUI_TREE_BATCH_SIZE']
   end
@@ -247,6 +271,7 @@ if __FILE__ == $PROGRAM_NAME
       result_row = { 'repeat' => repeat + 1, 'mode' => mode, 'run_id' => run_id, 'core' => core, 'wall_ms' => wall_ms,
                      'solr_doc_count' => doc_count, 'timing' => summary }
       if mode == 'pui'
+        result_row['pui_records_per_thread'] = indexer.instance_variable_get(:@records_per_thread)
         result_row['pui_tree_batch_size'] = indexer.tree_discovery_batch_size
         result_row['pui_tree_discovery_batch_size'] = indexer.tree_discovery_batch_size
       end
@@ -288,6 +313,7 @@ if __FILE__ == $PROGRAM_NAME
     'profiling_stack' => STACK_IDENTITY,
     'timers' => TIMERS,
     'pui_fetch_audit' => PUI_FETCH_AUDIT,
+    'pui_records_per_thread' => AppConfig[:pui_indexer_records_per_thread],
     'pui_tree_batch_size' => effective_pui_tree_batch_size,
     'pui_tree_discovery_batch_size' => effective_pui_tree_batch_size,
     'threads' => { 'staff' => [AppConfig[:indexer_thread_count], AppConfig[:indexer_records_per_thread]],
