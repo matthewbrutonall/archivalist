@@ -772,7 +772,11 @@ def main():
         fix_proposals = []
         if "title_sort" in top_diff_paths:
             fix_proposals.append(
-                "Add `title_sort` calculation for `archival_object` in `add_type_specific_fields` / `add_enriched_fields` in `index_document.rs` using `ruby_clean_for_sort(display_string)`."
+                "Add `title_sort` calculation for `archival_object` in `add_type_specific_fields` in `index_document.rs` using `ruby_clean_for_sort(display_string)`."
+            )
+        if "years" in top_diff_paths:
+            fix_proposals.append(
+                "In Rust `add_dates` (`index_document.rs`), insert `years: Value::Array(vec![])` when `record.get('dates')` is present but empty/unparseable, matching native Ruby `doc['years'] = []` initialization."
             )
         if any("fullrecord" in p for p in top_diff_paths):
             fix_proposals.append(
