@@ -674,6 +674,7 @@ def main():
     print("Capturing native pre-Solr documents via JRuby...", flush=True)
     native_cmd = [
         "docker", "exec",
+        "-u", f"{os.getuid()}:{os.getgid()}",
         "-e", "GEM_HOME=/archivesspace/build/gems/jruby/3.1.0",
         "-e", "GEM_PATH=/archivesspace/build/gems/jruby/3.1.0",
         "-w", "/archivesspace",
