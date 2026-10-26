@@ -772,7 +772,7 @@ def main():
         fix_proposals = []
         if "title_sort" in top_diff_paths:
             fix_proposals.append(
-                "Add `title_sort` calculation for `archival_object` in `add_type_specific_fields` in `index_document.rs` using `ruby_clean_for_sort(display_string)`."
+                "Align `title_sort` calculation in `index_document.rs` to match `indexer_common.rb` (clean_for_sort of finding_aid_filing_title or title, preserving precedence)."
             )
         if "years" in top_diff_paths:
             fix_proposals.append(
