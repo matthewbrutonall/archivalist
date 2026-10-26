@@ -18,6 +18,8 @@ pub enum ASpaceError {
     InvalidRequest(String),
     #[error("Hydration validation failed: {0}")]
     HydrationValidation(String),
+    #[error("Isolated Solr writer error: {0}")]
+    IsolatedSolrWriter(String),
 }
 
 pub type Result<T> = std::result::Result<T, ASpaceError>;

@@ -5,7 +5,10 @@ and accelerating selected archival-management operations.
 
 ## Components
 
-- `aspace-client`: typed HTTP client, validation models, and shadow-index query support.
+- `aspace-client`: typed HTTP client, validation models, shadow-index query support, and
+  `isolated_solr_writer` (bounded isolated Solr STAFF AO writer library infrastructure for
+  disposable benchmark candidate stage cores; defense-in-depth only, requiring caller harness
+  verification of stack state, Docker labels, and candidate core ownership; not connected to production indexer flags).
   Provides `archival_object_ids_modified_since(repo_id, Option<u64>)` for wire-contract
   alignment with native indexer discovery (`all_ids=true`, `modified_since=0`).
 - `aspace-cli`: command-line validation, performance probes, shadow-index utilities,
