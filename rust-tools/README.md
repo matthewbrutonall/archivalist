@@ -11,6 +11,12 @@ and accelerating selected archival-management operations.
   verification of stack state, Docker labels, and candidate core ownership; not connected to production indexer flags).
   Provides `archival_object_ids_modified_since(repo_id, Option<u64>)` for wire-contract
   alignment with native indexer discovery (`all_ids=true`, `modified_since=0`).
+  Provides `Client::dynamic_enum_fields_from_schemas()` for dynamic enum field discovery via
+  backend `GET /schemas` (the authoritative source), deriving fields via breadth-first queue extraction
+  matching Ruby `IndexerCommon#enum_fields`. The enum list serves as an explicit one-time control input
+  for candidate runs without mutating index builder defaults or sidecar semantics; this discovery helper
+  makes no claim of parity across arbitrary unvalidated schemas or production indexer environments
+  (failing closed on malformed schema shapes).
 - `aspace-cli`: command-line validation, performance probes, shadow-index utilities,
   and the `aspace-shadow-sidecar` binary.
 

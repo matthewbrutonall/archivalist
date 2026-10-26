@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::error::{ASpaceError, Result};
 use crate::models::{ArchivalObject, Repository, Resource};
+use crate::schema_enums::extract_dynamic_enum_fields_from_schemas;
 
 pub const DEFAULT_STAFF_BATCH_SIZE: usize = 25;
 pub const DEFAULT_STAFF_ARCHIVAL_OBJECT_BATCH_SIZE: usize = DEFAULT_STAFF_BATCH_SIZE;
@@ -399,6 +400,24 @@ impl Client {
         }
 
         Ok(records)
+    }
+
+    /// Fetches all schemas from ArchivesSpace backend `GET /schemas` and derives dynamic enum field
+    /// names via breadth-first traversal matching Ruby `IndexerCommon#enum_fields`.
+    ///
+    /// Requires an authenticated session (`X-ArchivesSpace-Session` header).
+    /// Returns the deduplicated field names in first-seen schema order.
+    pub async fn dynamic_enum_fields_from_schemas(&self) -> Result<Vec<String>> {
+        let res = self.get("schemas")?.send().await?;
+        let status = res.status();
+        if !status.is_success() {
+            return Err(ASpaceError::Api {
+                status: status.as_u16(),
+                message: format!("HTTP status {}", status),
+            });
+        }
+        let schemas_val: serde_json::Value = res.json().await?;
+        extract_dynamic_enum_fields_from_schemas(&schemas_val)
     }
 }
 
@@ -1280,5 +1299,456 @@ mod tests {
             ASpaceError::NotAuthenticated => (),
             _ => panic!("Expected NotAuthenticated error, got: {:?}", err_unauthed),
         }
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_enum_fields_unauthenticated_short_circuit() {
+        let client = Client::new("http://dummy");
+        let err = client.dynamic_enum_fields_from_schemas().await.unwrap_err();
+        match err {
+            ASpaceError::NotAuthenticated => (),
+            _ => panic!("Expected NotAuthenticated error, got: {:?}", err),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_enum_fields_http_error() {
+        let mut server = Server::new_async().await;
+        let sentinel_secret = "SENTINEL_PRIVATE_BACKEND_SCHEMA_SECRET_DO_NOT_LEAK_XYZ789";
+
+        let _mock = server
+            .mock("GET", "/schemas")
+            .match_header("X-ArchivesSpace-Session", "token123")
+            .with_status(500)
+            .with_body(sentinel_secret)
+            .create_async()
+            .await;
+
+        let mut client = Client::new(server.url());
+        client.session_token = Some("token123".to_string());
+
+        let err = client.dynamic_enum_fields_from_schemas().await.unwrap_err();
+        match &err {
+            ASpaceError::Api { status, message } => {
+                assert_eq!(*status, 500);
+                assert_eq!(message, "HTTP status 500 Internal Server Error");
+                assert!(!message.contains(sentinel_secret));
+            }
+            _ => panic!("Expected Api error, got: {:?}", err),
+        }
+
+        let display_repr = format!("{}", err);
+        let debug_repr = format!("{:?}", err);
+        assert!(
+            !display_repr.contains(sentinel_secret),
+            "Sentinel private content leaked in Display: {}",
+            display_repr
+        );
+        assert!(
+            !debug_repr.contains(sentinel_secret),
+            "Sentinel private content leaked in Debug: {}",
+            debug_repr
+        );
+        assert!(display_repr.contains("500"));
+        assert!(debug_repr.contains("500"));
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_enum_fields_malformed_top_level_shape() {
+        let mut server = Server::new_async().await;
+
+        let _mock = server
+            .mock("GET", "/schemas")
+            .match_header("X-ArchivesSpace-Session", "token123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("[1, 2, 3]")
+            .create_async()
+            .await;
+
+        let mut client = Client::new(server.url());
+        client.session_token = Some("token123".to_string());
+
+        let err = client.dynamic_enum_fields_from_schemas().await.unwrap_err();
+        match err {
+            ASpaceError::InvalidRequest(msg) => {
+                assert!(msg.contains("Top-level /schemas response must be a JSON object"));
+            }
+            _ => panic!("Expected InvalidRequest error, got: {:?}", err),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_enum_fields_malformed_model_shape() {
+        let mut server = Server::new_async().await;
+
+        let _mock = server
+            .mock("GET", "/schemas")
+            .match_header("X-ArchivesSpace-Session", "token123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"bad_model": "not an object"}"#)
+            .create_async()
+            .await;
+
+        let mut client = Client::new(server.url());
+        client.session_token = Some("token123".to_string());
+
+        let err = client.dynamic_enum_fields_from_schemas().await.unwrap_err();
+        match err {
+            ASpaceError::InvalidRequest(msg) => {
+                assert!(msg.contains("Model schema for 'bad_model' is not a JSON object"));
+            }
+            _ => panic!("Expected InvalidRequest error, got: {:?}", err),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_enum_fields_malformed_properties_shape() {
+        let mut server = Server::new_async().await;
+
+        let _mock_string = server
+            .mock("GET", "/schemas")
+            .match_header("X-ArchivesSpace-Session", "token123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"model_a": {"properties": "invalid_string"}}"#)
+            .create_async()
+            .await;
+
+        let mut client = Client::new(server.url());
+        client.session_token = Some("token123".to_string());
+
+        let err = client.dynamic_enum_fields_from_schemas().await.unwrap_err();
+        match err {
+            ASpaceError::InvalidRequest(msg) => {
+                assert!(msg.contains(
+                    "Model schema for 'model_a' has malformed 'properties' field (expected object)"
+                ));
+            }
+            _ => panic!("Expected InvalidRequest error, got: {:?}", err),
+        }
+
+        // Also test array properties
+        let mut server2 = Server::new_async().await;
+        let _mock_arr = server2
+            .mock("GET", "/schemas")
+            .match_header("X-ArchivesSpace-Session", "token123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"model_b": {"properties": [1, 2, 3]}}"#)
+            .create_async()
+            .await;
+
+        let mut client2 = Client::new(server2.url());
+        client2.session_token = Some("token123".to_string());
+
+        let err2 = client2
+            .dynamic_enum_fields_from_schemas()
+            .await
+            .unwrap_err();
+        match err2 {
+            ASpaceError::InvalidRequest(msg) => {
+                assert!(msg.contains(
+                    "Model schema for 'model_b' has malformed 'properties' field (expected object)"
+                ));
+            }
+            _ => panic!("Expected InvalidRequest error, got: {:?}", err2),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_enum_fields_malformed_items_shape() {
+        let mut server = Server::new_async().await;
+
+        let body = r#"{
+            "model_with_bad_items": {
+                "properties": {
+                    "bad_array": {
+                        "type": "array",
+                        "items": "malformed_string_not_object"
+                    }
+                }
+            }
+        }"#;
+
+        let _mock = server
+            .mock("GET", "/schemas")
+            .match_header("X-ArchivesSpace-Session", "token123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let mut client = Client::new(server.url());
+        client.session_token = Some("token123".to_string());
+
+        let err = client.dynamic_enum_fields_from_schemas().await.unwrap_err();
+        match err {
+            ASpaceError::InvalidRequest(msg) => {
+                assert!(msg.contains(
+                    "Property 'bad_array' has malformed 'items' field (expected object)"
+                ));
+            }
+            _ => panic!("Expected InvalidRequest error, got: {:?}", err),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_enum_fields_short_circuit_malformed_items() {
+        let mut server = Server::new_async().await;
+
+        let body = r#"{
+            "model_short_circuit": {
+                "properties": {
+                    "field_valid_enum_malformed_items": {
+                        "type": "string",
+                        "dynamic_enum": "valid",
+                        "items": "malformed"
+                    }
+                }
+            }
+        }"#;
+
+        let _mock = server
+            .mock("GET", "/schemas")
+            .match_header("X-ArchivesSpace-Session", "token123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let mut client = Client::new(server.url());
+        client.session_token = Some("token123".to_string());
+
+        let fields = client.dynamic_enum_fields_from_schemas().await.unwrap();
+        assert_eq!(fields, vec!["field_valid_enum_malformed_items"]);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_enum_fields_empty_models() {
+        let mut server = Server::new_async().await;
+
+        let body = r#"{
+            "empty1": {},
+            "empty2": {"type": "object"},
+            "empty3": {"properties": {}},
+            "empty4": {"properties": null}
+        }"#;
+
+        let _mock = server
+            .mock("GET", "/schemas")
+            .match_header("X-ArchivesSpace-Session", "token123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let mut client = Client::new(server.url());
+        client.session_token = Some("token123".to_string());
+
+        let fields = client.dynamic_enum_fields_from_schemas().await.unwrap();
+        assert!(fields.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_enum_fields_nested_schemas() {
+        let mut server = Server::new_async().await;
+
+        let body = r#"{
+            "archival_object": {
+                "type": "object",
+                "properties": {
+                    "level": { "type": "string", "dynamic_enum": "archival_record_level" },
+                    "dates": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "date_label": { "type": "string", "dynamic_enum": "date_label" },
+                                "date_type": { "type": "string", "dynamic_enum": "date_type" }
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+
+        let _mock = server
+            .mock("GET", "/schemas")
+            .match_header("X-ArchivesSpace-Session", "token123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let mut client = Client::new(server.url());
+        client.session_token = Some("token123".to_string());
+
+        let fields = client.dynamic_enum_fields_from_schemas().await.unwrap();
+        assert_eq!(fields, vec!["level", "date_label", "date_type"]);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_enum_fields_array_items() {
+        let mut server = Server::new_async().await;
+
+        let body = r#"{
+            "rights_statement": {
+                "properties": {
+                    "local_access_restriction_type": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "dynamic_enum": "restriction_type"
+                        }
+                    }
+                }
+            }
+        }"#;
+
+        let _mock = server
+            .mock("GET", "/schemas")
+            .match_header("X-ArchivesSpace-Session", "token123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let mut client = Client::new(server.url());
+        client.session_token = Some("token123".to_string());
+
+        let fields = client.dynamic_enum_fields_from_schemas().await.unwrap();
+        assert_eq!(fields, vec!["local_access_restriction_type"]);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_enum_fields_ruby_truthiness_edge() {
+        let mut server = Server::new_async().await;
+
+        let body = r#"{
+            "truthiness_model": {
+                "properties": {
+                    "f_false": { "type": "string", "dynamic_enum": false },
+                    "f_null": { "type": "string", "dynamic_enum": null },
+                    "f_true": { "type": "string", "dynamic_enum": true },
+                    "f_zero": { "type": "string", "dynamic_enum": 0 },
+                    "f_empty_str": { "type": "string", "dynamic_enum": "" },
+                    "f_str": { "type": "string", "dynamic_enum": "valid_enum" },
+                    "f_empty_arr": { "type": "string", "dynamic_enum": [] },
+                    "f_empty_obj": { "type": "string", "dynamic_enum": {} },
+                    "arr_items_false": { "type": "array", "items": { "dynamic_enum": false } },
+                    "arr_items_null": { "type": "array", "items": { "dynamic_enum": null } },
+                    "arr_items_truthy": { "type": "array", "items": { "dynamic_enum": "items_enum" } }
+                }
+            }
+        }"#;
+
+        let _mock = server
+            .mock("GET", "/schemas")
+            .match_header("X-ArchivesSpace-Session", "token123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let mut client = Client::new(server.url());
+        client.session_token = Some("token123".to_string());
+
+        let fields = client.dynamic_enum_fields_from_schemas().await.unwrap();
+        assert_eq!(
+            fields,
+            vec![
+                "f_true",
+                "f_zero",
+                "f_empty_str",
+                "f_str",
+                "f_empty_arr",
+                "f_empty_obj",
+                "arr_items_truthy"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_enum_fields_items_exclusion() {
+        let mut server = Server::new_async().await;
+
+        let body = r#"{
+            "model_with_items": {
+                "properties": {
+                    "some_array": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "dynamic_enum": "array_enum"
+                        }
+                    },
+                    "items": {
+                        "type": "string",
+                        "dynamic_enum": "creeps_in"
+                    }
+                }
+            }
+        }"#;
+
+        let _mock = server
+            .mock("GET", "/schemas")
+            .match_header("X-ArchivesSpace-Session", "token123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let mut client = Client::new(server.url());
+        client.session_token = Some("token123".to_string());
+
+        let fields = client.dynamic_enum_fields_from_schemas().await.unwrap();
+        assert_eq!(fields, vec!["some_array"]);
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_enum_fields_ordering_and_repeated_fields() {
+        let mut server = Server::new_async().await;
+
+        let body = r#"{
+            "model_z": {
+                "properties": {
+                    "z_field": { "dynamic_enum": "z_enum" },
+                    "a_field": { "dynamic_enum": "a_enum" }
+                }
+            },
+            "model_a": {
+                "properties": {
+                    "m_field": { "dynamic_enum": "m_enum" },
+                    "z_field": { "dynamic_enum": "z_enum" }
+                }
+            }
+        }"#;
+
+        let _mock = server
+            .mock("GET", "/schemas")
+            .match_header("X-ArchivesSpace-Session", "token123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create_async()
+            .await;
+
+        let mut client = Client::new(server.url());
+        client.session_token = Some("token123".to_string());
+
+        let fields = client.dynamic_enum_fields_from_schemas().await.unwrap();
+        // First-seen order: "z_field", "a_field", "m_field"
+        // NOT sorted alphabetically ("a_field", "m_field", "z_field")
+        // Repeated "z_field" deduplicated
+        assert_eq!(fields, vec!["z_field", "a_field", "m_field"]);
     }
 }
