@@ -348,8 +348,7 @@ def run_failure_injection_fallback_harness():
         + urllib.parse.urlencode({
             "action": "CREATE",
             "name": cand_core,
-            "instanceDir": cand_instance_dir,
-            "configSet": state["configset_name"],
+            "configSet": "archivesspace",
             "wt": "json",
         })
     )
