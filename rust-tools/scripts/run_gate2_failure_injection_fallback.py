@@ -548,7 +548,10 @@ def run_failure_injection_fallback_harness():
     fallback_env["STAGE_ROLE"] = "fallback"
 
     # Record pre-existing reports before invoking fallback script to detect unique newly generated artifact
-    pre_existing_reports = set(glob.glob(os.path.join(BENCHMARKS_DIR, "native_ao_profile_*.json")))
+    pre_existing_reports = set(
+        p for p in glob.glob(os.path.join(BENCHMARKS_DIR, "native_ao_profile_*.json"))
+        if not p.endswith(".build.json")
+    )
 
     pre_fb_metrics = snapshot_system_metrics(solr_host_url)
     t_fb_start = time.perf_counter()
@@ -595,13 +598,20 @@ def run_failure_injection_fallback_harness():
                     if line_s.startswith("Report:"):
                         cand_path = line_s.split("Report:", 1)[1].strip()
                         if cand_path:
-                            parsed_report_path = os.path.abspath(cand_path)
+                            # Note: wrapper runs inside container where path is /archivesspace/rust-tools/benchmarks/...
+                            # Map to host path under BENCHMARKS_DIR
+                            parsed_report_path = os.path.abspath(
+                                os.path.join(BENCHMARKS_DIR, os.path.basename(cand_path))
+                            )
                             break
         except Exception as e:
             print(f"Warning: could not read wrapper stdout file {wrapper_stdout_file}: {e}", file=sys.stderr)
 
-    # 2. Compare before/after manifest
-    current_reports = set(glob.glob(os.path.join(BENCHMARKS_DIR, "native_ao_profile_*.json")))
+    # 2. Compare before/after manifest, excluding wrapper build metadata (*.build.json)
+    current_reports = set(
+        p for p in glob.glob(os.path.join(BENCHMARKS_DIR, "native_ao_profile_*.json"))
+        if not p.endswith(".build.json")
+    )
     new_reports = current_reports - pre_existing_reports
     new_reports_in_window = [
         p for p in new_reports

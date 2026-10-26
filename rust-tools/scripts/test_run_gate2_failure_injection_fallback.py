@@ -149,6 +149,15 @@ class TestRunGate2FailureInjectionFallback(unittest.TestCase):
         valid_core = "stage_staff_20261026_181421_60310_397ad107_fallback"
         self.assertTrue(valid_core.endswith("_fallback"))
 
+    def test_build_metadata_excluded_from_reports(self):
+        candidates = [
+            "/path/to/native_ao_profile_20261026_182729_60427_3c5c6fc3.json",
+            "/path/to/native_ao_profile_run_20261026_182723.build.json",
+        ]
+        filtered = [p for p in candidates if not p.endswith(".build.json")]
+        self.assertEqual(len(filtered), 1)
+        self.assertTrue(filtered[0].endswith("_3c5c6fc3.json"))
+
 
 if __name__ == "__main__":
     unittest.main()
