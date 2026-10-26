@@ -702,7 +702,7 @@ def main():
     rust_cmd = [
         release_bin,
         "--url", backend_host_url,
-        "--username", state["admin_user"],
+        "--user", state["admin_user"],
         "--password", state["admin_password"],
         "staff-ao-builder",
         "--repo-id", str(args.repo_id),
