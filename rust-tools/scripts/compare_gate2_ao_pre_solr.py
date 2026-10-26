@@ -817,6 +817,11 @@ def main():
             raise RuntimeError(f"Expected {EXPECTED_AO_COUNT} IDs, got {len(all_ids)}")
 
         full_ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+        ids_full_rel = f"rust-tools/benchmarks/ao_ids_24200_{full_ts}.json"
+        ids_full_host = os.path.join(REPO_ROOT, ids_full_rel)
+        ids_full_container = f"/archivesspace/{ids_full_rel}"
+        write_file_mode_0600(ids_full_host, json.dumps(all_ids))
+
         native_full_rel = f"rust-tools/benchmarks/native_pre_solr_full_{full_ts}.json"
         native_full_host = os.path.join(REPO_ROOT, native_full_rel)
         native_full_container = f"/archivesspace/{native_full_rel}"
@@ -834,7 +839,7 @@ def main():
             "/archivesspace/scripts/jruby",
             "/archivesspace/rust-tools/scripts/capture_native_pre_solr_ao.rb",
             "--repo-id", str(args.repo_id),
-            "--all",
+            "--ids-file", ids_full_container,
             "--batch-size", "25",
             "--backend-url", state["backend_network_url"],
             "--session", session_token,

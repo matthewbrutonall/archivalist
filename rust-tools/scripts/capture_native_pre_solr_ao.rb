@@ -37,6 +37,8 @@ require 'json'
 require 'net/http'
 require 'optparse'
 
+include JSONModel
+
 options = {
   :repo_id => 4,
   :batch_size => 25,
