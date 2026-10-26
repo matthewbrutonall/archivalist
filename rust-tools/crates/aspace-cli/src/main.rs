@@ -10,6 +10,7 @@ use serde::Serialize;
 use std::{collections::BTreeMap, io};
 
 pub mod shadow;
+pub mod staff_ao_builder;
 pub mod staff_ao_probe;
 
 #[derive(Serialize)]
@@ -308,6 +309,10 @@ enum Commands {
     },
     #[command(name = "staff-ao-probe", alias = "staff-ao-hydration-probe")]
     StaffAoProbe(staff_ao_probe::StaffAoProbeArgs),
+    #[command(name = "staff-ao-builder")]
+    StaffAoBuilder(staff_ao_builder::StaffAoBuilderArgs),
+    #[command(name = "build-index-document")]
+    BuildIndexDocument(staff_ao_builder::BuildIndexDocumentArgs),
 }
 
 #[derive(Subcommand)]
@@ -745,6 +750,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    if let Commands::BuildIndexDocument(args) = &cli.command {
+        staff_ao_builder::run_build_index_document(args)?;
+        return Ok(());
+    }
+
     let mut client = Client::new(cli.url.clone());
 
     let auth_start = std::time::Instant::now();
@@ -1136,6 +1146,12 @@ async fn main() -> Result<()> {
         }
         Commands::StaffAoProbe(args) => {
             staff_ao_probe::run_staff_ao_probe(&client, args.clone()).await?;
+        }
+        Commands::BuildIndexDocument(_) => {
+            unreachable!("build-index-document returns before API login")
+        }
+        Commands::StaffAoBuilder(args) => {
+            staff_ao_builder::run_staff_ao_builder(&client, args.clone()).await?;
         }
         Commands::Validate { target } => match target {
             ValidateTarget::Repositories => {
@@ -2118,6 +2134,46 @@ mod tests {
                 assert!(args.validate().is_ok());
             }
             _ => panic!("Expected PerfTarget::StaffAoProbe"),
+        }
+
+        let cli_builder = Cli::try_parse_from([
+            "aspace",
+            "staff-ao-builder",
+            "--repo",
+            "4",
+            "--ids",
+            "1221,2229",
+            "--arks-enabled",
+        ])
+        .unwrap();
+        match cli_builder.command {
+            Commands::StaffAoBuilder(args) => {
+                assert_eq!(args.repo, 4);
+                assert_eq!(args.ids, vec![1221, 2229]);
+                assert!(args.arks_enabled);
+                assert!(args.strip_markers);
+                assert!(args.validate().is_ok());
+            }
+            _ => panic!("Expected Commands::StaffAoBuilder"),
+        }
+
+        let cli_build_doc = Cli::try_parse_from([
+            "aspace",
+            "build-index-document",
+            "--input",
+            "/tmp/test_input.json",
+            "--strip-markers",
+        ])
+        .unwrap();
+        match cli_build_doc.command {
+            Commands::BuildIndexDocument(args) => {
+                assert_eq!(
+                    args.input,
+                    Some(std::path::PathBuf::from("/tmp/test_input.json"))
+                );
+                assert!(args.strip_markers);
+            }
+            _ => panic!("Expected Commands::BuildIndexDocument"),
         }
     }
 
