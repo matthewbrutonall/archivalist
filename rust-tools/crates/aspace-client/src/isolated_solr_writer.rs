@@ -396,6 +396,7 @@ pub struct IsolatedSolrStaffAoWriter {
     doc_buffer: Vec<Value>,
     parent_ids_to_delete: Vec<String>,
     buffered_doc_bytes: usize,
+    update_requests_sent: usize,
     has_error: bool,
     committed: bool,
 }
@@ -443,6 +444,7 @@ impl IsolatedSolrStaffAoWriter {
             doc_buffer: Vec::new(),
             parent_ids_to_delete: Vec::new(),
             buffered_doc_bytes: 0,
+            update_requests_sent: 0,
             has_error: false,
             committed: false,
         })
@@ -516,6 +518,11 @@ impl IsolatedSolrStaffAoWriter {
     /// Returns `true` if the writer has successfully completed and sent a hard commit.
     pub fn is_committed(&self) -> bool {
         self.committed
+    }
+
+    /// Returns the number of successful update POST requests dispatched to Solr.
+    pub fn update_requests_sent(&self) -> usize {
+        self.update_requests_sent
     }
 
     /// The active writer configuration.
@@ -931,7 +938,7 @@ impl IsolatedSolrStaffAoWriter {
     ///
     /// To ensure no private record content is ever logged or leaked in error messages,
     /// returns a fixed generic message containing numeric HTTP and Solr status codes only.
-    async fn post_update(&self, payload_bytes: &[u8]) -> Result<()> {
+    async fn post_update(&mut self, payload_bytes: &[u8]) -> Result<()> {
         let response = match self
             .http
             .post(self.update_url.clone())
@@ -1016,6 +1023,7 @@ impl IsolatedSolrStaffAoWriter {
             });
         }
 
+        self.update_requests_sent += 1;
         Ok(())
     }
 }
@@ -1979,5 +1987,53 @@ mod tests {
 
         let writer = IsolatedSolrStaffAoWriter::new(&base_url, core).unwrap();
         writer.verify_target_core_ready().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_writer_update_requests_sent_and_no_commit_on_error() {
+        let mut server = Server::new_async().await;
+        let base_url = server.url();
+        let core = "stage_staff_20261026_caseupdate_candidate";
+        let update_path = format!("/{}/update", core);
+
+        let update_mock = server
+            .mock("POST", update_path.as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"responseHeader":{"status":0,"QTime":1}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let config = IsolatedSolrWriterConfig {
+            max_doc_count: 2,
+            ..Default::default()
+        };
+        let mut writer = IsolatedSolrStaffAoWriter::with_config(&base_url, core, config).unwrap();
+
+        assert_eq!(writer.update_requests_sent(), 0);
+
+        // Doc 1: buffered
+        writer
+            .add_document(json!({"id": "/repositories/4/archival_objects/1"}))
+            .await
+            .unwrap();
+        assert_eq!(writer.buffered_doc_count(), 1);
+        assert_eq!(writer.update_requests_sent(), 0);
+
+        // Doc 2: reaches max_doc_count=2, triggers automatic flush
+        writer
+            .add_document(json!({"id": "/repositories/4/archival_objects/2"}))
+            .await
+            .unwrap();
+        assert_eq!(writer.buffered_doc_count(), 0);
+        assert_eq!(writer.update_requests_sent(), 1);
+        update_mock.assert_async().await;
+
+        // If writer is in error state, commit() fails closed without sending any commit POST
+        writer.has_error = true;
+        let commit_err = writer.commit().await.unwrap_err();
+        assert!(commit_err.to_string().contains("writer is in error state"));
+        assert!(!writer.is_committed());
     }
 }

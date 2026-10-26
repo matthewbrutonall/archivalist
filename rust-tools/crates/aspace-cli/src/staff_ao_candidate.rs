@@ -153,6 +153,9 @@ pub struct StaffAoCandidateSummary {
     /// (streaming writes occur concurrently with ongoing worker batch fetches);
     /// do NOT sum `solr_write_elapsed_sec` with `batch_loop_wall_elapsed_sec`.
     pub solr_write_elapsed_sec: f64,
+    /// Total number of successful update POST requests dispatched to Solr prior to completion/failure.
+    #[serde(default)]
+    pub solr_update_requests_sent: usize,
     pub solr_commit_elapsed_sec: f64,
     pub total_wall_elapsed_sec: f64,
     pub records_per_second: f64,
@@ -193,6 +196,7 @@ pub async fn execute_staff_ao_candidate(
             id_list_elapsed_sec: 0.0,
             batch_loop_wall_elapsed_sec: 0.0,
             solr_write_elapsed_sec: 0.0,
+            solr_update_requests_sent: 0,
             solr_commit_elapsed_sec: 0.0,
             total_wall_elapsed_sec: 0.0,
             records_per_second: 0.0,
@@ -225,6 +229,7 @@ pub async fn execute_staff_ao_candidate(
                 id_list_elapsed_sec: 0.0,
                 batch_loop_wall_elapsed_sec: 0.0,
                 solr_write_elapsed_sec: 0.0,
+                solr_update_requests_sent: 0,
                 solr_commit_elapsed_sec: 0.0,
                 total_wall_elapsed_sec: 0.0,
                 records_per_second: 0.0,
@@ -257,6 +262,7 @@ pub async fn execute_staff_ao_candidate(
             id_list_elapsed_sec: 0.0,
             batch_loop_wall_elapsed_sec: 0.0,
             solr_write_elapsed_sec: 0.0,
+            solr_update_requests_sent: 0,
             solr_commit_elapsed_sec: 0.0,
             total_wall_elapsed_sec: 0.0,
             records_per_second: 0.0,
@@ -292,6 +298,7 @@ pub async fn execute_staff_ao_candidate(
                 id_list_elapsed_sec: 0.0,
                 batch_loop_wall_elapsed_sec: 0.0,
                 solr_write_elapsed_sec: 0.0,
+                solr_update_requests_sent: 0,
                 solr_commit_elapsed_sec: 0.0,
                 total_wall_elapsed_sec: 0.0,
                 records_per_second: 0.0,
@@ -337,6 +344,7 @@ pub async fn execute_staff_ao_candidate(
                 id_list_elapsed_sec,
                 batch_loop_wall_elapsed_sec: 0.0,
                 solr_write_elapsed_sec: 0.0,
+                solr_update_requests_sent: 0,
                 solr_commit_elapsed_sec: 0.0,
                 total_wall_elapsed_sec,
                 records_per_second: 0.0,
@@ -378,6 +386,7 @@ pub async fn execute_staff_ao_candidate(
             id_list_elapsed_sec,
             batch_loop_wall_elapsed_sec: 0.0,
             solr_write_elapsed_sec: 0.0,
+            solr_update_requests_sent: 0,
             solr_commit_elapsed_sec: 0.0,
             total_wall_elapsed_sec,
             records_per_second: 0.0,
@@ -411,6 +420,7 @@ pub async fn execute_staff_ao_candidate(
             id_list_elapsed_sec,
             batch_loop_wall_elapsed_sec: 0.0,
             solr_write_elapsed_sec: 0.0,
+            solr_update_requests_sent: 0,
             solr_commit_elapsed_sec: 0.0,
             total_wall_elapsed_sec,
             records_per_second: 0.0,
@@ -673,6 +683,7 @@ pub async fn execute_staff_ao_candidate(
         id_list_elapsed_sec,
         batch_loop_wall_elapsed_sec,
         solr_write_elapsed_sec,
+        solr_update_requests_sent: writer.update_requests_sent(),
         solr_commit_elapsed_sec,
         total_wall_elapsed_sec,
         records_per_second,
@@ -706,6 +717,10 @@ pub fn print_human_candidate_summary(summary: &StaffAoCandidateSummary) {
     println!(
         "  Solr Writes Elapsed: {:.4}s (awaiting Solr update POSTs; overlaps batch loop)",
         summary.solr_write_elapsed_sec
+    );
+    println!(
+        "  Solr Update POST Requests: {}",
+        summary.solr_update_requests_sent
     );
     println!(
         "Solr Hard Commit Elapsed: {:.4}s",
@@ -1176,6 +1191,7 @@ mod tests {
             .create_async()
             .await;
 
+        let all_ids: Vec<u32> = (1..=525).collect();
         let _m_ids = aspace_server
             .mock(
                 "GET",
@@ -1183,37 +1199,51 @@ mod tests {
             )
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body("[101, 102, 103, 104]")
+            .with_body(serde_json::to_string(&all_ids).unwrap())
             .create_async()
             .await;
 
-        let _m_batch = aspace_server
-            .mock(
-                "GET",
-                mockito::Matcher::Regex(r"^/repositories/4/archival_objects\?id_set=".to_string()),
+        let mut _batch_mocks = Vec::new();
+        for chunk in all_ids.chunks(25) {
+            let id_str = chunk
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let body = serde_json::to_string(
+                &chunk
+                    .iter()
+                    .map(|id| {
+                        serde_json::json!({
+                            "uri": format!("/repositories/4/archival_objects/{id}"),
+                            "title": format!("Item {id}"),
+                            "level": "item",
+                            "jsonmodel_type": "archival_object",
+                            "repository": {"ref": "/repositories/4"}
+                        })
+                    })
+                    .collect::<Vec<_>>(),
             )
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                serde_json::json!([
-                    {
-                        "uri": "/repositories/4/archival_objects/101",
-                        "title": "Item 101",
-                        "level": "item",
-                        "jsonmodel_type": "archival_object",
-                        "repository": {"ref": "/repositories/4"}
-                    }
-                ])
-                .to_string(),
-            )
-            .create_async()
-            .await;
+            .unwrap();
+
+            let enc_ids = id_str.replace(',', "%2C");
+            let regex = format!(r"^/repositories/4/archival_objects\?id_set={enc_ids}(&|$)");
+            let m = aspace_server
+                .mock("GET", mockito::Matcher::Regex(regex))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(body)
+                .create_async()
+                .await;
+            _batch_mocks.push(m);
+        }
 
         let _m_update = solr_server
             .mock("POST", format!("/{candidate_core}/update").as_str())
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"responseHeader":{"status":0,"QTime":1}}"#)
+            .expect_at_least(1)
             .create_async()
             .await;
 
@@ -1223,24 +1253,28 @@ mod tests {
 
         let args = StaffAoCandidateArgs {
             repo: 4,
-            batch_size: 1,
+            batch_size: 25,
             concurrency: 1,
             solr_url,
             candidate_core: candidate_core.to_string(),
             arks_enabled: false,
             strip_markers: true,
             json: true,
-            fail_after_batches: Some(1),
+            fail_after_batches: Some(21),
         };
 
         let summary = execute_staff_ao_candidate(&client, &args).await;
 
         assert!(!summary.success);
         assert!(summary.failures >= 1);
-        assert_eq!(summary.batches_completed, 1);
+        assert_eq!(summary.batches_completed, 21);
+        assert_eq!(summary.exact_ids_indexed, 525);
+        assert!(summary.solr_update_requests_sent >= 1);
+        assert_eq!(summary.solr_commit_elapsed_sec, 0.0);
         assert!(summary
             .error_message
             .unwrap()
-            .contains("Injected deterministic test failure after 1 completed batch"));
+            .contains("Injected deterministic test failure after 21 completed batch"));
+        _m_update.assert_async().await;
     }
 }

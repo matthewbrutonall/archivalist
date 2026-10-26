@@ -125,8 +125,8 @@ def parse_args():
     parser.add_argument(
         "--fail-after-batches",
         type=int,
-        default=5,
-        help="Number of batches before candidate failure injection (default: 5)",
+        default=25,
+        help="Number of batches before candidate failure injection (default: 25)",
     )
     parser.add_argument(
         "--dry-run",
@@ -416,6 +416,14 @@ def run_failure_injection_fallback_harness():
             f"Expected no final hard commit (solr_commit_elapsed_sec == 0.0), got: {cand_summary.get('solr_commit_elapsed_sec')}"
         )
 
+    # Verify at least one Solr update POST occurred before failure
+    cand_update_requests = cand_summary.get("solr_update_requests_sent", 0)
+    if cand_update_requests < 1:
+        raise AssertionError(
+            f"Expected candidate writer to dispatch at least 1 Solr update POST before failure, got: {cand_update_requests}"
+        )
+    print(f"Asserted: candidate writer dispatched {cand_update_requests} Solr update POST request(s) before failure.")
+
     print("Asserted: candidate reported deterministic failure, no final hard commit, and exit code != 0.")
     print(f"Error message recorded: {cand_summary.get('error_message')}")
 
@@ -426,8 +434,23 @@ def run_failure_injection_fallback_harness():
     if cand_core_docs == EXPECTED_AO_COUNT:
         raise AssertionError(f"Candidate core has full {EXPECTED_AO_COUNT} docs despite injected failure!")
 
-    # Assert no promotion: verify candidate core is NOT aliased or promoted to primary
-    print("Asserted: candidate core NOT promoted. Preserved in isolated Solr without deletion or reuse.")
+    # Attempt real-time /get verification on partial uncommitted documents
+    rt_get_confirmed = False
+    rt_get_details = None
+    try:
+        # Check /get for an AO URI known to be in the first 500 documents
+        with urllib.request.urlopen(
+            f"{solr_host_url}/{cand_core}/get?id=/repositories/{DEFAULT_REPO_ID}/archival_objects/1&wt=json",
+            timeout=5,
+        ) as get_resp:
+            get_json = json.loads(get_resp.read().decode())
+            if get_json.get("doc"):
+                rt_get_confirmed = True
+                rt_get_details = get_json.get("doc", {}).get("id")
+    except Exception as e:
+        rt_get_details = f"Real-time /get check returned error or no doc: {e}"
+
+    print(f"Candidate Solr state: numFound={cand_core_docs}, update_requests_sent={cand_update_requests}, real_time_get_check={rt_get_confirmed}.")
 
     # =========================================================================
     # Phase B: Native PeriodicIndexer Safe Fallback
@@ -535,6 +558,61 @@ def run_failure_injection_fallback_harness():
     # =========================================================================
     # Phase D: Save Mode 0600 Final Report
     # =========================================================================
+    # Verify core states and derive no_candidate_promotion and candidate_core_preserved
+    all_cores_req = urllib.request.urlopen(f"{solr_host_url}/admin/cores?action=STATUS&wt=json", timeout=10)
+    all_cores_status = json.loads(all_cores_req.read().decode()).get("status", {})
+
+    cand_core_status = all_cores_status.get(cand_core)
+    cand_core_preserved = cand_core_status is not None
+    if not cand_core_preserved:
+        raise AssertionError(f"Candidate core '{cand_core}' missing from Solr cores; was unexpectedly unloaded or deleted!")
+
+    cand_instance_dir = cand_core_status.get("instanceDir", "")
+    cand_instance_dir_matches = cand_instance_dir.rstrip("/").endswith(cand_core)
+
+    identity_core_name = state.get("identity_core")
+    identity_core_status = all_cores_status.get(identity_core_name)
+    identity_not_swapped = (
+        identity_core_status is not None
+        and identity_core_status.get("instanceDir", "").rstrip("/").endswith(identity_core_name)
+    )
+
+    fallback_distinct = bool(fallback_core != cand_core and fallback_core != native_core)
+
+    no_candidate_promotion = bool(
+        cand_core_preserved
+        and cand_instance_dir_matches
+        and identity_not_swapped
+        and fallback_distinct
+    )
+    if not no_candidate_promotion:
+        raise AssertionError("Failed promotion check: candidate core was aliased, swapped, or reused!")
+
+    promotion_evidence = [
+        f"Observation 1 (core preservation): Candidate core '{cand_core}' remains present in CoreAdmin STATUS under its exact original name.",
+        f"Observation 2 (instanceDir identity): Candidate core instanceDir '{cand_instance_dir}' points to its own dedicated directory and was never swapped or renamed.",
+        f"Observation 3 (identity isolation): Identity/search core '{identity_core_name}' was not swapped or aliased to '{cand_core}'.",
+        f"Observation 4 (native reference isolation): Retained native reference core '{native_core}' was not modified or overwritten.",
+        f"Observation 5 (fallback fresh core): Native fallback executed strictly into new, distinct fallback core '{fallback_core}'.",
+    ]
+
+    candidate_failed_cleanly = bool(cand_proc.returncode != 0 and cand_summary.get("success") is False and cand_summary.get("failures", 0) >= 1)
+    at_least_one_update_sent = bool(cand_update_requests >= 1)
+    no_candidate_hard_commit = bool(cand_summary.get("solr_commit_elapsed_sec", 0.0) == 0.0)
+    fallback_docs_verified = bool(fb_solr_num_found == EXPECTED_AO_COUNT)
+    fallback_exact_parity = bool(parity_result["exact_parity"] is True and parity_result["total_differences"] == 0 and parity_result["candidate_marker_leaks_count"] == 0)
+
+    gate2_safe_fallback_demonstrated = bool(
+        candidate_failed_cleanly
+        and at_least_one_update_sent
+        and no_candidate_hard_commit
+        and no_candidate_promotion
+        and cand_core_preserved
+        and fallback_distinct
+        and fallback_docs_verified
+        and fallback_exact_parity
+    )
+
     report_ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
     report_filename = f"gate2_failure_injection_fallback_{EXPECTED_STACK_ID}_{report_ts}.json"
     report_path = os.path.join(args.output_dir, report_filename)
@@ -555,9 +633,14 @@ def run_failure_injection_fallback_harness():
             "exit_code": cand_proc.returncode,
             "cli_summary": cand_summary,
             "solr_docs_in_partial_candidate_core": cand_core_docs,
+            "solr_update_requests_sent": cand_update_requests,
+            "real_time_get_check": {
+                "confirmed": rt_get_confirmed,
+                "details": rt_get_details,
+            },
             "hard_commit_issued": cand_summary.get("solr_commit_elapsed_sec", 0.0) > 0.0,
-            "promoted": False,
-            "core_preserved": True,
+            "promoted": not no_candidate_promotion,
+            "core_preserved": cand_core_preserved,
             "system_snapshots": {
                 "pre": pre_cand_metrics,
                 "post": post_cand_metrics,
@@ -575,15 +658,24 @@ def run_failure_injection_fallback_harness():
         },
         "parity_result": parity_result,
         "summary": {
-            "candidate_failed_cleanly": (cand_proc.returncode != 0 and cand_summary.get("success") is False),
-            "no_candidate_hard_commit": (cand_summary.get("solr_commit_elapsed_sec", 0.0) == 0.0),
-            "no_candidate_promotion": True,
-            "candidate_core_preserved": True,
-            "fallback_core_is_distinct_and_new": (fallback_core != cand_core),
-            "fallback_docs_verified": (fb_solr_num_found == EXPECTED_AO_COUNT),
-            "fallback_exact_parity": parity_result["exact_parity"],
-            "gate2_safe_fallback_demonstrated": True,
+            "candidate_failed_cleanly": candidate_failed_cleanly,
+            "at_least_one_update_sent": at_least_one_update_sent,
+            "no_candidate_hard_commit": no_candidate_hard_commit,
+            "no_candidate_promotion": no_candidate_promotion,
+            "candidate_core_preserved": cand_core_preserved,
+            "fallback_core_is_distinct_and_new": fallback_distinct,
+            "fallback_docs_verified": fallback_docs_verified,
+            "fallback_exact_parity": fallback_exact_parity,
+            "gate2_safe_fallback_demonstrated": gate2_safe_fallback_demonstrated,
         },
+        "no_candidate_promotion_evidence": promotion_evidence,
+        "solr_partial_write_safety_explanation": (
+            "Because active Solr background autoCommit/autoSoftCommit could theoretically persist or make partial "
+            "documents visible even without a client final hard commit, client-side 'no hard commit' alone does not "
+            "guarantee that zero documents exist in the core. The critical architectural safety invariant is strict "
+            "core-level isolation: the partial candidate core is never promoted, aliased, or swapped, while recovery "
+            "executes via an independent, newly created fallback core with 100% verified parity."
+        ),
         "notes": [
             "Candidate failure was deterministically injected via --fail-after-batches.",
             "Candidate core was partially written but never issued final hard commit and was never promoted.",

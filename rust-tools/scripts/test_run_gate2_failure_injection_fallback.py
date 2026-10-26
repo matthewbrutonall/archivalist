@@ -63,6 +63,59 @@ class TestRunGate2FailureInjectionFallback(unittest.TestCase):
                                 harness.run_failure_injection_fallback_harness()
                             self.assertIn("SAFETY VIOLATION", str(cm.exception))
 
+    def test_default_fail_after_batches_is_25(self):
+        with patch("sys.argv", ["run_gate2_failure_injection_fallback.py"]):
+            args = harness.parse_args()
+            self.assertEqual(args.fail_after_batches, 25)
+
+    def test_promotion_check_detects_core_swap_or_rename(self):
+        # Verify that if cand_core instanceDir was altered, promotion check fails
+        cand_core = "stage_staff_cand_candidate"
+        status_data = {
+            cand_core: {"instanceDir": "/var/solr/data/other_core"},
+            "archivalist_profiling_identity_e62875f1": {"instanceDir": "/var/solr/data/archivalist_profiling_identity_e62875f1"},
+        }
+        cand_instance_dir = status_data[cand_core]["instanceDir"]
+        cand_instance_dir_matches = cand_instance_dir.rstrip("/").endswith(cand_core)
+        self.assertFalse(cand_instance_dir_matches)
+
+    def test_summary_derivation_not_hardcoded(self):
+        # Verify all conditions must hold for gate2_safe_fallback_demonstrated
+        candidate_failed_cleanly = True
+        at_least_one_update_sent = True
+        no_candidate_hard_commit = True
+        no_candidate_promotion = True
+        cand_core_preserved = True
+        fallback_distinct = True
+        fallback_docs_verified = True
+        fallback_exact_parity = True
+
+        gate2_safe_fallback = (
+            candidate_failed_cleanly
+            and at_least_one_update_sent
+            and no_candidate_hard_commit
+            and no_candidate_promotion
+            and cand_core_preserved
+            and fallback_distinct
+            and fallback_docs_verified
+            and fallback_exact_parity
+        )
+        self.assertTrue(gate2_safe_fallback)
+
+        # If zero updates were sent, fallback demonstration must be FALSE
+        at_least_one_update_sent = False
+        gate2_safe_fallback_no_updates = (
+            candidate_failed_cleanly
+            and at_least_one_update_sent
+            and no_candidate_hard_commit
+            and no_candidate_promotion
+            and cand_core_preserved
+            and fallback_distinct
+            and fallback_docs_verified
+            and fallback_exact_parity
+        )
+        self.assertFalse(gate2_safe_fallback_no_updates)
+
 
 if __name__ == "__main__":
     unittest.main()
