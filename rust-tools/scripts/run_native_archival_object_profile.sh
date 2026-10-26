@@ -46,7 +46,7 @@ printf '{\n  "git_commit": "%s",\n  "git_dirty": "%s",\n  "stack_state": "%s"\n}
 
 CONTAINER_JAVA_OPTS="$(docker exec "$APP_CONTAINER" printenv JAVA_OPTS)"
 OPT_ENV=()
-for var in REPEATS REPO_ID STAFF_THREADS STAFF_RECORDS_PER_THREAD; do
+for var in REPEATS REPO_ID STAFF_THREADS STAFF_RECORDS_PER_THREAD STAGE_ROLE; do
   [ -n "${!var:-}" ] && OPT_ENV+=(-e "$var=${!var}")
 done
 docker exec "${STACK_ARGS[@]}" "${OPT_ENV[@]}" -e JAVA_OPTS="$CONTAINER_JAVA_OPTS -Xss${PROFILE_XSS:-16m}" \

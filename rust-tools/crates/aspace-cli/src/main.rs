@@ -2172,6 +2172,28 @@ mod tests {
                 assert!(!args.arks_enabled);
                 assert!(args.strip_markers);
                 assert!(args.json);
+                assert_eq!(args.fail_after_batches, None);
+                assert!(args.validate().is_ok());
+            }
+            _ => panic!("Expected Commands::StaffAoCandidate"),
+        }
+
+        let cli_candidate_fail = Cli::try_parse_from([
+            "aspace",
+            "staff-ao-candidate",
+            "--repo",
+            "4",
+            "--solr-url",
+            "http://127.0.0.1:18983/solr",
+            "--candidate-core",
+            "stage_staff_20261026_candidate",
+            "--fail-after-batches",
+            "5",
+        ])
+        .unwrap();
+        match cli_candidate_fail.command {
+            Commands::StaffAoCandidate(args) => {
+                assert_eq!(args.fail_after_batches, Some(5));
                 assert!(args.validate().is_ok());
             }
             _ => panic!("Expected Commands::StaffAoCandidate"),

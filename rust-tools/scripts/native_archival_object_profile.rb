@@ -438,7 +438,8 @@ if __FILE__ == $PROGRAM_NAME
     run_id = ArchivalistHarnessSafety.generate_run_id
     first_run_id ||= run_id
 
-    core = ArchivalistHarnessSafety.stage_core_name(run_id, 'native', 'staff')
+    stage_role = ENV['STAGE_ROLE'] || 'native'
+    core = ArchivalistHarnessSafety.stage_core_name(run_id, stage_role, 'staff')
     ArchivalistHarnessSafety.ensure_stage_core(core, run_id, solr_base: SOLR_BASE)
 
     data_dir = Dir.mktmpdir('archivalist_native_ao_profile_')

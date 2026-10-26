@@ -121,6 +121,33 @@ def get_mem_available_gib() -> float:
     return 0.0
 
 
+def snapshot_system_metrics(solr_host_url: Optional[str] = None) -> Dict[str, Any]:
+    metrics: Dict[str, Any] = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    try:
+        with open("/proc/loadavg") as f:
+            parts = f.read().split()
+            metrics["loadavg"] = [float(parts[0]), float(parts[1]), float(parts[2])]
+    except Exception:
+        pass
+    metrics["mem_available_gib"] = round(get_mem_available_gib(), 2)
+    if solr_host_url:
+        try:
+            req = urllib.request.urlopen(f"{solr_host_url}/admin/info/system?wt=json", timeout=3)
+            info = json.loads(req.read().decode())
+            jvm_mem = info.get("jvm", {}).get("memory", {})
+            metrics["solr_jvm_heap"] = {
+                "free_bytes": jvm_mem.get("free"),
+                "total_bytes": jvm_mem.get("total"),
+                "max_bytes": jvm_mem.get("max"),
+                "used_bytes": jvm_mem.get("used"),
+            }
+        except Exception:
+            pass
+    return metrics
+
+
 def canonical_json_key(val: Any) -> Any:
     if val is None:
         return ("null", None)
@@ -843,9 +870,15 @@ def run_harness():
             "--json",
         ]
 
+        # Pre-pass system metrics snapshot
+        pre_metrics = snapshot_system_metrics(solr_host_url)
+
         t_harness_wall_start = time.perf_counter()
         cli_proc = subprocess.run(cli_cmd, capture_output=True, text=True)
         t_harness_wall_elapsed = time.perf_counter() - t_harness_wall_start
+
+        # Post-pass system metrics snapshot
+        post_metrics = snapshot_system_metrics(solr_host_url)
 
         if cli_proc.returncode != 0:
             raise RuntimeError(
@@ -901,6 +934,11 @@ def run_harness():
             f"diffs={parity_result['total_differences']}, marker_leaks={parity_result['candidate_marker_leaks_count']}."
         )
 
+        batch_loop_wall = cand_summary.get(
+            "batch_loop_wall_elapsed_sec",
+            cand_summary.get("batch_fetch_build_elapsed_sec", 0.0),
+        )
+
         return {
             "pass_name": pass_name,
             "pass_index": pass_index,
@@ -908,9 +946,13 @@ def run_harness():
             "cli_summary": cand_summary,
             "solr_verified_docs": solr_num_found,
             "parity_result": parity_result,
+            "system_snapshots": {
+                "pre_pass": pre_metrics,
+                "post_pass": post_metrics,
+            },
             "timings": {
                 "id_list_elapsed_sec": cand_summary["id_list_elapsed_sec"],
-                "batch_fetch_build_elapsed_sec": cand_summary["batch_fetch_build_elapsed_sec"],
+                "batch_loop_wall_elapsed_sec": batch_loop_wall,
                 "solr_write_elapsed_sec": cand_summary["solr_write_elapsed_sec"],
                 "solr_commit_elapsed_sec": cand_summary["solr_commit_elapsed_sec"],
                 "total_wall_elapsed_sec": cand_summary["total_wall_elapsed_sec"],
@@ -993,8 +1035,8 @@ def run_harness():
         t = p["timings"]
         print(
             f"{p['pass_name']}: total_wall={t['total_wall_elapsed_sec']:.3f}s "
-            f"(id_list={t['id_list_elapsed_sec']:.3f}s, batch_fetch_build={t['batch_fetch_build_elapsed_sec']:.3f}s, "
-            f"solr_writes={t['solr_write_elapsed_sec']:.3f}s, solr_commit={t['solr_commit_elapsed_sec']:.3f}s) "
+            f"(id_list={t['id_list_elapsed_sec']:.3f}s, batch_loop_wall={t['batch_loop_wall_elapsed_sec']:.3f}s, "
+            f"solr_writes_awaited={t['solr_write_elapsed_sec']:.3f}s, solr_commit={t['solr_commit_elapsed_sec']:.3f}s) "
             f"throughput={t['records_per_second']:.2f} docs/sec"
         )
     print(f"\nMeasured passes wall times: {[round(w, 3) for w in measured_wall_times]}s")
@@ -1036,6 +1078,14 @@ def run_harness():
             "speedup_ratio": speedup_ratio,
             "percent_faster": percent_faster,
             "gate2_target_met": target_met,
+            "timing_breakdown_note": (
+                "Non-overlapping timing: total_wall_elapsed_sec equals "
+                "id_list_elapsed_sec + batch_loop_wall_elapsed_sec + solr_commit_elapsed_sec. "
+                "batch_loop_wall_elapsed_sec measures combined wall interval for concurrent batch fetch, "
+                "document building, and pipelined Solr streaming writes; "
+                "solr_write_elapsed_sec measures cumulative time awaiting Solr update POST requests and "
+                "overlaps batch_loop_wall_elapsed_sec. Do not sum solr_write_elapsed_sec with batch_loop_wall_elapsed_sec."
+            ),
         },
         "baseline_caveats": [
             "Native reference is 56.625s median from native_ao_profile_20261025_224440_59214_55c63af5.json on isolated stack e62875f1.",

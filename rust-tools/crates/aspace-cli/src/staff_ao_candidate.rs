@@ -81,6 +81,12 @@ pub struct StaffAoCandidateArgs {
         help = "Output machine-readable JSON summary (default: human-readable)"
     )]
     pub json: bool,
+
+    #[arg(
+        long,
+        help = "Test-only: inject deterministic failure after completing N batches"
+    )]
+    pub fail_after_batches: Option<usize>,
 }
 
 impl StaffAoCandidateArgs {
@@ -108,6 +114,11 @@ impl StaffAoCandidateArgs {
                 self.concurrency
             );
         }
+        if let Some(limit) = self.fail_after_batches {
+            if limit == 0 {
+                bail!("fail_after_batches must be greater than 0 if specified");
+            }
+        }
         validate_isolated_solr_base_url(&self.solr_url)?;
         validate_stage_candidate_core(&self.candidate_core, None)?;
         Ok(())
@@ -133,7 +144,14 @@ pub struct StaffAoCandidateSummary {
     pub solr_url: String,
     pub arks_enabled: bool,
     pub id_list_elapsed_sec: f64,
-    pub batch_fetch_build_elapsed_sec: f64,
+    /// Combined wall interval for concurrent batch fetch, document building,
+    /// and pipelined streaming writes to Solr.
+    #[serde(alias = "batch_fetch_build_elapsed_sec")]
+    pub batch_loop_wall_elapsed_sec: f64,
+    /// Cumulative duration spent awaiting Solr update POST requests.
+    /// Note: This is an overlapping sub-component of `batch_loop_wall_elapsed_sec`
+    /// (streaming writes occur concurrently with ongoing worker batch fetches);
+    /// do NOT sum `solr_write_elapsed_sec` with `batch_loop_wall_elapsed_sec`.
     pub solr_write_elapsed_sec: f64,
     pub solr_commit_elapsed_sec: f64,
     pub total_wall_elapsed_sec: f64,
@@ -173,7 +191,7 @@ pub async fn execute_staff_ao_candidate(
             solr_url: args.solr_url.clone(),
             arks_enabled: args.arks_enabled,
             id_list_elapsed_sec: 0.0,
-            batch_fetch_build_elapsed_sec: 0.0,
+            batch_loop_wall_elapsed_sec: 0.0,
             solr_write_elapsed_sec: 0.0,
             solr_commit_elapsed_sec: 0.0,
             total_wall_elapsed_sec: 0.0,
@@ -205,7 +223,7 @@ pub async fn execute_staff_ao_candidate(
                 solr_url: args.solr_url.clone(),
                 arks_enabled: args.arks_enabled,
                 id_list_elapsed_sec: 0.0,
-                batch_fetch_build_elapsed_sec: 0.0,
+                batch_loop_wall_elapsed_sec: 0.0,
                 solr_write_elapsed_sec: 0.0,
                 solr_commit_elapsed_sec: 0.0,
                 total_wall_elapsed_sec: 0.0,
@@ -237,7 +255,7 @@ pub async fn execute_staff_ao_candidate(
             solr_url: args.solr_url.clone(),
             arks_enabled: args.arks_enabled,
             id_list_elapsed_sec: 0.0,
-            batch_fetch_build_elapsed_sec: 0.0,
+            batch_loop_wall_elapsed_sec: 0.0,
             solr_write_elapsed_sec: 0.0,
             solr_commit_elapsed_sec: 0.0,
             total_wall_elapsed_sec: 0.0,
@@ -272,7 +290,7 @@ pub async fn execute_staff_ao_candidate(
                 solr_url: args.solr_url.clone(),
                 arks_enabled: args.arks_enabled,
                 id_list_elapsed_sec: 0.0,
-                batch_fetch_build_elapsed_sec: 0.0,
+                batch_loop_wall_elapsed_sec: 0.0,
                 solr_write_elapsed_sec: 0.0,
                 solr_commit_elapsed_sec: 0.0,
                 total_wall_elapsed_sec: 0.0,
@@ -317,7 +335,7 @@ pub async fn execute_staff_ao_candidate(
                 solr_url: args.solr_url.clone(),
                 arks_enabled: args.arks_enabled,
                 id_list_elapsed_sec,
-                batch_fetch_build_elapsed_sec: 0.0,
+                batch_loop_wall_elapsed_sec: 0.0,
                 solr_write_elapsed_sec: 0.0,
                 solr_commit_elapsed_sec: 0.0,
                 total_wall_elapsed_sec,
@@ -358,7 +376,7 @@ pub async fn execute_staff_ao_candidate(
             solr_url: args.solr_url.clone(),
             arks_enabled: args.arks_enabled,
             id_list_elapsed_sec,
-            batch_fetch_build_elapsed_sec: 0.0,
+            batch_loop_wall_elapsed_sec: 0.0,
             solr_write_elapsed_sec: 0.0,
             solr_commit_elapsed_sec: 0.0,
             total_wall_elapsed_sec,
@@ -391,7 +409,7 @@ pub async fn execute_staff_ao_candidate(
             solr_url: args.solr_url.clone(),
             arks_enabled: args.arks_enabled,
             id_list_elapsed_sec,
-            batch_fetch_build_elapsed_sec: 0.0,
+            batch_loop_wall_elapsed_sec: 0.0,
             solr_write_elapsed_sec: 0.0,
             solr_commit_elapsed_sec: 0.0,
             total_wall_elapsed_sec,
@@ -563,6 +581,19 @@ pub async fn execute_staff_ao_candidate(
                     break;
                 }
                 solr_write_elapsed_sec += t_write.elapsed().as_secs_f64();
+
+                if let Some(fail_limit) = args.fail_after_batches {
+                    if batches_completed >= fail_limit {
+                        batches_failed += 1;
+                        if first_error.is_none() {
+                            first_error = Some(format!(
+                                "Injected deterministic test failure after {} completed batch(es) (fail_after_batches={})",
+                                batches_completed, fail_limit
+                            ));
+                        }
+                        break;
+                    }
+                }
             }
             Err(err) => {
                 batches_failed += 1;
@@ -574,7 +605,7 @@ pub async fn execute_staff_ao_candidate(
         }
     }
 
-    let batch_fetch_build_elapsed_sec = batch_start.elapsed().as_secs_f64();
+    let batch_loop_wall_elapsed_sec = batch_start.elapsed().as_secs_f64();
 
     // Commit only if all batches succeeded and zero unexpected/duplicate anomalies occurred
     let mut solr_commit_elapsed_sec = 0.0;
@@ -640,7 +671,7 @@ pub async fn execute_staff_ao_candidate(
         solr_url: args.solr_url.clone(),
         arks_enabled: args.arks_enabled,
         id_list_elapsed_sec,
-        batch_fetch_build_elapsed_sec,
+        batch_loop_wall_elapsed_sec,
         solr_write_elapsed_sec,
         solr_commit_elapsed_sec,
         total_wall_elapsed_sec,
@@ -669,11 +700,11 @@ pub fn print_human_candidate_summary(summary: &StaffAoCandidateSummary) {
     println!("ARKs Enabled: {}", summary.arks_enabled);
     println!("ID List Elapsed: {:.4}s", summary.id_list_elapsed_sec);
     println!(
-        "Batch Fetch/Build Elapsed: {:.4}s",
-        summary.batch_fetch_build_elapsed_sec
+        "Combined Batch Loop Wall Elapsed: {:.4}s (pipelined fetch, build & writes)",
+        summary.batch_loop_wall_elapsed_sec
     );
     println!(
-        "Solr Writes Elapsed: {:.4}s",
+        "  Solr Writes Elapsed: {:.4}s (awaiting Solr update POSTs; overlaps batch loop)",
         summary.solr_write_elapsed_sec
     );
     println!(
@@ -681,7 +712,7 @@ pub fn print_human_candidate_summary(summary: &StaffAoCandidateSummary) {
         summary.solr_commit_elapsed_sec
     );
     println!(
-        "Total Wall Elapsed: {:.4}s (excludes auth & setup)",
+        "Total Wall Elapsed: {:.4}s (id_list + batch_loop_wall + solr_commit)",
         summary.total_wall_elapsed_sec
     );
     println!("Records / Sec: {:.2}", summary.records_per_second);
@@ -746,12 +777,12 @@ pub async fn run_staff_ao_candidate_to_writer<W: Write>(
             )?;
             writeln!(
                 cursor,
-                "Batch Fetch/Build Elapsed: {:.4}s",
-                summary.batch_fetch_build_elapsed_sec
+                "Combined Batch Loop Wall Elapsed: {:.4}s (pipelined fetch, build & writes)",
+                summary.batch_loop_wall_elapsed_sec
             )?;
             writeln!(
                 cursor,
-                "Solr Writes Elapsed: {:.4}s",
+                "  Solr Writes Elapsed: {:.4}s (awaiting Solr update POSTs; overlaps batch loop)",
                 summary.solr_write_elapsed_sec
             )?;
             writeln!(
@@ -761,7 +792,7 @@ pub async fn run_staff_ao_candidate_to_writer<W: Write>(
             )?;
             writeln!(
                 cursor,
-                "Total Wall Elapsed: {:.4}s (excludes auth & setup)",
+                "Total Wall Elapsed: {:.4}s (id_list + batch_loop_wall + solr_commit)",
                 summary.total_wall_elapsed_sec
             )?;
             writeln!(cursor, "Records / Sec: {:.2}", summary.records_per_second)?;
@@ -806,8 +837,18 @@ mod tests {
             arks_enabled: false,
             strip_markers: true,
             json: false,
+            fail_after_batches: None,
         };
         assert!(valid_args.validate().is_ok());
+
+        let fail_zero = StaffAoCandidateArgs {
+            fail_after_batches: Some(0),
+            ..valid_args.clone()
+        };
+        assert_eq!(
+            fail_zero.validate().unwrap_err().to_string(),
+            "fail_after_batches must be greater than 0 if specified"
+        );
 
         let repo_zero = StaffAoCandidateArgs {
             repo: 0,
@@ -897,6 +938,7 @@ mod tests {
             arks_enabled: false,
             strip_markers: true,
             json: false,
+            fail_after_batches: None,
         };
 
         let summary = execute_staff_ao_candidate(&client, &args).await;
@@ -1043,6 +1085,7 @@ mod tests {
             arks_enabled: false,
             strip_markers: true,
             json: true,
+            fail_after_batches: None,
         };
 
         let mut output = Vec::new();
@@ -1059,6 +1102,145 @@ mod tests {
         assert_eq!(summary.duplicate_ids, 0);
         assert_eq!(summary.unexpected_ids, 0);
         assert!(summary.id_list_elapsed_sec >= 0.0);
+        assert!(summary.batch_loop_wall_elapsed_sec >= 0.0);
         assert!(summary.total_wall_elapsed_sec >= 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_candidate_injected_failure_after_batches() {
+        let mut aspace_server = Server::new_async().await;
+        let mut solr_server = Server::new_async().await;
+
+        let candidate_core = "stage_staff_20261026_5678_candidate";
+
+        let _m_status = solr_server
+            .mock(
+                "GET",
+                format!("/admin/cores?action=STATUS&core={candidate_core}&wt=json").as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "responseHeader": {"status": 0},
+                    "status": {
+                        candidate_core: {
+                            "name": candidate_core,
+                            "instanceDir": "/var/solr/data/stage_staff_20261026_5678_candidate"
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let _m_empty = solr_server
+            .mock(
+                "GET",
+                format!("/{candidate_core}/select?q=*:*&rows=0&wt=json").as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "responseHeader": {"status": 0},
+                    "response": {
+                        "numFound": 0,
+                        "start": 0,
+                        "docs": []
+                    }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let _m_schemas = aspace_server
+            .mock("GET", "/schemas")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "archival_object": {
+                        "properties": {
+                            "level": {
+                                "type": "string",
+                                "dynamic_enum": "archival_record_level"
+                            }
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let _m_ids = aspace_server
+            .mock(
+                "GET",
+                "/repositories/4/archival_objects?all_ids=true&modified_since=0",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("[101, 102, 103, 104]")
+            .create_async()
+            .await;
+
+        let _m_batch = aspace_server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/repositories/4/archival_objects\?id_set=".to_string()),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!([
+                    {
+                        "uri": "/repositories/4/archival_objects/101",
+                        "title": "Item 101",
+                        "level": "item",
+                        "jsonmodel_type": "archival_object",
+                        "repository": {"ref": "/repositories/4"}
+                    }
+                ])
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let _m_update = solr_server
+            .mock("POST", format!("/{candidate_core}/update").as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"responseHeader":{"status":0,"QTime":1}}"#)
+            .create_async()
+            .await;
+
+        let mut client = Client::new(aspace_server.url());
+        client.session_token = Some("dummy-session".to_string());
+        let solr_url = solr_server.url();
+
+        let args = StaffAoCandidateArgs {
+            repo: 4,
+            batch_size: 1,
+            concurrency: 1,
+            solr_url,
+            candidate_core: candidate_core.to_string(),
+            arks_enabled: false,
+            strip_markers: true,
+            json: true,
+            fail_after_batches: Some(1),
+        };
+
+        let summary = execute_staff_ao_candidate(&client, &args).await;
+
+        assert!(!summary.success);
+        assert!(summary.failures >= 1);
+        assert_eq!(summary.batches_completed, 1);
+        assert!(summary
+            .error_message
+            .unwrap()
+            .contains("Injected deterministic test failure after 1 completed batch"));
     }
 }
