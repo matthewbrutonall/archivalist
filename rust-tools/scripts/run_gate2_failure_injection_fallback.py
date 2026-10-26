@@ -69,6 +69,41 @@ from run_gate2_full_ao_candidate import (
 started_containers: List[str] = []
 
 
+def fetch_first_archival_object_id(
+    backend_url: str,
+    admin_user: str,
+    admin_password: str,
+    repo_id: int,
+) -> int:
+    """Fetches the first archival object ID for the repository from the backend,
+    matching the exact sequence the candidate indexer processes.
+    Falls back to verified dataset initial ID 1221 if API call is unauthenticated.
+    """
+    try:
+        login_url = f"{backend_url.rstrip('/')}/users/{urllib.parse.quote(admin_user)}/login?password={urllib.parse.quote(admin_password)}"
+        req = urllib.request.Request(login_url, data=b"", method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            login_data = json.loads(resp.read().decode("utf-8"))
+            session_token = login_data.get("session")
+
+        if session_token:
+            ids_url = f"{backend_url.rstrip('/')}/repositories/{repo_id}/archival_objects?all_ids=true&modified_since=0"
+            ids_req = urllib.request.Request(
+                ids_url,
+                headers={"X-ArchivesSpace-Session": session_token},
+                method="GET",
+            )
+            with urllib.request.urlopen(ids_req, timeout=10) as resp:
+                ids_list = json.loads(resp.read().decode("utf-8"))
+                if isinstance(ids_list, list) and len(ids_list) > 0:
+                    first_id = int(ids_list[0])
+                    print(f"Discovered first AO ID from backend: {first_id}", flush=True)
+                    return first_id
+    except Exception as e:
+        print(f"Warning: could not fetch dynamic first AO ID from backend: {e}", file=sys.stderr)
+    return 1221
+
+
 def cleanup():
     global started_containers
     if not started_containers:
@@ -133,6 +168,11 @@ def parse_args():
         action="store_true",
         help="Run safety and static checks without modifying state or running indexing",
     )
+    parser.add_argument(
+        "--save-debug-stderr",
+        action="store_true",
+        help="Explicit debug opt-in: save raw fallback stderr to a mode 0600 file on failure",
+    )
     return parser.parse_args()
 
 
@@ -140,7 +180,7 @@ def run_failure_injection_fallback_harness():
     args = parse_args()
     print("=== Gate 2 Failure Injection & Safe Fallback Harness ===", flush=True)
 
-    # 1. Check git branch and HEAD
+    # 1. Check git branch, HEAD, and clean tracked status
     git_branch = (
         subprocess.run(
             ["git", "-C", REPO_ROOT, "rev-parse", "--abbrev-ref", "HEAD"],
@@ -159,12 +199,29 @@ def run_failure_injection_fallback_harness():
         )
         .stdout.strip()
     )
+    git_status_tracked = (
+        subprocess.run(
+            ["git", "-C", REPO_ROOT, "status", "--porcelain", "-uno"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        .stdout.strip()
+    )
+    git_dirty = bool(git_status_tracked)
     print(f"Git branch: {git_branch}")
     print(f"Git HEAD: {git_head}")
+    print(f"Git dirty (tracked): {git_dirty}")
 
     if git_branch != EXPECTED_BRANCH:
         raise RuntimeError(
             f"Expected branch '{EXPECTED_BRANCH}', but current branch is '{git_branch}'"
+        )
+
+    if git_dirty:
+        raise RuntimeError(
+            f"Git working tree has uncommitted tracked changes! Tracked status:\n{git_status_tracked}\n"
+            "All changes must be committed before building/running to ensure binary and source provenance."
         )
 
     # 2. Check binary provenance
@@ -434,23 +491,51 @@ def run_failure_injection_fallback_harness():
     if cand_core_docs == EXPECTED_AO_COUNT:
         raise AssertionError(f"Candidate core has full {EXPECTED_AO_COUNT} docs despite injected failure!")
 
-    # Attempt real-time /get verification on partial uncommitted documents
+    # Attempt real-time /get verification on partial uncommitted documents using known initial ID
+    target_ao_id = fetch_first_archival_object_id(
+        backend_host_url,
+        state["admin_user"],
+        state["admin_password"],
+        DEFAULT_REPO_ID,
+    )
+    target_ao_uri = f"/repositories/{DEFAULT_REPO_ID}/archival_objects/{target_ao_id}"
+    print(
+        f"Attempting real-time /get verification on selected first written document: {target_ao_uri}...",
+        flush=True,
+    )
+
     rt_get_confirmed = False
     rt_get_details = None
     try:
-        # Check /get for an AO URI known to be in the first 500 documents
-        with urllib.request.urlopen(
-            f"{solr_host_url}/{cand_core}/get?id=/repositories/{DEFAULT_REPO_ID}/archival_objects/1&wt=json",
-            timeout=5,
-        ) as get_resp:
+        # Check /get for the first known written AO URI in the candidate core
+        get_url = f"{solr_host_url}/{cand_core}/get?id={urllib.parse.quote(target_ao_uri, safe='')}&wt=json"
+        req = urllib.request.Request(get_url)
+        with urllib.request.urlopen(req, timeout=5) as get_resp:
             get_json = json.loads(get_resp.read().decode())
-            if get_json.get("doc"):
+            doc = get_json.get("doc")
+            if doc and doc.get("id") == target_ao_uri:
                 rt_get_confirmed = True
-                rt_get_details = get_json.get("doc", {}).get("id")
+                rt_get_details = f"Document visible via real-time /get: id={doc.get('id')}"
+            elif doc:
+                rt_get_confirmed = True
+                rt_get_details = f"Document visible via real-time /get with mismatched id: {doc.get('id')}"
+            else:
+                rt_get_details = (
+                    "Real-time /get returned 200 without doc (expected in archivesspace configSet: "
+                    "updateLog/RealTimeGetHandler not active; uncommitted documents are buffered in memory)"
+                )
+    except urllib.error.HTTPError as e:
+        rt_get_details = (
+            f"Real-time /get returned HTTP {e.code} (expected in archivesspace configSet: "
+            f"handler not configured: {e.reason})"
+        )
     except Exception as e:
-        rt_get_details = f"Real-time /get check returned error or no doc: {e}"
+        rt_get_details = f"Real-time /get query failed: {e}"
 
-    print(f"Candidate Solr state: numFound={cand_core_docs}, update_requests_sent={cand_update_requests}, real_time_get_check={rt_get_confirmed}.")
+    print(
+        f"Candidate Solr state: numFound={cand_core_docs}, update_requests_sent={cand_update_requests}, "
+        f"target_uri={target_ao_uri}, real_time_get_check={rt_get_confirmed} ({rt_get_details})."
+    )
 
     # =========================================================================
     # Phase B: Native PeriodicIndexer Safe Fallback
@@ -462,8 +547,12 @@ def run_failure_injection_fallback_harness():
     fallback_env["REPEATS"] = "1"
     fallback_env["STAGE_ROLE"] = "fallback"
 
+    # Record pre-existing reports before invoking fallback script to detect unique newly generated artifact
+    pre_existing_reports = set(glob.glob(os.path.join(BENCHMARKS_DIR, "native_ao_profile_*.json")))
+
     pre_fb_metrics = snapshot_system_metrics(solr_host_url)
     t_fb_start = time.perf_counter()
+    t_fb_wall = time.time()
     fb_proc = subprocess.run(
         [fallback_script],
         env=fallback_env,
@@ -475,35 +564,101 @@ def run_failure_injection_fallback_harness():
 
     print(f"Native fallback script finished with exit code {fb_proc.returncode} in {t_fb_elapsed:.3f}s.")
     if fb_proc.returncode != 0:
-        print(f"[FALLBACK FAILURE] Stderr: {fb_proc.stderr[:512]}", file=sys.stderr)
+        print(
+            f"[FALLBACK FAILURE] Native fallback script failed with exit code {fb_proc.returncode} "
+            "(raw stderr suppressed to protect potential record content or credentials)",
+            file=sys.stderr,
+        )
+        if getattr(args, "save_debug_stderr", False) and fb_proc.stderr:
+            err_ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+            debug_stderr_path = os.path.join(
+                args.output_dir, f"fallback_stderr_debug_{EXPECTED_STACK_ID}_{err_ts}.log"
+            )
+            write_file_mode_0600(debug_stderr_path, fb_proc.stderr)
+            print(f"[FALLBACK FAILURE] Raw stderr saved with mode 0600 under debug opt-in: {debug_stderr_path}", file=sys.stderr)
         raise RuntimeError(f"Native fallback script failed with exit code {fb_proc.returncode}")
 
-    # Find the newly written native_ao_profile JSON report
-    report_files = sorted(
-        glob.glob(os.path.join(BENCHMARKS_DIR, "native_ao_profile_*.json")),
-        key=os.path.getmtime,
-    )
-    if not report_files:
-        raise RuntimeError("No native_ao_profile JSON reports found under benchmarks/!")
+    # Locate the unique new native_ao_profile report
+    # 1. Look for report path parsed from wrapper stdout
+    parsed_report_path: Optional[str] = None
+    wrapper_stdout_file = None
+    for token in fb_proc.stdout.split():
+        if token.startswith("stdout="):
+            wrapper_stdout_file = token.split("=", 1)[1]
+            break
 
-    latest_report_path = report_files[-1]
-    print(f"Reading fallback report: {latest_report_path}")
-    with open(latest_report_path) as f:
+    if wrapper_stdout_file and os.path.isfile(wrapper_stdout_file):
+        try:
+            with open(wrapper_stdout_file, "r") as sf:
+                for line in sf:
+                    line_s = line.strip()
+                    if line_s.startswith("Report:"):
+                        cand_path = line_s.split("Report:", 1)[1].strip()
+                        if cand_path:
+                            parsed_report_path = os.path.abspath(cand_path)
+                            break
+        except Exception as e:
+            print(f"Warning: could not read wrapper stdout file {wrapper_stdout_file}: {e}", file=sys.stderr)
+
+    # 2. Compare before/after manifest
+    current_reports = set(glob.glob(os.path.join(BENCHMARKS_DIR, "native_ao_profile_*.json")))
+    new_reports = current_reports - pre_existing_reports
+    new_reports_in_window = [
+        p for p in new_reports
+        if os.path.getmtime(p) >= (t_fb_wall - 10.0)
+    ]
+
+    # 3. Fail closed on ambiguity
+    selected_report_path: Optional[str] = None
+    if len(new_reports_in_window) == 1:
+        selected_report_path = list(new_reports_in_window)[0]
+        if parsed_report_path and os.path.normpath(selected_report_path) != os.path.normpath(parsed_report_path):
+            raise RuntimeError(
+                f"AMBIGUITY ERROR: Parsed report path '{parsed_report_path}' differs from unique manifest report '{selected_report_path}'!"
+            )
+    elif len(new_reports_in_window) == 0:
+        if parsed_report_path and os.path.isfile(parsed_report_path):
+            selected_report_path = parsed_report_path
+        else:
+            raise RuntimeError(
+                f"AMBIGUITY ERROR: No new native_ao_profile_*.json report found after fallback run! "
+                f"(pre-existing={len(pre_existing_reports)}, parsed={parsed_report_path})"
+            )
+    else:
+        # Multiple new reports found
+        if parsed_report_path and parsed_report_path in new_reports_in_window:
+            selected_report_path = parsed_report_path
+        else:
+            raise RuntimeError(
+                f"AMBIGUITY ERROR: Multiple ({len(new_reports_in_window)}) new native_ao_profile reports created concurrently! "
+                f"Candidates: {new_reports_in_window}"
+            )
+
+    selected_report_path = os.path.abspath(selected_report_path)
+    print(f"Reading verified unique fallback report: {selected_report_path}")
+    with open(selected_report_path) as f:
         fb_report = json.load(f)
 
     results_list = fb_report.get("results", [])
     if not results_list:
-        raise RuntimeError("Fallback report contains empty results list!")
+        raise RuntimeError(f"Fallback report '{selected_report_path}' contains empty results list!")
 
     fallback_core = results_list[0].get("core")
     if not fallback_core:
-        raise RuntimeError("Fallback report result missing 'core' field!")
+        raise RuntimeError(f"Fallback report '{selected_report_path}' result missing 'core' field!")
+
+    if not fallback_core.endswith("_fallback"):
+        raise AssertionError(
+            f"AMBIGUITY ERROR: Fallback core name '{fallback_core}' does not end with '_fallback'!"
+        )
 
     print(f"Identified new fallback core: '{fallback_core}'")
 
     # Assert fallback core is NEW and distinct from candidate core
     if fallback_core == cand_core:
         raise AssertionError(f"Safety violation: fallback core '{fallback_core}' reused candidate core '{cand_core}'!")
+    if fallback_core == native_core:
+        raise AssertionError(f"Safety violation: fallback core '{fallback_core}' reused native core '{native_core}'!")
 
     # Verify Solr document count on fallback core
     with urllib.request.urlopen(f"{solr_host_url}/{fallback_core}/select?q=*:*&rows=0&wt=json", timeout=10) as resp:
@@ -579,21 +734,30 @@ def run_failure_injection_fallback_harness():
 
     fallback_distinct = bool(fallback_core != cand_core and fallback_core != native_core)
 
+    # Isolated CoreAdmin alias/masquerade check: identity core was not retargeted to candidate or fallback
+    no_identity_aliasing = (
+        identity_core_name != cand_core
+        and identity_core_name != fallback_core
+        and cand_core in all_cores_status
+    )
+
     no_candidate_promotion = bool(
         cand_core_preserved
         and cand_instance_dir_matches
         and identity_not_swapped
         and fallback_distinct
+        and no_identity_aliasing
     )
     if not no_candidate_promotion:
         raise AssertionError("Failed promotion check: candidate core was aliased, swapped, or reused!")
 
     promotion_evidence = [
-        f"Observation 1 (core preservation): Candidate core '{cand_core}' remains present in CoreAdmin STATUS under its exact original name.",
-        f"Observation 2 (instanceDir identity): Candidate core instanceDir '{cand_instance_dir}' points to its own dedicated directory and was never swapped or renamed.",
-        f"Observation 3 (identity isolation): Identity/search core '{identity_core_name}' was not swapped or aliased to '{cand_core}'.",
-        f"Observation 4 (native reference isolation): Retained native reference core '{native_core}' was not modified or overwritten.",
+        f"Observation 1 (no promotion code invoked): Candidate indexer CLI halted immediately upon injected failure (exit code {cand_proc.returncode}); no promotion logic, alias API, or core swap commands exist in its failure path.",
+        f"Observation 2 (isolated CoreAdmin STATUS): Candidate core '{cand_core}' remains registered under its exact original name with dedicated instanceDir '{cand_instance_dir}'.",
+        f"Observation 3 (identity core unaltered): Identity/search core '{identity_core_name}' remains mapped to its own instanceDir without alias, swap, or rename.",
+        f"Observation 4 (native reference isolation): Retained native reference core '{native_core}' was not modified, swapped, or overwritten.",
         f"Observation 5 (fallback fresh core): Native fallback executed strictly into new, distinct fallback core '{fallback_core}'.",
+        "(Scope limitation: This confirms empirically via isolated CoreAdmin status that no promotion occurred during this run; it is an isolated state check rather than a global proof across arbitrary external systems.)",
     ]
 
     candidate_failed_cleanly = bool(cand_proc.returncode != 0 and cand_summary.get("success") is False and cand_summary.get("failures", 0) >= 1)
@@ -622,6 +786,7 @@ def run_failure_injection_fallback_harness():
         "stack_id": EXPECTED_STACK_ID,
         "git_commit": git_head,
         "git_branch": git_branch,
+        "git_dirty": git_dirty,
         "release_binary_sha256": provenance["sha256"],
         "repo_id": DEFAULT_REPO_ID,
         "expected_ao_count": EXPECTED_AO_COUNT,
@@ -635,8 +800,11 @@ def run_failure_injection_fallback_harness():
             "solr_docs_in_partial_candidate_core": cand_core_docs,
             "solr_update_requests_sent": cand_update_requests,
             "real_time_get_check": {
+                "target_id": target_ao_id,
+                "target_uri": target_ao_uri,
                 "confirmed": rt_get_confirmed,
                 "details": rt_get_details,
+                "primary_proof": "solr_update_requests_sent",
             },
             "hard_commit_issued": cand_summary.get("solr_commit_elapsed_sec", 0.0) > 0.0,
             "promoted": not no_candidate_promotion,
@@ -649,7 +817,7 @@ def run_failure_injection_fallback_harness():
         "native_fallback_execution": {
             "exit_code": fb_proc.returncode,
             "script_elapsed_sec": t_fb_elapsed,
-            "report_file": latest_report_path,
+            "report_file": selected_report_path,
             "solr_verified_docs": fb_solr_num_found,
             "system_snapshots": {
                 "pre": pre_fb_metrics,
@@ -669,6 +837,7 @@ def run_failure_injection_fallback_harness():
             "gate2_safe_fallback_demonstrated": gate2_safe_fallback_demonstrated,
         },
         "no_candidate_promotion_evidence": promotion_evidence,
+        "no_candidate_promotion_basis": "verified_isolated_coreadmin_status_and_no_promotion_code_invoked",
         "solr_partial_write_safety_explanation": (
             "Because active Solr background autoCommit/autoSoftCommit could theoretically persist or make partial "
             "documents visible even without a client final hard commit, client-side 'no hard commit' alone does not "

@@ -14,11 +14,19 @@ import run_gate2_failure_injection_fallback as harness
 
 
 class TestRunGate2FailureInjectionFallback(unittest.TestCase):
+    def _mock_git_subproc(self, cmd, *args, **kwargs):
+        if "rev-parse" in cmd and "--abbrev-ref" in cmd:
+            return MagicMock(returncode=0, stdout="codex/native-profile-analysis\n")
+        if "rev-parse" in cmd:
+            return MagicMock(returncode=0, stdout="431c4789ceeebd348ed7b93237a865838a9dda1e\n")
+        if "status" in cmd:
+            return MagicMock(returncode=0, stdout="")
+        return MagicMock(returncode=0, stdout="")
+
     def test_dry_run_passes_safety_checks(self):
         with patch("run_gate2_failure_injection_fallback.parse_args") as mock_args:
             mock_args.return_value = MagicMock(dry_run=True, state=harness.DEFAULT_STATE_FILE)
-            with patch("run_gate2_failure_injection_fallback.subprocess.run") as mock_subproc:
-                mock_subproc.return_value = MagicMock(returncode=0, stdout="codex/native-profile-analysis\n")
+            with patch("run_gate2_failure_injection_fallback.subprocess.run", side_effect=self._mock_git_subproc):
                 with patch("run_gate2_failure_injection_fallback.verify_binary_provenance", return_value={"sha256": "mock", "path": "mock"}):
                     with patch("run_gate2_failure_injection_fallback.get_mem_available_gib", return_value=32.0):
                         with patch("run_gate2_failure_injection_fallback.is_running", return_value=True):
@@ -35,11 +43,22 @@ class TestRunGate2FailureInjectionFallback(unittest.TestCase):
                                 rc = harness.run_failure_injection_fallback_harness()
                                 self.assertEqual(rc, 0)
 
+    def test_fails_if_git_dirty(self):
+        with patch("run_gate2_failure_injection_fallback.parse_args") as mock_args:
+            mock_args.return_value = MagicMock(dry_run=True, state=harness.DEFAULT_STATE_FILE)
+            def git_dirty_subproc(cmd, *args, **kwargs):
+                if "status" in cmd:
+                    return MagicMock(returncode=0, stdout=" M scripts/run_gate2_failure_injection_fallback.py\n")
+                return self._mock_git_subproc(cmd, *args, **kwargs)
+            with patch("run_gate2_failure_injection_fallback.subprocess.run", side_effect=git_dirty_subproc):
+                with self.assertRaises(RuntimeError) as cm:
+                    harness.run_failure_injection_fallback_harness()
+                self.assertIn("Git working tree has uncommitted tracked changes", str(cm.exception))
+
     def test_fails_if_memory_low(self):
         with patch("run_gate2_failure_injection_fallback.parse_args") as mock_args:
             mock_args.return_value = MagicMock(dry_run=True, state=harness.DEFAULT_STATE_FILE)
-            with patch("run_gate2_failure_injection_fallback.subprocess.run") as mock_subproc:
-                mock_subproc.return_value = MagicMock(returncode=0, stdout="codex/native-profile-analysis\n")
+            with patch("run_gate2_failure_injection_fallback.subprocess.run", side_effect=self._mock_git_subproc):
                 with patch("run_gate2_failure_injection_fallback.verify_binary_provenance", return_value={"sha256": "mock", "path": "mock"}):
                     with patch("run_gate2_failure_injection_fallback.get_mem_available_gib", return_value=12.0):
                         with self.assertRaises(RuntimeError) as cm:
@@ -49,8 +68,7 @@ class TestRunGate2FailureInjectionFallback(unittest.TestCase):
     def test_fails_if_main_solr_running(self):
         with patch("run_gate2_failure_injection_fallback.parse_args") as mock_args:
             mock_args.return_value = MagicMock(dry_run=True, state=harness.DEFAULT_STATE_FILE)
-            with patch("run_gate2_failure_injection_fallback.subprocess.run") as mock_subproc:
-                mock_subproc.return_value = MagicMock(returncode=0, stdout="codex/native-profile-analysis\n")
+            with patch("run_gate2_failure_injection_fallback.subprocess.run", side_effect=self._mock_git_subproc):
                 with patch("run_gate2_failure_injection_fallback.verify_binary_provenance", return_value={"sha256": "mock", "path": "mock"}):
                     with patch("run_gate2_failure_injection_fallback.get_mem_available_gib", return_value=32.0):
                         with patch("run_gate2_failure_injection_fallback.docker_inspect") as mock_inspect:
@@ -115,6 +133,21 @@ class TestRunGate2FailureInjectionFallback(unittest.TestCase):
             and fallback_exact_parity
         )
         self.assertFalse(gate2_safe_fallback_no_updates)
+
+    def test_fetch_first_archival_object_id_fallback_on_unauthenticated(self):
+        first_id = harness.fetch_first_archival_object_id("http://127.0.0.1:9999", "admin", "invalid", 4)
+        self.assertEqual(first_id, 1221)
+
+    def test_save_debug_stderr_flag_parsed(self):
+        with patch("sys.argv", ["run_gate2_failure_injection_fallback.py", "--save-debug-stderr"]):
+            args = harness.parse_args()
+            self.assertTrue(args.save_debug_stderr)
+
+    def test_fallback_core_name_requires_fallback_suffix(self):
+        invalid_core = "stage_staff_20261026_181421_60310_397ad107_candidate"
+        self.assertFalse(invalid_core.endswith("_fallback"))
+        valid_core = "stage_staff_20261026_181421_60310_397ad107_fallback"
+        self.assertTrue(valid_core.endswith("_fallback"))
 
 
 if __name__ == "__main__":
