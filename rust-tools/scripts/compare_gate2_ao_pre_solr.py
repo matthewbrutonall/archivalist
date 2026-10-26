@@ -589,7 +589,7 @@ def main():
     if not db_info or not db_info.get("State", {}).get("Running", False):
         raise RuntimeError(f"DB container {DB_CONTAINER} is not running!")
     db_labels = db_info.get("Config", {}).get("Labels", {})
-    if db_labels.get("archivalist-profiling-stack") != EXPECTED_STACK_ID:
+    if db_labels.get("archivalist.profiling-stack") != EXPECTED_STACK_ID:
         raise RuntimeError(f"DB container label mismatch for stack {EXPECTED_STACK_ID}")
     print(f"Verified DB container {DB_CONTAINER} is running with correct labels.")
 
