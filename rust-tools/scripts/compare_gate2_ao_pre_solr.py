@@ -35,6 +35,7 @@ import subprocess
 import sys
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -804,7 +805,132 @@ def main():
         for fix in fix_proposals:
             print(f"  Proposed Fix: {fix}")
     elif args.full_if_sample_passes:
-        print("\nSample comparison passed with 0 differences! Full run not requested or required here.")
+        print("\n=== Phase 2: Full 24,200 Pre-Solr Comparison ===", flush=True)
+
+        # 1. Discover all repository AO IDs from backend
+        all_ids_url = f"{backend_host_url}/repositories/{args.repo_id}/archival_objects?all_ids=true&modified_since=0"
+        all_ids_req = urllib.request.Request(all_ids_url, headers={"X-ArchivesSpace-Session": session_token})
+        with urllib.request.urlopen(all_ids_req, timeout=30) as resp:
+            all_ids = json.loads(resp.read().decode())
+        print(f"Discovered {len(all_ids)} total repository AO IDs (expected: {EXPECTED_AO_COUNT}).", flush=True)
+        if len(all_ids) != EXPECTED_AO_COUNT:
+            raise RuntimeError(f"Expected {EXPECTED_AO_COUNT} IDs, got {len(all_ids)}")
+
+        full_ts = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+        native_full_rel = f"rust-tools/benchmarks/native_pre_solr_full_{full_ts}.json"
+        native_full_host = os.path.join(REPO_ROOT, native_full_rel)
+        native_full_container = f"/archivesspace/{native_full_rel}"
+        write_file_mode_0600(native_full_host, "")
+
+        # 2. Native full capture via app container
+        print(f"Capturing all {len(all_ids)} native pre-Solr documents via JRuby...", flush=True)
+        native_full_cmd = [
+            "docker", "exec",
+            "-u", f"{os.getuid()}:{os.getgid()}",
+            "-e", "GEM_HOME=/archivesspace/build/gems/jruby/3.1.0",
+            "-e", "GEM_PATH=/archivesspace/build/gems/jruby/3.1.0",
+            "-w", "/archivesspace",
+            APP_CONTAINER,
+            "/archivesspace/scripts/jruby",
+            "/archivesspace/rust-tools/scripts/capture_native_pre_solr_ao.rb",
+            "--repo-id", str(args.repo_id),
+            "--all",
+            "--batch-size", "25",
+            "--backend-url", state["backend_network_url"],
+            "--session", session_token,
+            "--output", native_full_container,
+        ]
+        t_native_full_start = time.perf_counter()
+        native_full_proc = subprocess.run(native_full_cmd, capture_output=True, text=True)
+        t_native_full_elapsed = time.perf_counter() - t_native_full_start
+        if native_full_proc.returncode != 0:
+            print(f"Native full capture failed (exit {native_full_proc.returncode}):\n{native_full_proc.stderr}", file=sys.stderr)
+            raise RuntimeError("Native full pre-Solr capture failed")
+        print(f"Native full capture completed in {t_native_full_elapsed:.2f}s: {native_full_proc.stdout.strip()}", flush=True)
+
+        # 3. Rust candidate full execution via release aspace-cli staff-ao-builder
+        rust_full_rel = f"rust-tools/benchmarks/rust_pre_solr_full_{full_ts}.json"
+        rust_full_host = os.path.join(REPO_ROOT, rust_full_rel)
+        print(f"Building Rust candidate pre-Solr documents for {len(all_ids)} IDs via aspace-cli...", flush=True)
+
+        chunks = [all_ids[i:i + 25] for i in range(0, len(all_ids), 25)]
+        print(f"Dispatched {len(chunks)} batches of 25 IDs across worker pool...", flush=True)
+
+        t_rust_full_start = time.perf_counter()
+
+        def build_chunk(chunk_ids: List[int], idx: int) -> List[Dict[str, Any]]:
+            chunk_str = ",".join(str(i) for i in chunk_ids)
+            cmd = [
+                release_bin,
+                "--url", backend_host_url,
+                "--user", state["admin_user"],
+                "--password", state["admin_password"],
+                "staff-ao-builder",
+                "--repo-id", str(args.repo_id),
+                "--ids", chunk_str,
+                "--arks-enabled", "true" if active_arks_enabled else "false",
+                "--strip-markers", "true",
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise RuntimeError(f"Rust builder failed on batch {idx} (exit {proc.returncode}): {proc.stderr}")
+            return json.loads(proc.stdout)
+
+        rust_full_docs: List[Dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            future_to_idx = {
+                executor.submit(build_chunk, chunk, idx): idx
+                for idx, chunk in enumerate(chunks)
+            }
+            completed_batches = 0
+            chunk_results: Dict[int, List[Dict[str, Any]]] = {}
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                chunk_docs = future.result()
+                chunk_results[idx] = chunk_docs
+                completed_batches += 1
+                if completed_batches % 100 == 0 or completed_batches == len(chunks):
+                    print(f"  Built {completed_batches}/{len(chunks)} Rust batches...", flush=True)
+
+        for idx in range(len(chunks)):
+            rust_full_docs.extend(chunk_results[idx])
+
+        t_rust_full_elapsed = time.perf_counter() - t_rust_full_start
+        print(f"Rust full builder completed in {t_rust_full_elapsed:.2f}s ({len(rust_full_docs)} total docs).", flush=True)
+
+        write_file_mode_0600(rust_full_host, json.dumps(rust_full_docs))
+
+        # 4. Read native full documents
+        with open(native_full_host, encoding="utf-8") as f:
+            native_full_data = json.load(f)
+        native_full_docs = native_full_data["documents"]
+
+        print(f"Loaded {len(native_full_docs)} native full docs and {len(rust_full_docs)} Rust full docs.", flush=True)
+        print("Running full type-strict pre-Solr comparison...", flush=True)
+        full_comparison = run_pre_solr_comparison(native_full_docs, rust_full_docs)
+
+        print("\n--- Full 24,200 Pre-Solr Comparison Summary ---")
+        print(f"Records compared: {full_comparison['records_compared']}")
+        print(f"Records with exact equality: {full_comparison['records_with_exact_equality']}")
+        print(f"Records with differences: {full_comparison['records_with_differences']}")
+        print(f"Total differences: {full_comparison['total_differences']}")
+        print(f"Distinct differing paths: {full_comparison['distinct_differing_paths']}")
+        print(f"Embedded json exact bytes matches: {full_comparison['embedded_json_bytes_matches']}/{full_comparison['records_compared']}")
+        print(f"Embedded json parsed matches: {full_comparison['embedded_json_parsed_matches']}/{full_comparison['records_compared']}")
+        if full_comparison["top_differing_paths"]:
+            print("Top differing paths:")
+            for p in full_comparison["top_differing_paths"]:
+                print(f"  {p['path']}: {p['count']}")
+
+        report["full_run_executed"] = True
+        report["full_comparison"] = full_comparison
+        report["gate2_pre_solr_pass"] = (
+            sample_comparison["records_with_differences"] == 0
+            and full_comparison["records_with_differences"] == 0
+            and full_comparison["embedded_json_bytes_matches"] == EXPECTED_AO_COUNT
+        )
+        if full_comparison["records_with_differences"] > 0:
+            report["stop_reason"] = "Full comparison detected pre-Solr document field differences."
 
     # Write report mode 0600
     report_path = os.path.join(

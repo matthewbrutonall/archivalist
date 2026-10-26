@@ -138,6 +138,8 @@ end
 
 ids = Array(ids).map(&:to_i).uniq
 
+total_ids = ids.length
+batch_idx = 0
 ids.each_slice(options[:batch_size]) do |id_subset|
   records = indexer.fetch_records(:archival_object, id_subset, indexer.resolved_attributes)
   next if records.empty?
@@ -149,6 +151,10 @@ ids.each_slice(options[:batch_size]) do |id_subset|
     }
   end
   indexer.index_records(prepared)
+  batch_idx += 1
+  if batch_idx % 100 == 0 || indexer.captured_docs.length == total_ids
+    $stderr.puts "Captured #{indexer.captured_docs.length}/#{total_ids} native pre-Solr docs..."
+  end
 end
 
 # Write captured docs atomically mode 0600
