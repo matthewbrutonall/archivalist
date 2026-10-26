@@ -785,6 +785,145 @@ impl IsolatedSolrStaffAoWriter {
         self.commit().await
     }
 
+    /// Verifies that the designated stage candidate core exists in Solr and contains zero documents.
+    ///
+    /// Refuses to write if:
+    /// - The Solr core is absent from Solr admin STATUS.
+    /// - The Solr core already contains documents (`numFound > 0`).
+    /// - The Solr admin or select endpoint fails or returns a non-zero status.
+    pub async fn verify_target_core_ready(&self) -> Result<()> {
+        let status_url = format!(
+            "{}/admin/cores?action=STATUS&core={}&wt=json",
+            self.base_url.trim_end_matches('/'),
+            self.target_core
+        );
+        let resp = match self
+            .http
+            .get(&status_url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(ASpaceError::Solr {
+                    status: 0,
+                    message: format!("HTTP transport failure querying Solr core STATUS: {}", e),
+                });
+            }
+        };
+
+        let http_status = resp.status();
+        if !http_status.is_success() {
+            return Err(ASpaceError::Solr {
+                status: http_status.as_u16(),
+                message: format!(
+                    "Solr core STATUS request failed with HTTP status {}",
+                    http_status.as_u16()
+                ),
+            });
+        }
+
+        let body_text = resp.text().await.unwrap_or_default();
+        let json_body: Value = match serde_json::from_str(&body_text) {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(ASpaceError::Solr {
+                    status: http_status.as_u16(),
+                    message: "Solr core STATUS response is not valid JSON".to_string(),
+                });
+            }
+        };
+
+        if json_body
+            .get("responseHeader")
+            .and_then(|h| h.get("status"))
+            .and_then(Value::as_i64)
+            != Some(0)
+        {
+            return Err(ASpaceError::Solr {
+                status: http_status.as_u16(),
+                message: "Solr core STATUS returned non-zero responseHeader status".to_string(),
+            });
+        }
+
+        let core_info = json_body
+            .get("status")
+            .and_then(|s| s.get(&self.target_core));
+
+        match core_info {
+            Some(Value::Object(map)) if !map.is_empty() => {}
+            _ => {
+                return Err(ASpaceError::InvalidRequest(format!(
+                    "Target candidate core '{}' does not exist in Solr. Writer refuses to write to absent core.",
+                    self.target_core
+                )));
+            }
+        }
+
+        let select_url = format!(
+            "{}/{}/select?q=*:*&rows=0&wt=json",
+            self.base_url.trim_end_matches('/'),
+            self.target_core
+        );
+        let sel_resp = match self
+            .http
+            .get(&select_url)
+            .header("Accept", "application/json")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(ASpaceError::Solr {
+                    status: 0,
+                    message: format!("HTTP transport failure querying Solr core select: {}", e),
+                });
+            }
+        };
+
+        let sel_status = sel_resp.status();
+        if !sel_status.is_success() {
+            return Err(ASpaceError::Solr {
+                status: sel_status.as_u16(),
+                message: format!(
+                    "Solr select request on '{}' failed with HTTP status {}",
+                    self.target_core,
+                    sel_status.as_u16()
+                ),
+            });
+        }
+
+        let sel_body = sel_resp.text().await.unwrap_or_default();
+        let sel_json: Value = match serde_json::from_str(&sel_body) {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(ASpaceError::Solr {
+                    status: sel_status.as_u16(),
+                    message: "Solr select response is not valid JSON".to_string(),
+                });
+            }
+        };
+
+        let num_found = sel_json
+            .get("response")
+            .and_then(|r| r.get("numFound"))
+            .and_then(Value::as_u64)
+            .ok_or_else(|| ASpaceError::Solr {
+                status: sel_status.as_u16(),
+                message: "Missing or invalid numFound in Solr select response".to_string(),
+            })?;
+
+        if num_found > 0 {
+            return Err(ASpaceError::InvalidRequest(format!(
+                "Target candidate core '{}' is not empty (found {} existing documents). Writer refuses to write to non-empty core.",
+                self.target_core, num_found
+            )));
+        }
+
+        Ok(())
+    }
+
     /// Posts an update payload to the target stage core update endpoint.
     ///
     /// Fails closed unless the HTTP response is 2xx AND the response body is parseable JSON
@@ -1757,5 +1896,88 @@ mod tests {
 
         del_mock.assert_async().await;
         add_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_verify_target_core_ready_refuses_absent_core() {
+        let mut server = Server::new_async().await;
+        let base_url = server.url();
+        let core = "stage_staff_20261026_caseabsent_candidate";
+
+        let _status_mock = server
+            .mock(
+                "GET",
+                "/admin/cores?action=STATUS&core=stage_staff_20261026_caseabsent_candidate&wt=json",
+            )
+            .with_status(200)
+            .with_body(r#"{"responseHeader":{"status":0},"status":{}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let writer = IsolatedSolrStaffAoWriter::new(&base_url, core).unwrap();
+        let err = writer.verify_target_core_ready().await.unwrap_err();
+        assert!(err.to_string().contains("does not exist in Solr"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_target_core_ready_refuses_non_empty_core() {
+        let mut server = Server::new_async().await;
+        let base_url = server.url();
+        let core = "stage_staff_20261026_casenonempty_candidate";
+
+        let _status_mock = server
+            .mock("GET", "/admin/cores?action=STATUS&core=stage_staff_20261026_casenonempty_candidate&wt=json")
+            .with_status(200)
+            .with_body(r#"{"responseHeader":{"status":0},"status":{"stage_staff_20261026_casenonempty_candidate":{"name":"stage_staff_20261026_casenonempty_candidate"}}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let _select_mock = server
+            .mock(
+                "GET",
+                "/stage_staff_20261026_casenonempty_candidate/select?q=*:*&rows=0&wt=json",
+            )
+            .with_status(200)
+            .with_body(r#"{"responseHeader":{"status":0},"response":{"numFound":5,"docs":[]}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let writer = IsolatedSolrStaffAoWriter::new(&base_url, core).unwrap();
+        let err = writer.verify_target_core_ready().await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("is not empty (found 5 existing documents)"));
+    }
+
+    #[tokio::test]
+    async fn test_verify_target_core_ready_success() {
+        let mut server = Server::new_async().await;
+        let base_url = server.url();
+        let core = "stage_staff_20261026_casesuccess_candidate";
+
+        let _status_mock = server
+            .mock("GET", "/admin/cores?action=STATUS&core=stage_staff_20261026_casesuccess_candidate&wt=json")
+            .with_status(200)
+            .with_body(r#"{"responseHeader":{"status":0},"status":{"stage_staff_20261026_casesuccess_candidate":{"name":"stage_staff_20261026_casesuccess_candidate"}}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let _select_mock = server
+            .mock(
+                "GET",
+                "/stage_staff_20261026_casesuccess_candidate/select?q=*:*&rows=0&wt=json",
+            )
+            .with_status(200)
+            .with_body(r#"{"responseHeader":{"status":0},"response":{"numFound":0,"docs":[]}}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let writer = IsolatedSolrStaffAoWriter::new(&base_url, core).unwrap();
+        writer.verify_target_core_ready().await.unwrap();
     }
 }

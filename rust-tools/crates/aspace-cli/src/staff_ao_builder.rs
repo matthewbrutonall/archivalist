@@ -44,6 +44,18 @@ pub struct StaffAoBuilderArgs {
 
     #[arg(long, help = "Path to write JSON output file (stdout if omitted)")]
     pub output: Option<PathBuf>,
+
+    #[arg(
+        long,
+        help = "Isolated Solr base URL (e.g. http://127.0.0.1:18983/solr) for candidate write mode"
+    )]
+    pub solr_url: Option<String>,
+
+    #[arg(
+        long,
+        help = "Target stage candidate core name (format: stage_staff_<nonce>_candidate)"
+    )]
+    pub candidate_core: Option<String>,
 }
 
 impl StaffAoBuilderArgs {
@@ -59,6 +71,16 @@ impl StaffAoBuilderArgs {
                 "cannot request more than 100 AO IDs per call (requested: {})",
                 self.ids.len()
             );
+        }
+        match (&self.solr_url, &self.candidate_core) {
+            (Some(url), Some(core)) => {
+                aspace_client::isolated_solr_writer::validate_isolated_solr_base_url(url)?;
+                aspace_client::isolated_solr_writer::validate_stage_candidate_core(core, None)?;
+            }
+            (None, None) => {}
+            _ => {
+                bail!("--solr-url and --candidate-core must be specified together");
+            }
         }
         Ok(())
     }
@@ -145,6 +167,26 @@ pub async fn execute_staff_ao_builder(
         for doc in &mut docs {
             strip_archivalist_markers(doc);
         }
+    }
+
+    if let (Some(solr_url), Some(candidate_core)) = (&args.solr_url, &args.candidate_core) {
+        let mut writer = aspace_client::isolated_solr_writer::IsolatedSolrStaffAoWriter::new(
+            solr_url,
+            candidate_core,
+        )
+        .context("Failed to construct IsolatedSolrStaffAoWriter")?;
+        writer
+            .verify_target_core_ready()
+            .await
+            .context("Target candidate core readiness verification failed")?;
+        writer
+            .add_documents(docs.clone())
+            .await
+            .context("Failed to add documents to isolated Solr writer")?;
+        writer
+            .commit()
+            .await
+            .context("Failed to commit documents in isolated Solr writer")?;
     }
 
     Ok(docs)
@@ -271,6 +313,8 @@ mod tests {
             arks_enabled: false,
             strip_markers: true,
             output: None,
+            solr_url: None,
+            candidate_core: None,
         };
         assert!(invalid_repo.validate().is_err());
 
@@ -280,6 +324,8 @@ mod tests {
             arks_enabled: false,
             strip_markers: true,
             output: None,
+            solr_url: None,
+            candidate_core: None,
         };
         assert!(empty_ids.validate().is_err());
 
@@ -289,6 +335,8 @@ mod tests {
             arks_enabled: false,
             strip_markers: true,
             output: None,
+            solr_url: None,
+            candidate_core: None,
         };
         assert!(too_many_ids.validate().is_err());
 
@@ -298,8 +346,68 @@ mod tests {
             arks_enabled: false,
             strip_markers: true,
             output: None,
+            solr_url: None,
+            candidate_core: None,
         };
         assert!(valid.validate().is_ok());
+
+        // Mismatched solr_url and candidate_core
+        let mismatch1 = StaffAoBuilderArgs {
+            repo: 4,
+            ids: vec![1],
+            arks_enabled: false,
+            strip_markers: true,
+            output: None,
+            solr_url: Some("http://127.0.0.1:8983/solr".to_string()),
+            candidate_core: None,
+        };
+        assert!(mismatch1.validate().is_err());
+
+        let mismatch2 = StaffAoBuilderArgs {
+            repo: 4,
+            ids: vec![1],
+            arks_enabled: false,
+            strip_markers: true,
+            output: None,
+            solr_url: None,
+            candidate_core: Some("stage_staff_nonce1_candidate".to_string()),
+        };
+        assert!(mismatch2.validate().is_err());
+
+        // Non-loopback Solr URL refused
+        let non_loopback = StaffAoBuilderArgs {
+            repo: 4,
+            ids: vec![1],
+            arks_enabled: false,
+            strip_markers: true,
+            output: None,
+            solr_url: Some("http://remote-solr.com:8983/solr".to_string()),
+            candidate_core: Some("stage_staff_nonce1_candidate".to_string()),
+        };
+        assert!(non_loopback.validate().is_err());
+
+        // Forbidden core name refused
+        let forbidden_core = StaffAoBuilderArgs {
+            repo: 4,
+            ids: vec![1],
+            arks_enabled: false,
+            strip_markers: true,
+            output: None,
+            solr_url: Some("http://127.0.0.1:8983/solr".to_string()),
+            candidate_core: Some("stage_staff_test_candidate".to_string()),
+        };
+        assert!(forbidden_core.validate().is_err());
+
+        let valid_solr = StaffAoBuilderArgs {
+            repo: 4,
+            ids: vec![1],
+            arks_enabled: false,
+            strip_markers: true,
+            output: None,
+            solr_url: Some("http://127.0.0.1:18983/solr".to_string()),
+            candidate_core: Some("stage_staff_20261026_candidate".to_string()),
+        };
+        assert!(valid_solr.validate().is_ok());
     }
 
     #[test]
@@ -381,6 +489,8 @@ mod tests {
             arks_enabled: false,
             strip_markers: true,
             output: None,
+            solr_url: None,
+            candidate_core: None,
         };
 
         let docs = execute_staff_ao_builder(&client, &args)
@@ -395,6 +505,103 @@ mod tests {
         assert_eq!(doc["title"], "Item 1221 display");
         assert_eq!(doc["resource"], "/repositories/4/resources/10");
         assert!(doc.get("_archivalist_rust_fields").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_execute_staff_ao_builder_with_solr_write_and_commit() {
+        let mut server = Server::new_async().await;
+
+        let schemas_payload = json!({
+            "archival_object": {
+                "properties": {
+                    "level": {
+                        "type": "string",
+                        "dynamic_enum": "archival_record_level"
+                    }
+                }
+            }
+        });
+
+        let _m_schemas = server
+            .mock("GET", "/schemas")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&schemas_payload).unwrap())
+            .create_async()
+            .await;
+
+        let ao_records = json!([
+            {
+                "uri": "/repositories/4/archival_objects/1221",
+                "title": "Item 1221",
+                "display_string": "Item 1221 display",
+                "level": "item",
+                "publish": true,
+                "suppressed": false,
+                "resource": {"ref": "/repositories/4/resources/10"},
+                "ancestors": [{"ref": "/repositories/4/resources/10"}]
+            }
+        ]);
+
+        let _m_ao = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(
+                    r"^/repositories/4/archival_objects\?.*id_set=1221.*".to_string(),
+                ),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&ao_records).unwrap())
+            .create_async()
+            .await;
+
+        let core_name = "stage_staff_20261026_casebuilderwrite_candidate";
+        let status_path = format!("/admin/cores?action=STATUS&core={}&wt=json", core_name);
+        let _m_status = server
+            .mock("GET", status_path.as_str())
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"responseHeader":{{"status":0}},"status":{{"{}":{{"name":"{}"}}}}}}"#,
+                core_name, core_name
+            ))
+            .create_async()
+            .await;
+
+        let select_path = format!("/{}/select?q=*:*&rows=0&wt=json", core_name);
+        let _m_select = server
+            .mock("GET", select_path.as_str())
+            .with_status(200)
+            .with_body(r#"{"responseHeader":{"status":0},"response":{"numFound":0,"docs":[]}}"#)
+            .create_async()
+            .await;
+
+        let update_path = format!("/{}/update", core_name);
+        let _m_update = server
+            .mock("POST", update_path.as_str())
+            .with_status(200)
+            .with_body(r#"{"responseHeader":{"status":0}}"#)
+            .expect(2) // 1 for docs batch, 1 for commit
+            .create_async()
+            .await;
+
+        let mut client = Client::new(server.url());
+        client.session_token = Some("dummy-session".to_string());
+
+        let args = StaffAoBuilderArgs {
+            repo: 4,
+            ids: vec![1221],
+            arks_enabled: false,
+            strip_markers: true,
+            output: None,
+            solr_url: Some(server.url()),
+            candidate_core: Some(core_name.to_string()),
+        };
+
+        let docs = execute_staff_ao_builder(&client, &args)
+            .await
+            .expect("should write and commit to Solr candidate core");
+        assert_eq!(docs.len(), 1);
     }
 
     #[cfg(unix)]
