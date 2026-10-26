@@ -52,6 +52,14 @@ cargo run -p aspace-cli -- --url http://localhost:4567 \
 
 cargo run -p aspace-cli -- --url http://localhost:4567 \
   perf health --repo REPOSITORY_ID --json
+
+# Against isolated profiling stack backend (default port 14567; caveat: actual stack state overrides if customized):
+cargo run -p aspace-cli -- --url http://127.0.0.1:14567 \
+  staff-ao-probe --repo REPOSITORY_ID --batch-size 25 --concurrency 4 --json
+
+# Or dynamically derived from validated profiling stack state file:
+cargo run -p aspace-cli -- --url "$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["backend_host_url"])' /path/to/profiling_stack_state.json)" \
+  staff-ao-probe --repo REPOSITORY_ID --batch-size 25 --concurrency 4 --json
 ```
 
 ## Shadow index
@@ -407,6 +415,30 @@ Scripts under `scripts/` are code-only harnesses:
   host load, route parameters, raw warmup and repeat durations, p50/p95 percentiles (defaulting to
   >=20 measured samples), status/blocker details, and response result counts. Network/HTTP errors
   are captured per route to preserve completed measurements and partial route durations. Offline tests: `test_benchmark_native_search_and_tree.py`.
+- `staff-ao-probe` (`aspace-cli` subcommand): Bounded, read-only Rust STAFF archival-object
+  hydration probe that exercises `Client::fetch_staff_archival_objects_by_ids` over all AO IDs
+  for one repository against an explicitly isolated backend instance.
+  Exact command (derive URL from validated profiling stack state, or use explicit default `http://127.0.0.1:14567` with caveat actual state overrides):
+  ```bash
+  # Explicit default isolated profiling stack backend URL (port 14567; caveat: actual stack state overrides if customized):
+  cargo run -p aspace-cli -- --url http://127.0.0.1:14567 \
+    staff-ao-probe --repo REPOSITORY_ID --batch-size 25 --concurrency 4 --json
+
+  # Or dynamically derived from validated profiling stack state file:
+  cargo run -p aspace-cli -- --url "$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["backend_host_url"])' /path/to/profiling_stack_state.json)" \
+    staff-ao-probe --repo REPOSITORY_ID --batch-size 25 --concurrency 4 --json
+  ```
+  Inputs: repository ID, batch size (default 25, maximum 25), and worker concurrency (default 4,
+  bounded to maximum 32). Fetches the full repository AO ID list, then all records in bounded
+  batches using the full STAFF indexer resolve list (`resolve[]`). Safely aggregates out-of-order
+  completions, tracks exact returned IDs, unique URIs, batch counts, failures, and wall clock elapsed
+  time covering the ID list and all batch fetches (excludes authentication; `aspace-cli` logs in first).
+  Aborts non-zero on any missing, duplicate, or unexpected IDs or batch request failures without printing
+  record payloads or secrets.
+  Emits human-readable summary by default, or machine-readable JSON summary (`--json`), with explicit note
+  that no Solr build or write is measured.
+  **Scope caveat:** This is strictly a source-fetch timing and validity experiment, NOT an
+  indexer or parity/speedup claim. No Solr documents are built or written.
 - Helpers that query records require the caller to provide test-specific values
   through environment variables such as `RESOURCE_URI` and `QUERY`.
 

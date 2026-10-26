@@ -10,6 +10,7 @@ use serde::Serialize;
 use std::{collections::BTreeMap, io};
 
 pub mod shadow;
+pub mod staff_ao_probe;
 
 #[derive(Serialize)]
 struct PerfPingReport {
@@ -305,6 +306,8 @@ enum Commands {
         #[command(subcommand)]
         target: ValidateTarget,
     },
+    #[command(name = "staff-ao-probe", alias = "staff-ao-hydration-probe")]
+    StaffAoProbe(staff_ao_probe::StaffAoProbeArgs),
 }
 
 #[derive(Subcommand)]
@@ -476,6 +479,8 @@ enum PerfTarget {
     RecordTypes(PerfRecordTypesArgs),
     SearchCheck(PerfSearchCheckArgs),
     SolrCheck(PerfSolrCheckArgs),
+    #[command(name = "staff-ao-probe", alias = "staff-ao-hydration-probe")]
+    StaffAoProbe(staff_ao_probe::StaffAoProbeArgs),
 }
 
 #[derive(clap::Args)]
@@ -1124,7 +1129,13 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
+                PerfTarget::StaffAoProbe(args) => {
+                    staff_ao_probe::run_staff_ao_probe(&client, args.clone()).await?;
+                }
             }
+        }
+        Commands::StaffAoProbe(args) => {
+            staff_ao_probe::run_staff_ao_probe(&client, args.clone()).await?;
         }
         Commands::Validate { target } => match target {
             ValidateTarget::Repositories => {
@@ -2056,6 +2067,58 @@ mod tests {
     #[test]
     fn verify_cli() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn staff_ao_probe_cli_parsing() {
+        let cli =
+            Cli::try_parse_from(["aspace", "staff-ao-probe", "--repo", "2", "--json"]).unwrap();
+        match cli.command {
+            Commands::StaffAoProbe(args) => {
+                assert_eq!(args.repo, 2);
+                assert_eq!(args.batch_size, 25);
+                assert_eq!(args.concurrency, 4);
+                assert!(args.json);
+                assert!(args.validate().is_ok());
+            }
+            _ => panic!("Expected Commands::StaffAoProbe"),
+        }
+
+        let cli_alias = Cli::try_parse_from([
+            "aspace",
+            "staff-ao-hydration-probe",
+            "--repo-id",
+            "3",
+            "--batch-size",
+            "10",
+            "--concurrency",
+            "8",
+        ])
+        .unwrap();
+        match cli_alias.command {
+            Commands::StaffAoProbe(args) => {
+                assert_eq!(args.repo, 3);
+                assert_eq!(args.batch_size, 10);
+                assert_eq!(args.concurrency, 8);
+                assert!(!args.json);
+                assert!(args.validate().is_ok());
+            }
+            _ => panic!("Expected Commands::StaffAoProbe"),
+        }
+
+        let cli_perf =
+            Cli::try_parse_from(["aspace", "perf", "staff-ao-probe", "--repo", "2"]).unwrap();
+        match cli_perf.command {
+            Commands::Perf {
+                target: PerfTarget::StaffAoProbe(args),
+            } => {
+                assert_eq!(args.repo, 2);
+                assert_eq!(args.batch_size, 25);
+                assert_eq!(args.concurrency, 4);
+                assert!(args.validate().is_ok());
+            }
+            _ => panic!("Expected PerfTarget::StaffAoProbe"),
+        }
     }
 
     #[test]

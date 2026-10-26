@@ -5,7 +5,9 @@ pub mod models;
 pub mod shadow;
 pub mod validation;
 
-pub use client::Client;
+pub use client::{
+    Client, DEFAULT_STAFF_ARCHIVAL_OBJECT_BATCH_SIZE, STAFF_INDEXER_RESOLVED_ATTRIBUTES,
+};
 pub use error::{ASpaceError, Result};
 pub use index_document::{
     build_index_document, build_index_document_batch, IndexDocumentBatchRequest,
