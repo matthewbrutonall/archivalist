@@ -2157,6 +2157,29 @@ mod tests {
             _ => panic!("Expected Commands::StaffAoBuilder"),
         }
 
+        let cli_builder_write_output = Cli::try_parse_from([
+            "aspace",
+            "staff-ao-builder",
+            "--repo",
+            "4",
+            "--ids",
+            "1221,2229",
+            "--solr-url",
+            "http://127.0.0.1:18983/solr",
+            "--candidate-core",
+            "stage_staff_20261026_candidate",
+            "--output",
+            "/tmp/should_be_rejected.json",
+        ])
+        .unwrap();
+        match cli_builder_write_output.command {
+            Commands::StaffAoBuilder(args) => {
+                let err = args.validate().unwrap_err();
+                assert!(err.to_string().contains("--output"));
+            }
+            _ => panic!("Expected Commands::StaffAoBuilder"),
+        }
+
         let cli_build_doc = Cli::try_parse_from([
             "aspace",
             "build-index-document",

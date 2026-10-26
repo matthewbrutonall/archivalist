@@ -155,9 +155,13 @@ class TestSameStageStoredSolrDiagnostic(unittest.TestCase):
 
             test_args = ["diagnose_gate2_ao_same_stage_solr.py", "--state", f.name, "--dry-run"]
             with patch("sys.argv", test_args):
-                with self.assertRaises(RuntimeError) as cm:
-                    run_diagnostic()
-                self.assertIn("wrong_stack_id_1234", str(cm.exception))
+                with patch("diagnose_gate2_ao_same_stage_solr.subprocess.run") as mock_subproc:
+                    mock_subproc.return_value = MagicMock(returncode=0, stdout="codex/native-profile-analysis\n")
+                    with patch("diagnose_gate2_ao_same_stage_solr.verify_binary_provenance") as mock_provenance:
+                        mock_provenance.return_value = {"sha256": "mock_sha256", "size": 1234}
+                        with self.assertRaises(RuntimeError) as cm:
+                            run_diagnostic()
+                        self.assertIn("wrong_stack_id_1234", str(cm.exception))
 
     def test_main_solr_running_refusal(self):
         from diagnose_gate2_ao_same_stage_solr import run_diagnostic
@@ -177,25 +181,29 @@ class TestSameStageStoredSolrDiagnostic(unittest.TestCase):
 
             test_args = ["diagnose_gate2_ao_same_stage_solr.py", "--state", f.name, "--dry-run"]
             with patch("sys.argv", test_args):
-                with patch("diagnose_gate2_ao_same_stage_solr.docker_inspect") as mock_inspect:
-                    # Mock MAIN_SOLR_CONTAINER as running
-                    def inspect_side_effect(name):
-                        if name == "archivesspaceai-solr-1":
-                            return {"State": {"Running": True}}
-                        return {
-                            "State": {"Running": False},
-                            "Config": {
-                                "Labels": {
-                                    "archivalist.profiling-stack": "e62875f1",
-                                    "archivalist.profiling-role": name.split("-")[2],
+                with patch("diagnose_gate2_ao_same_stage_solr.subprocess.run") as mock_subproc:
+                    mock_subproc.return_value = MagicMock(returncode=0, stdout="codex/native-profile-analysis\n")
+                    with patch("diagnose_gate2_ao_same_stage_solr.verify_binary_provenance") as mock_provenance:
+                        mock_provenance.return_value = {"sha256": "mock_sha256", "size": 1234}
+                        with patch("diagnose_gate2_ao_same_stage_solr.docker_inspect") as mock_inspect:
+                            # Mock MAIN_SOLR_CONTAINER as running
+                            def inspect_side_effect(name):
+                                if name == "archivesspaceai-solr-1":
+                                    return {"State": {"Running": True}}
+                                return {
+                                    "State": {"Running": False},
+                                    "Config": {
+                                        "Labels": {
+                                            "archivalist.profiling-stack": "e62875f1",
+                                            "archivalist.profiling-role": name.split("-")[2],
+                                        }
+                                    },
                                 }
-                            },
-                        }
 
-                    mock_inspect.side_effect = inspect_side_effect
-                    with self.assertRaises(RuntimeError) as cm:
-                        run_diagnostic()
-                    self.assertIn("Main Solr container 'archivesspaceai-solr-1' is currently running", str(cm.exception))
+                            mock_inspect.side_effect = inspect_side_effect
+                            with self.assertRaises(RuntimeError) as cm:
+                                run_diagnostic()
+                            self.assertIn("Main Solr container 'archivesspaceai-solr-1' is currently running", str(cm.exception))
 
     def test_candidate_core_already_exists_no_clobber_refusal(self):
         from diagnose_gate2_ao_same_stage_solr import run_diagnostic
@@ -220,74 +228,84 @@ class TestSameStageStoredSolrDiagnostic(unittest.TestCase):
 
             test_args = ["diagnose_gate2_ao_same_stage_solr.py", "--state", f.name]
             with patch("sys.argv", test_args):
-                with patch("diagnose_gate2_ao_same_stage_solr.docker_inspect") as mock_inspect:
-                    def inspect_mock(name):
-                        if name == "archivesspaceai-solr-1":
-                            return {"State": {"Running": False}}
-                        return {
-                            "State": {"Running": True},
-                            "Config": {
-                                "Labels": {
-                                    "archivalist.profiling-stack": "e62875f1",
-                                    "archivalist.profiling-role": name.split("-")[2] if "-" in name else "db",
+                with patch("diagnose_gate2_ao_same_stage_solr.verify_binary_provenance") as mock_provenance:
+                    mock_provenance.return_value = {"sha256": "mock_sha256", "size": 1234}
+                    with patch("diagnose_gate2_ao_same_stage_solr.time.sleep") as mock_sleep:
+                        with patch("diagnose_gate2_ao_same_stage_solr.docker_inspect") as mock_inspect:
+                            def inspect_mock(name):
+                                if name == "archivesspaceai-solr-1":
+                                    return {"State": {"Running": False}}
+                                return {
+                                    "State": {"Running": True},
+                                    "Config": {
+                                        "Labels": {
+                                            "archivalist.profiling-stack": "e62875f1",
+                                            "archivalist.profiling-role": name.split("-")[2] if "-" in name else "db",
+                                        }
+                                    },
                                 }
-                            },
-                        }
-                    mock_inspect.side_effect = inspect_mock
-                    with patch("diagnose_gate2_ao_same_stage_solr.urllib.request.urlopen") as mock_urlopen:
-                        # Mock Solr STATUS returning core already exists
-                        resp_obj = MagicMock()
-                        resp_obj.read.return_value = json.dumps({
-                            "responseHeader": {"status": 0},
-                            "status": {
-                                "stage_staff_20261025_224741_59214_8a08a5d2_native": {"name": "native"},
-                                "archivalist_profiling_identity_e62875f1": {"name": "id"},
-                            },
-                        }).encode("utf-8")
-                        mock_urlopen.return_value = resp_obj
+                            mock_inspect.side_effect = inspect_mock
+                            with patch("diagnose_gate2_ao_same_stage_solr.urllib.request.urlopen") as mock_urlopen:
+                                with patch("diagnose_gate2_ao_same_stage_solr.verify_active_app_arks_enabled") as mock_arks:
+                                    mock_arks.return_value = ("genuine_active_process", False)
+                                    with patch("diagnose_gate2_ao_same_stage_solr.subprocess.run") as mock_subproc:
+                                        executed_commands = []
 
-                        with patch("diagnose_gate2_ao_same_stage_solr.verify_active_app_arks_enabled") as mock_arks:
-                            mock_arks.return_value = ("genuine_active_process", False)
-                            with patch("diagnose_gate2_ao_same_stage_solr.subprocess.run") as mock_subproc:
-                                def subproc_side_effect(cmd, *a, **kw):
-                                    if "git" in cmd:
-                                        if "--abbrev-ref" in cmd:
-                                            return MagicMock(returncode=0, stdout="codex/native-profile-analysis")
-                                        return MagicMock(returncode=0, stdout="e48599e0a897cc816cfbfccb0e28c2f3429da299")
-                                    return MagicMock(returncode=0, stdout="Verified: ok")
+                                        def subproc_side_effect(cmd, *a, **kw):
+                                            executed_commands.append(cmd)
+                                            if cmd[0] == "git":
+                                                if "--abbrev-ref" in cmd:
+                                                    return MagicMock(returncode=0, stdout="codex/native-profile-analysis\n")
+                                                return MagicMock(returncode=0, stdout="e48599e0a897cc816cfbfccb0e28c2f3429da299\n")
+                                            if len(cmd) > 1 and "profiling_stack.py" in cmd[1]:
+                                                return MagicMock(returncode=0, stdout="Verified: ok\n")
+                                            raise AssertionError(f"Unexpected external subprocess execution: {cmd}")
 
-                                mock_subproc.side_effect = subproc_side_effect
-                                # If candidate core check returns that it already exists:
-                                def urlopen_side_effect(req, timeout=None):
-                                    url = req.full_url if hasattr(req, "full_url") else str(req)
-                                    mock_res = MagicMock()
-                                    if "candidate" in url and "action=STATUS" in url:
-                                        # Simulates candidate core already present in Solr
-                                        core_name = url.split("core=")[1].split("&")[0]
-                                        mock_res.read.return_value = json.dumps({
-                                            "status": {core_name: {"name": core_name}}
-                                        }).encode("utf-8")
-                                        return mock_res
-                                    if "action=STATUS" in url:
-                                        mock_res.read.return_value = json.dumps({
-                                            "status": {
-                                                "stage_staff_20261025_224741_59214_8a08a5d2_native": {"name": "native"},
-                                                "archivalist_profiling_identity_e62875f1": {"name": "id"},
-                                            }
-                                        }).encode("utf-8")
-                                        return mock_res
-                                    if "rows=0" in url:
-                                        mock_res.read.return_value = json.dumps({
-                                            "response": {"numFound": 24200}
-                                        }).encode("utf-8")
-                                        return mock_res
-                                    mock_res.read.return_value = b'{"databaseProductName":"MySQL"}'
-                                    return mock_res
+                                        mock_subproc.side_effect = subproc_side_effect
 
-                                mock_urlopen.side_effect = urlopen_side_effect
-                                with self.assertRaises(RuntimeError) as cm:
-                                    run_diagnostic()
-                                self.assertIn("already exists before creation! No-clobber refusal", str(cm.exception))
+                                        def make_mock_response(body_bytes: bytes) -> MagicMock:
+                                            mock_res = MagicMock()
+                                            mock_res.read.return_value = body_bytes
+                                            mock_res.__enter__.return_value = mock_res
+                                            mock_res.__exit__.return_value = None
+                                            return mock_res
+
+                                        def urlopen_side_effect(req, timeout=None):
+                                            url = req.full_url if hasattr(req, "full_url") else str(req)
+                                            if "candidate" in url and "action=STATUS" in url:
+                                                # Simulates candidate core already present in Solr
+                                                core_name = url.split("core=")[1].split("&")[0]
+                                                return make_mock_response(json.dumps({
+                                                    "responseHeader": {"status": 0},
+                                                    "status": {core_name: {"name": core_name}}
+                                                }).encode("utf-8"))
+                                            if "action=STATUS" in url:
+                                                return make_mock_response(json.dumps({
+                                                    "responseHeader": {"status": 0},
+                                                    "status": {
+                                                        "stage_staff_20261025_224741_59214_8a08a5d2_native": {"name": "native"},
+                                                        "archivalist_profiling_identity_e62875f1": {"name": "id"},
+                                                    }
+                                                }).encode("utf-8"))
+                                            if "rows=0" in url:
+                                                return make_mock_response(json.dumps({
+                                                    "responseHeader": {"status": 0},
+                                                    "response": {"numFound": 24200, "docs": []}
+                                                }).encode("utf-8"))
+                                            return make_mock_response(json.dumps({
+                                                "databaseProductName": "MySQL"
+                                            }).encode("utf-8"))
+
+                                        mock_urlopen.side_effect = urlopen_side_effect
+                                        with self.assertRaises(RuntimeError) as cm:
+                                            run_diagnostic()
+                                        self.assertIn("already exists before creation! No-clobber refusal", str(cm.exception))
+
+                                        # Assertions for zero external/Docker calls and zero sleep retries
+                                        self.assertEqual(mock_sleep.call_count, 0, "No retry sleep should occur with properly configured mock responses")
+                                        self.assertGreater(len(executed_commands), 0)
+                                        for cmd in executed_commands:
+                                            self.assertNotIn("docker", cmd, f"Docker must not be invoked during unit test: {cmd}")
 
 
 if __name__ == "__main__":
