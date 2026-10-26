@@ -541,6 +541,7 @@ def main():
     # 1. Verify Git Branch
     git_branch_proc = subprocess.run(
         ["git", "branch", "--show-current"],
+        cwd=REPO_ROOT,
         capture_output=True,
         text=True,
         check=True,
@@ -552,6 +553,7 @@ def main():
 
     git_commit_proc = subprocess.run(
         ["git", "rev-parse", "HEAD"],
+        cwd=REPO_ROOT,
         capture_output=True,
         text=True,
         check=True,
