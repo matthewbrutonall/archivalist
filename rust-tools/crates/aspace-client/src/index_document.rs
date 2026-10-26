@@ -601,7 +601,15 @@ fn add_instance_fields(
     document: &mut Map<String, Value>,
     record: &Map<String, Value>,
 ) -> Result<(), IndexDocumentError> {
-    let instances = wrapped_values(record.get("instances"));
+    let instances = match record.get("instances") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => return Ok(()),
+        Some(Value::Array(items)) => items,
+        Some(_) => return Err(error("field 'instances' must be an array")),
+    };
+    if instances.is_empty() {
+        return Ok(());
+    }
+
     let mut digital_objects = Vec::new();
     let mut top_containers = Vec::new();
     let mut child_containers = Vec::new();
@@ -659,12 +667,10 @@ fn add_instance_fields(
         }
     }
 
-    if !digital_objects.is_empty() {
-        document.insert(
-            "digital_object_uris".to_string(),
-            Value::Array(digital_objects),
-        );
-    }
+    document.insert(
+        "digital_object_uris".to_string(),
+        Value::Array(digital_objects),
+    );
     if !top_containers.is_empty() {
         document.insert(
             "top_container_uri_u_sstr".to_string(),
@@ -4791,6 +4797,155 @@ mod tests {
         assert_eq!(doc_ranged["years"], json!(["1912", "1913", "1914"]));
         assert_eq!(doc_ranged["year_sort"], "19121914");
         assert_eq!(doc_ranged["dates"], json!(["1912 - 1914"]));
+    }
+
+    #[test]
+    fn test_add_instances_and_digital_object_uris_semantics() {
+        // 1. instances absent -> no digital_object_uris, no container fields
+        let doc_no_inst = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/20".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/20",
+                "title": "No instances",
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(doc_no_inst.get("digital_object_uris").is_none());
+        assert!(doc_no_inst.get("top_container_uri_u_sstr").is_none());
+
+        // 2. instances null -> no digital_object_uris
+        let doc_null_inst = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/21".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/21",
+                "title": "Null instances",
+                "instances": Value::Null,
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(doc_null_inst.get("digital_object_uris").is_none());
+
+        // 3. instances false -> no digital_object_uris
+        let doc_false_inst = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/22".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/22",
+                "title": "False instances",
+                "instances": false,
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(doc_false_inst.get("digital_object_uris").is_none());
+
+        // 4. instances: [] (empty array) -> no digital_object_uris
+        let doc_empty_inst = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/23".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/23",
+                "title": "Empty instances",
+                "instances": [],
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(doc_empty_inst.get("digital_object_uris").is_none());
+
+        // 5. instances with containers but no digital objects -> digital_object_uris: []
+        let doc_container_only = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/24".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/24",
+                "title": "Container only",
+                "instances": [{
+                    "sub_container": {
+                        "top_container": {"ref": "/repositories/2/top_containers/9"}
+                    }
+                }],
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(doc_container_only["digital_object_uris"], json!([]));
+        assert_eq!(
+            doc_container_only["top_container_uri_u_sstr"],
+            json!(["/repositories/2/top_containers/9"])
+        );
+
+        // 6. instances with digital objects -> digital_object_uris: [ref]
+        let doc_with_do = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/25".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/25",
+                "title": "With DO",
+                "instances": [{
+                    "digital_object": {"ref": "/repositories/2/digital_objects/42"}
+                }],
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            doc_with_do["digital_object_uris"],
+            json!(["/repositories/2/digital_objects/42"])
+        );
+
+        // 7. invalid instances type -> error
+        let err_inst = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/26".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/26",
+                "instances": "bad",
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(err_inst.to_string(), "field 'instances' must be an array");
+
+        let err_entry = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/27".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/27",
+                "instances": [123],
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(err_entry.to_string(), "instances entries must be objects");
     }
 
     #[test]
