@@ -137,8 +137,22 @@ impl Client {
     }
 
     pub async fn archival_object_ids(&self, repo_id: u32) -> Result<Vec<u32>> {
-        let path = format!("repositories/{}/archival_objects?all_ids=true", repo_id);
-        let res = self.get(&path)?.send().await?;
+        self.archival_object_ids_modified_since(repo_id, None).await
+    }
+
+    pub async fn archival_object_ids_modified_since(
+        &self,
+        repo_id: u32,
+        modified_since: Option<u64>,
+    ) -> Result<Vec<u32>> {
+        let path = format!("repositories/{}/archival_objects", repo_id);
+        let modified_since_str = modified_since.map(|ts| ts.to_string());
+        let mut query: Vec<(&str, &str)> = vec![("all_ids", "true")];
+        if let Some(ref ts_str) = modified_since_str {
+            query.push(("modified_since", ts_str.as_str()));
+        }
+
+        let res = self.get(&path)?.query(&query).send().await?;
         if !res.status().is_success() {
             return Err(ASpaceError::Api {
                 status: res.status().as_u16(),
@@ -1092,6 +1106,179 @@ mod tests {
                 assert!(msg.contains("not a JSON array"));
             }
             _ => panic!("Expected HydrationValidation, got: {:?}", err),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_archival_object_ids_modified_since_none() {
+        let mut server = Server::new_async().await;
+
+        let _login = server
+            .mock("POST", "/users/admin/login")
+            .with_status(200)
+            .with_body(r#"{"session": "token"}"#)
+            .create_async()
+            .await;
+
+        let mock_none = server
+            .mock("GET", "/repositories/2/archival_objects")
+            .match_header("X-ArchivesSpace-Session", "token")
+            .match_query(mockito::Matcher::Exact("all_ids=true".to_string()))
+            .with_status(200)
+            .with_body("[101, 102]")
+            .create_async()
+            .await;
+
+        let mut client = Client::new(server.url());
+        client.login("admin", "pass").await.unwrap();
+
+        let ids = client
+            .archival_object_ids_modified_since(2, None)
+            .await
+            .unwrap();
+        assert_eq!(ids, vec![101, 102]);
+        mock_none.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_archival_object_ids_backward_compatibility() {
+        let mut server = Server::new_async().await;
+
+        let _login = server
+            .mock("POST", "/users/admin/login")
+            .with_status(200)
+            .with_body(r#"{"session": "token"}"#)
+            .create_async()
+            .await;
+
+        let mock_legacy = server
+            .mock("GET", "/repositories/2/archival_objects")
+            .match_header("X-ArchivesSpace-Session", "token")
+            .match_query(mockito::Matcher::Exact("all_ids=true".to_string()))
+            .with_status(200)
+            .with_body("[101, 102]")
+            .create_async()
+            .await;
+
+        let mut client = Client::new(server.url());
+        client.login("admin", "pass").await.unwrap();
+
+        let ids = client.archival_object_ids(2).await.unwrap();
+        assert_eq!(ids, vec![101, 102]);
+        mock_legacy.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_archival_object_ids_modified_since_zero() {
+        let mut server = Server::new_async().await;
+
+        let _login = server
+            .mock("POST", "/users/admin/login")
+            .with_status(200)
+            .with_body(r#"{"session": "token"}"#)
+            .create_async()
+            .await;
+
+        let mock_zero = server
+            .mock("GET", "/repositories/2/archival_objects")
+            .match_header("X-ArchivesSpace-Session", "token")
+            .match_query(mockito::Matcher::Exact(
+                "all_ids=true&modified_since=0".to_string(),
+            ))
+            .with_status(200)
+            .with_body("[201, 202, 203]")
+            .create_async()
+            .await;
+
+        let mut client = Client::new(server.url());
+        client.login("admin", "pass").await.unwrap();
+
+        let ids = client
+            .archival_object_ids_modified_since(2, Some(0))
+            .await
+            .unwrap();
+        assert_eq!(ids, vec![201, 202, 203]);
+        mock_zero.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_archival_object_ids_modified_since_timestamp() {
+        let mut server = Server::new_async().await;
+
+        let _login = server
+            .mock("POST", "/users/admin/login")
+            .with_status(200)
+            .with_body(r#"{"session": "token"}"#)
+            .create_async()
+            .await;
+
+        let mock_timestamp = server
+            .mock("GET", "/repositories/2/archival_objects")
+            .match_header("X-ArchivesSpace-Session", "token")
+            .match_query(mockito::Matcher::Exact(
+                "all_ids=true&modified_since=1700000000".to_string(),
+            ))
+            .with_status(200)
+            .with_body("[301]")
+            .create_async()
+            .await;
+
+        let mut client = Client::new(server.url());
+        client.login("admin", "pass").await.unwrap();
+
+        let ids = client
+            .archival_object_ids_modified_since(2, Some(1700000000))
+            .await
+            .unwrap();
+        assert_eq!(ids, vec![301]);
+        mock_timestamp.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_archival_object_ids_modified_since_http_error() {
+        let mut server = Server::new_async().await;
+
+        let _login = server
+            .mock("POST", "/users/admin/login")
+            .with_status(200)
+            .with_body(r#"{"session": "token"}"#)
+            .create_async()
+            .await;
+
+        let _err_mock = server
+            .mock("GET", "/repositories/2/archival_objects")
+            .match_query(mockito::Matcher::Exact(
+                "all_ids=true&modified_since=0".to_string(),
+            ))
+            .with_status(500)
+            .with_body("Internal Server Error")
+            .create_async()
+            .await;
+
+        let mut client = Client::new(server.url());
+        client.login("admin", "pass").await.unwrap();
+
+        let err = client
+            .archival_object_ids_modified_since(2, Some(0))
+            .await
+            .unwrap_err();
+
+        match err {
+            ASpaceError::Api { status, message } => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "Internal Server Error");
+            }
+            _ => panic!("Expected Api error, got: {:?}", err),
+        }
+
+        let unauthed_client = Client::new("http://dummy");
+        let err_unauthed = unauthed_client
+            .archival_object_ids_modified_since(2, Some(0))
+            .await
+            .unwrap_err();
+        match err_unauthed {
+            ASpaceError::NotAuthenticated => (),
+            _ => panic!("Expected NotAuthenticated error, got: {:?}", err_unauthed),
         }
     }
 }

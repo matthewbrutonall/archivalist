@@ -6,6 +6,8 @@ and accelerating selected archival-management operations.
 ## Components
 
 - `aspace-client`: typed HTTP client, validation models, and shadow-index query support.
+  Provides `archival_object_ids_modified_since(repo_id, Option<u64>)` for wire-contract
+  alignment with native indexer discovery (`all_ids=true`, `modified_since=0`).
 - `aspace-cli`: command-line validation, performance probes, shadow-index utilities,
   and the `aspace-shadow-sidecar` binary.
 
