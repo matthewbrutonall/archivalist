@@ -11,6 +11,7 @@ use std::{collections::BTreeMap, io};
 
 pub mod shadow;
 pub mod staff_ao_builder;
+pub mod staff_ao_candidate;
 pub mod staff_ao_probe;
 
 #[derive(Serialize)]
@@ -309,6 +310,8 @@ enum Commands {
     },
     #[command(name = "staff-ao-probe", alias = "staff-ao-hydration-probe")]
     StaffAoProbe(staff_ao_probe::StaffAoProbeArgs),
+    #[command(name = "staff-ao-candidate")]
+    StaffAoCandidate(staff_ao_candidate::StaffAoCandidateArgs),
     #[command(name = "staff-ao-builder")]
     StaffAoBuilder(staff_ao_builder::StaffAoBuilderArgs),
     #[command(name = "build-index-document")]
@@ -1146,6 +1149,9 @@ async fn main() -> Result<()> {
         }
         Commands::StaffAoProbe(args) => {
             staff_ao_probe::run_staff_ao_probe(&client, args.clone()).await?;
+        }
+        Commands::StaffAoCandidate(args) => {
+            staff_ao_candidate::run_staff_ao_candidate(&client, args.clone()).await?;
         }
         Commands::BuildIndexDocument(_) => {
             unreachable!("build-index-document returns before API login")
@@ -2134,6 +2140,41 @@ mod tests {
                 assert!(args.validate().is_ok());
             }
             _ => panic!("Expected PerfTarget::StaffAoProbe"),
+        }
+
+        let cli_candidate = Cli::try_parse_from([
+            "aspace",
+            "staff-ao-candidate",
+            "--repo",
+            "4",
+            "--batch-size",
+            "25",
+            "--concurrency",
+            "4",
+            "--solr-url",
+            "http://127.0.0.1:18983/solr",
+            "--candidate-core",
+            "stage_staff_20261026_candidate",
+            "--arks-enabled",
+            "false",
+            "--strip-markers",
+            "true",
+            "--json",
+        ])
+        .unwrap();
+        match cli_candidate.command {
+            Commands::StaffAoCandidate(args) => {
+                assert_eq!(args.repo, 4);
+                assert_eq!(args.batch_size, 25);
+                assert_eq!(args.concurrency, 4);
+                assert_eq!(args.solr_url, "http://127.0.0.1:18983/solr");
+                assert_eq!(args.candidate_core, "stage_staff_20261026_candidate");
+                assert!(!args.arks_enabled);
+                assert!(args.strip_markers);
+                assert!(args.json);
+                assert!(args.validate().is_ok());
+            }
+            _ => panic!("Expected Commands::StaffAoCandidate"),
         }
 
         let cli_builder = Cli::try_parse_from([

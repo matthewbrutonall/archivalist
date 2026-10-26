@@ -633,22 +633,24 @@ fn add_instance_fields(
             .get("type_2")
             .is_some_and(|value| !value.is_null())
         {
-            child_containers.push(Value::String(format!(
+            let raw_str = format!(
                 "{} {} {}",
                 ruby_string(sub_container.get("type_2")),
                 ruby_string(sub_container.get("indicator_2")),
                 ruby_string(sub_container.get("barcode_2"))
-            )));
+            );
+            child_containers.push(Value::String(ruby_strip(&raw_str).to_string()));
         }
         if sub_container
             .get("type_3")
             .is_some_and(|value| !value.is_null())
         {
-            grandchild_containers.push(Value::String(format!(
+            let raw_str = format!(
                 "{} {}",
                 ruby_string(sub_container.get("type_3")),
                 ruby_string(sub_container.get("indicator_3"))
-            )));
+            );
+            grandchild_containers.push(Value::String(ruby_strip(&raw_str).to_string()));
         }
     }
 
