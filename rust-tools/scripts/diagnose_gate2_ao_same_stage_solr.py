@@ -579,12 +579,27 @@ def run_diagnostic():
             f"Native reference core '{native_core}' does not exist in isolated Solr {solr_host_url}"
         )
 
-    native_select_req = urllib.request.urlopen(
-        f"{solr_host_url}/{native_core}/select?q=*:*&rows=0&wt=json",
-        timeout=10,
-    )
-    native_select_data = json.loads(native_select_req.read().decode())
-    native_num_found = native_select_data.get("response", {}).get("numFound", 0)
+    native_select_url = f"{solr_host_url}/{native_core}/select?q=*:*&rows=0&wt=json"
+    native_num_found = -1
+    for attempt in range(60):
+        try:
+            with urllib.request.urlopen(native_select_url, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                native_num_found = data.get("response", {}).get("numFound", -1)
+                if native_num_found >= 0:
+                    break
+        except urllib.error.HTTPError as e:
+            if e.code == 503:
+                time.sleep(1)
+                continue
+            raise
+        except Exception:
+            time.sleep(1)
+
+    if native_num_found < 0:
+        raise RuntimeError(
+            f"Native reference core '{native_core}' select failed to become ready within 60s"
+        )
     print(f"Native reference core '{native_core}' verified present with {native_num_found} documents.")
     if native_num_found == 0:
         raise RuntimeError(
