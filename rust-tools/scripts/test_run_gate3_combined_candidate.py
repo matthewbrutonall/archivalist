@@ -112,6 +112,12 @@ class TestRunGate3CombinedCandidate(unittest.TestCase):
                 "title": "DO 501",
                 "json": '{"title":"DO 501"}',
             },
+            "/repositories/4/top_containers/1001": {
+                "id": "/repositories/4/top_containers/1001",
+                "uri": "/repositories/4/top_containers/1001",
+                "indicator": "Box 1",
+                "json": '{"indicator":"Box 1"}',
+            },
             "/repositories/4/collection_management/2": {
                 "id": "/repositories/4/collection_management/2",
                 "uri": "/repositories/4/collection_management/2",
@@ -150,6 +156,13 @@ class TestRunGate3CombinedCandidate(unittest.TestCase):
                 "json": '{"title":"DO 501"}',
                 "_version_": 98765,
             },
+            "/repositories/4/top_containers/1001": {
+                "id": "/repositories/4/top_containers/1001",
+                "uri": "/repositories/4/top_containers/1001",
+                "indicator": "Box 1",
+                "json": '{"indicator":"Box 1"}',
+                "_version_": 11223,
+            },
             "/repositories/4/collection_management/2": {
                 "id": "/repositories/4/collection_management/2",
                 "uri": "/repositories/4/collection_management/2",
@@ -165,7 +178,7 @@ class TestRunGate3CombinedCandidate(unittest.TestCase):
         self.assertEqual(res["total_differences"], 0)
         self.assertEqual(res["candidate_marker_leaks_count"], 0)
         self.assertEqual(res["embedded_json_mismatches_count"], 0)
-        self.assertEqual(res["records_with_exact_equality"], 5)
+        self.assertEqual(res["records_with_exact_equality"], 6)
 
     def test_run_slice_parity_comparison_embedded_json_mismatch(self):
         cand_docs = {
