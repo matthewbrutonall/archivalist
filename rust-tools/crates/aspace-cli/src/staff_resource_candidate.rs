@@ -327,6 +327,58 @@ pub fn extract_resource_batch_documents(
     })
 }
 
+pub async fn fetch_and_build_resource_candidate_batch(
+    client: &Client,
+    repo_id: u32,
+    chunk: &[u32],
+    batch_idx: usize,
+    batch_size: usize,
+    dynamic_enums: std::sync::Arc<Vec<String>>,
+    arks_enabled: bool,
+) -> Result<CandidateBatchOutput> {
+    let raw_records = client
+        .fetch_staff_resources_by_ids_bounded(repo_id, chunk, batch_size)
+        .await
+        .with_context(|| format!("Failed to fetch resource batch {}", batch_idx))?;
+
+    if raw_records.len() != chunk.len() {
+        bail!(
+            "Backend returned {} records for batch {}, expected {}",
+            raw_records.len(),
+            batch_idx,
+            chunk.len()
+        );
+    }
+
+    let repo_scope = Value::String(format!("/repositories/{}", repo_id));
+    let mut inputs = Vec::with_capacity(raw_records.len());
+    for record in raw_records {
+        let uri = record
+            .get("uri")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Record missing valid string uri"))?
+            .to_string();
+
+        let input = IndexDocumentInput {
+            uri,
+            record_type: "resource".to_string(),
+            repository: repo_scope.clone(),
+            record,
+            enrich: true,
+            dynamic_enum_fields: (*dynamic_enums).clone(),
+            arks_enabled,
+            ..Default::default()
+        };
+        inputs.push(input);
+    }
+
+    let batch_resp = build_index_document_batch(IndexDocumentBatchRequest { records: inputs })
+        .map_err(|e| anyhow::anyhow!("Failed to build index document batch: {e}"))?;
+
+    let extracted = extract_resource_batch_documents(batch_resp.documents, repo_id)?;
+    Ok(extracted.into())
+}
+
 pub async fn execute_staff_resource_candidate(
     client: &Client,
     args: &StaffResourceCandidateArgs,
@@ -373,50 +425,16 @@ where
         move |batch_idx, chunk, dynamic_enums| {
             let client = client_for_batches.clone();
             async move {
-                let raw_records = client
-                    .fetch_staff_resources_by_ids_bounded(repo_id, &chunk, batch_size)
-                    .await
-                    .with_context(|| format!("Failed to fetch resource batch {}", batch_idx))?;
-
-                if raw_records.len() != chunk.len() {
-                    bail!(
-                        "Backend returned {} records for batch {}, expected {}",
-                        raw_records.len(),
-                        batch_idx,
-                        chunk.len()
-                    );
-                }
-
-                let repo_scope = Value::String(format!("/repositories/{}", repo_id));
-                let mut inputs = Vec::with_capacity(raw_records.len());
-                for record in raw_records {
-                    let uri = record
-                        .get("uri")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| anyhow::anyhow!("Record missing valid string uri"))?
-                        .to_string();
-
-                    let input = IndexDocumentInput {
-                        uri,
-                        record_type: "resource".to_string(),
-                        repository: repo_scope.clone(),
-                        record,
-                        enrich: true,
-                        dynamic_enum_fields: (*dynamic_enums).clone(),
-                        arks_enabled,
-                        ..Default::default()
-                    };
-                    inputs.push(input);
-                }
-
-                let batch_resp =
-                    build_index_document_batch(IndexDocumentBatchRequest { records: inputs })
-                        .map_err(|e| {
-                            anyhow::anyhow!("Failed to build index document batch: {e}")
-                        })?;
-
-                let extracted = extract_resource_batch_documents(batch_resp.documents, repo_id)?;
-                Ok(extracted.into())
+                fetch_and_build_resource_candidate_batch(
+                    &client,
+                    repo_id,
+                    &chunk,
+                    batch_idx,
+                    batch_size,
+                    dynamic_enums,
+                    arks_enabled,
+                )
+                .await
             }
         },
     )

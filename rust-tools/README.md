@@ -24,7 +24,7 @@ The application API remains authoritative. The tools do not write directly to th
 application database or primary Solr collection. The sidecar `/index/documents` endpoint
 remains JSON-only, returning prepared JSON to the Ruby production indexer, which remains
 authoritative for production Solr writes. The only Solr write exceptions are the isolated
-experimental CLI commands (`staff-ao-candidate`, `staff-resource-candidate`, and `staff-ao-builder`), which write exclusively
+experimental CLI commands (`staff-ao-candidate`, `staff-resource-candidate`, `staff-combined-candidate`, and `staff-ao-builder`), which write exclusively
 to disposable candidate stage cores under verified profiling-stack isolation. Writing to the
 primary Solr core or application database is strictly forbidden and blocked.
 
@@ -470,13 +470,33 @@ Scripts under `scripts/` are code-only harnesses:
   parent and child documents, validates exact child identity and structural envelope invariants offline, and streams
   documents to a disposable candidate stage core (`stage_staff_<nonce>_candidate`). Live type-strict stored-document
   parity (including byte-for-byte embedded JSON equality) against native reference cores is independently established
-  and measured by dedicated stage comparison harnesses (`rust-tools/scripts/run_gate3_resource_candidate.py`),
-  distinguishing offline structural verification from live native parity.
+  and measured for parent resource documents by dedicated stage comparison harnesses (`rust-tools/scripts/run_gate3_resource_candidate.py`),
+  distinguishing offline structural verification from live native parent parity (the current live profiling dataset contains 0
+  `collection_management` child records, so live child parity remains unexercised in live data).
   **Safety Guard:** Requires `--state <path_to_profiling_stack_state.json>` on every invocation. Runs
   `rust-tools/scripts/profiling_stack.py verify` via subprocess argument arrays before any Solr write or core readiness check,
   failing closed if verification fails, state is missing, the repository verifier is absent, endpoints/labels mismatch,
   or child envelope/markers are malformed. Marker removal is mandatory; `--strip-markers false` is strictly rejected.
   Outputs JSON metrics reporting separate source IDs, parent docs, child docs, committed status, and error details.
+  **Scope caveat:** This is an isolated bounded candidate vertical slice; fresh-core full rebuild only. No incremental
+  deletes, checkpointing, production indexing, or full-STAFF speed claims.
+- `staff-combined-candidate` (`aspace-cli` subcommand, alias `staff-candidate`): Full-repository STAFF composite candidate
+  pipeline combining `archival_objects` and `resources` (including synthetic `collection_management` child document support;
+  current live dataset contains 0 child records, so live child parity remains unexercised in live data)
+  under a single verified isolated writer and atomic hard commit. Discovers repository-scoped IDs for both types using
+  native full-reindex contracts (`all_ids=true`, `modified_since=0`), hydrates bounded `id_set` batches with
+  `IndexerCommonConfig.resolved_attributes`, prepares documents via `build_index_document_batch` with dynamic enum
+  fields derived from backend `/schemas`, extracts resource `collection_management` child docs in native hook order
+  (parent then child docs) before stripping markers, enforces per-type exact IDs and cross-type URI deduplication,
+  strips all private `_archivalist_*` markers, streams documents into a single disposable candidate stage core
+  (`stage_staff_<nonce>_candidate`), and executes exactly one final hard commit only when all batches and sanity invariants pass.
+  **Safety Guard:** Requires `--state <path_to_profiling_stack_state.json>` on every invocation. Runs
+  `rust-tools/scripts/profiling_stack.py verify` via subprocess argument arrays BEFORE any Solr write or core readiness check,
+  failing closed without touching Solr or the candidate core if verification fails, state is missing, or the repository
+  verifier is absent (no CWD or PATH fallback). Fails closed without hard commit on any missing/duplicate/unexpected IDs,
+  cross-type duplicate URIs, or batch errors. Marker removal is mandatory; `--strip-markers false` is strictly rejected.
+  Outputs structured per-type breakdowns (IDs, parent docs, child docs, batches, failures) and overall metrics (total docs,
+  unique URIs, timings, committed status).
   **Scope caveat:** This is an isolated bounded candidate vertical slice; fresh-core full rebuild only. No incremental
   deletes, checkpointing, production indexing, or full-STAFF speed claims.
 - `staff-ao-builder` (`aspace-cli` subcommand): Targeted STAFF archival-object builder for single or

@@ -85,6 +85,74 @@ impl From<StaffCandidateExecutionResult> for StaffAoCandidateSummary {
     }
 }
 
+pub async fn fetch_and_build_ao_candidate_batch(
+    client: &Client,
+    repo_id: u32,
+    chunk: &[u32],
+    batch_idx: usize,
+    dynamic_enums: std::sync::Arc<Vec<String>>,
+    arks_enabled: bool,
+) -> Result<CandidateBatchOutput> {
+    let raw_records = client
+        .fetch_staff_archival_objects_by_ids(repo_id, chunk)
+        .await
+        .with_context(|| format!("Failed to fetch AO batch {}", batch_idx))?;
+
+    if raw_records.len() != chunk.len() {
+        bail!(
+            "Backend returned {} records for batch {}, expected {}",
+            raw_records.len(),
+            batch_idx,
+            chunk.len()
+        );
+    }
+
+    let repo_scope = Value::String(format!("/repositories/{}", repo_id));
+    let mut inputs = Vec::with_capacity(raw_records.len());
+    for record in raw_records {
+        let uri = record
+            .get("uri")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Record missing valid string uri"))?
+            .to_string();
+
+        let input = IndexDocumentInput {
+            uri,
+            record_type: "archival_object".to_string(),
+            repository: repo_scope.clone(),
+            record,
+            enrich: true,
+            dynamic_enum_fields: (*dynamic_enums).clone(),
+            arks_enabled,
+            ..Default::default()
+        };
+        inputs.push(input);
+    }
+
+    let batch_resp = build_index_document_batch(IndexDocumentBatchRequest { records: inputs })
+        .map_err(|e| anyhow::anyhow!("Failed to build index document batch: {e}"))?;
+
+    let mut docs = batch_resp.documents;
+    // Marker removal is mandatory before adding documents / writing to Solr
+    for doc in &mut docs {
+        strip_archivalist_markers(doc);
+    }
+
+    let parent_uris = docs
+        .iter()
+        .map(|d| d.get("uri").and_then(Value::as_str).map(|s| s.to_string()))
+        .collect();
+
+    let parent_count = docs.len();
+    Ok(CandidateBatchOutput {
+        ordered_documents: docs,
+        parent_uris,
+        child_uris: Vec::new(),
+        parent_count,
+        child_count: 0,
+    })
+}
+
 pub async fn execute_staff_ao_candidate(
     client: &Client,
     args: &StaffAoCandidateArgs,
@@ -130,67 +198,15 @@ where
         move |batch_idx, chunk, dynamic_enums| {
             let client = client_for_batches.clone();
             async move {
-                let raw_records = client
-                    .fetch_staff_archival_objects_by_ids(repo_id, &chunk)
-                    .await
-                    .with_context(|| format!("Failed to fetch AO batch {}", batch_idx))?;
-
-                if raw_records.len() != chunk.len() {
-                    bail!(
-                        "Backend returned {} records for batch {}, expected {}",
-                        raw_records.len(),
-                        batch_idx,
-                        chunk.len()
-                    );
-                }
-
-                let repo_scope = Value::String(format!("/repositories/{}", repo_id));
-                let mut inputs = Vec::with_capacity(raw_records.len());
-                for record in raw_records {
-                    let uri = record
-                        .get("uri")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| anyhow::anyhow!("Record missing valid string uri"))?
-                        .to_string();
-
-                    let input = IndexDocumentInput {
-                        uri,
-                        record_type: "archival_object".to_string(),
-                        repository: repo_scope.clone(),
-                        record,
-                        enrich: true,
-                        dynamic_enum_fields: (*dynamic_enums).clone(),
-                        arks_enabled,
-                        ..Default::default()
-                    };
-                    inputs.push(input);
-                }
-
-                let batch_resp =
-                    build_index_document_batch(IndexDocumentBatchRequest { records: inputs })
-                        .map_err(|e| {
-                            anyhow::anyhow!("Failed to build index document batch: {e}")
-                        })?;
-
-                let mut docs = batch_resp.documents;
-                // Marker removal is mandatory before adding documents / writing to Solr
-                for doc in &mut docs {
-                    strip_archivalist_markers(doc);
-                }
-
-                let parent_uris = docs
-                    .iter()
-                    .map(|d| d.get("uri").and_then(Value::as_str).map(|s| s.to_string()))
-                    .collect();
-
-                let parent_count = docs.len();
-                Ok(CandidateBatchOutput {
-                    ordered_documents: docs,
-                    parent_uris,
-                    child_uris: Vec::new(),
-                    parent_count,
-                    child_count: 0,
-                })
+                fetch_and_build_ao_candidate_batch(
+                    &client,
+                    repo_id,
+                    &chunk,
+                    batch_idx,
+                    dynamic_enums,
+                    arks_enabled,
+                )
+                .await
             }
         },
     )
