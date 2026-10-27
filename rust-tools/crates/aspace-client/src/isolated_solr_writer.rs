@@ -562,6 +562,13 @@ impl IsolatedSolrStaffAoWriter {
             ASpaceError::InvalidRequest("Solr document missing string 'id' field".to_string())
         })?;
 
+        // Enforce mandatory marker removal before adding to Solr
+        if obj.keys().any(|k| k.starts_with("_archivalist_")) {
+            return Err(ASpaceError::InvalidRequest(
+                "Solr document contains forbidden private _archivalist_* marker; markers must be removed before writing to Solr".to_string(),
+            ));
+        }
+
         // Step 2: Serialize to measure exact UTF-8 byte length
         let serialized = serde_json::to_vec(&doc)?;
         let doc_len = serialized.len();
@@ -1403,6 +1410,18 @@ mod tests {
             "title": huge_title
         });
         assert!(writer.add_document(huge_doc).await.is_err());
+        assert_eq!(writer.buffered_doc_count(), initial_doc_count);
+        assert_eq!(writer.buffered_bytes(), initial_bytes);
+        assert_eq!(writer.pending_delete_count(), 1);
+        assert!(!writer.has_error());
+
+        // Attempt 4: Marker key not stripped
+        let marker_doc = json!({
+            "id": "/repositories/2/archival_objects/1000",
+            "_archivalist_repo_scope": "/repositories/2"
+        });
+        let marker_err = writer.add_document(marker_doc).await.unwrap_err();
+        assert!(marker_err.to_string().contains("_archivalist_"));
         assert_eq!(writer.buffered_doc_count(), initial_doc_count);
         assert_eq!(writer.buffered_bytes(), initial_bytes);
         assert_eq!(writer.pending_delete_count(), 1);

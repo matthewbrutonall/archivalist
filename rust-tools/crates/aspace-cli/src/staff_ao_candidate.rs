@@ -78,6 +78,13 @@ pub struct StaffAoCandidateArgs {
 
     #[arg(
         long,
+        alias = "profiling-stack-state",
+        help = "Path to profiling-stack state JSON file (required for Solr write verification)"
+    )]
+    pub state: Option<std::path::PathBuf>,
+
+    #[arg(
+        long,
         help = "Output machine-readable JSON summary (default: human-readable)"
     )]
     pub json: bool,
@@ -121,6 +128,13 @@ impl StaffAoCandidateArgs {
         }
         validate_isolated_solr_base_url(&self.solr_url)?;
         validate_stage_candidate_core(&self.candidate_core, None)?;
+        if !self.strip_markers {
+            bail!("--strip-markers false is forbidden in Solr write mode; marker stripping is mandatory");
+        }
+        match &self.state {
+            Some(path) if !path.as_os_str().is_empty() => {}
+            _ => bail!("missing required profiling-stack state file for Solr write mode (--state)"),
+        }
         Ok(())
     }
 }
@@ -175,6 +189,22 @@ pub async fn execute_staff_ao_candidate(
     client: &Client,
     args: &StaffAoCandidateArgs,
 ) -> StaffAoCandidateSummary {
+    execute_staff_ao_candidate_with_verifier(
+        client,
+        args,
+        crate::profiling_stack::verify_profiling_stack,
+    )
+    .await
+}
+
+pub async fn execute_staff_ao_candidate_with_verifier<V>(
+    client: &Client,
+    args: &StaffAoCandidateArgs,
+    verifier: V,
+) -> StaffAoCandidateSummary
+where
+    V: FnOnce(&std::path::Path, &str, &str) -> Result<()>,
+{
     if let Err(err) = args.validate() {
         return StaffAoCandidateSummary {
             repository_id: args.repo,
@@ -202,6 +232,39 @@ pub async fn execute_staff_ao_candidate(
             records_per_second: 0.0,
             success: false,
             error_message: Some(format!("Invalid arguments: {err}")),
+        };
+    }
+
+    let state_path = args.state.as_ref().unwrap();
+
+    // Verify profiling stack identity before any Solr write or core readiness check
+    if let Err(err) = verifier(state_path, client.base_url(), &args.solr_url) {
+        return StaffAoCandidateSummary {
+            repository_id: args.repo,
+            total_ids_discovered: 0,
+            batch_size: args.batch_size,
+            concurrency: args.concurrency,
+            total_batches: 0,
+            batches_completed: 0,
+            batches_failed: 0,
+            failures: 1,
+            exact_ids_indexed: 0,
+            unique_uris: 0,
+            missing_ids: 0,
+            duplicate_ids: 0,
+            unexpected_ids: 0,
+            candidate_core: args.candidate_core.clone(),
+            solr_url: args.solr_url.clone(),
+            arks_enabled: args.arks_enabled,
+            id_list_elapsed_sec: 0.0,
+            batch_loop_wall_elapsed_sec: 0.0,
+            solr_write_elapsed_sec: 0.0,
+            solr_update_requests_sent: 0,
+            solr_commit_elapsed_sec: 0.0,
+            total_wall_elapsed_sec: 0.0,
+            records_per_second: 0.0,
+            success: false,
+            error_message: Some(format!("Profiling stack verification failed: {err}")),
         };
     }
 
@@ -435,7 +498,6 @@ pub async fn execute_staff_ao_candidate(
 
     let repo_id = args.repo;
     let arks_enabled = args.arks_enabled;
-    let strip_markers = args.strip_markers;
 
     let stream = stream::iter(batches.into_iter().enumerate().map(|(batch_idx, chunk)| {
         let client = client.clone();
@@ -485,10 +547,9 @@ pub async fn execute_staff_ao_candidate(
                         })?;
 
                 let mut docs = batch_resp.documents;
-                if strip_markers {
-                    for doc in &mut docs {
-                        strip_archivalist_markers(doc);
-                    }
+                // Marker removal is mandatory before adding documents / writing to Solr
+                for doc in &mut docs {
+                    strip_archivalist_markers(doc);
                 }
                 Ok(docs)
             }
@@ -752,7 +813,25 @@ pub async fn run_staff_ao_candidate_to_writer<W: Write>(
     args: StaffAoCandidateArgs,
     writer: &mut W,
 ) -> Result<StaffAoCandidateSummary> {
-    let summary = execute_staff_ao_candidate(client, &args).await;
+    run_staff_ao_candidate_to_writer_with_verifier(
+        client,
+        args,
+        writer,
+        crate::profiling_stack::verify_profiling_stack,
+    )
+    .await
+}
+
+pub async fn run_staff_ao_candidate_to_writer_with_verifier<W: Write, V>(
+    client: &Client,
+    args: StaffAoCandidateArgs,
+    writer: &mut W,
+    verifier: V,
+) -> Result<StaffAoCandidateSummary>
+where
+    V: FnOnce(&std::path::Path, &str, &str) -> Result<()>,
+{
+    let summary = execute_staff_ao_candidate_with_verifier(client, &args, verifier).await;
 
     if args.json {
         let json_out = serde_json::to_string_pretty(&summary)?;
@@ -851,10 +930,37 @@ mod tests {
             candidate_core: "stage_staff_20261026_candidate".to_string(),
             arks_enabled: false,
             strip_markers: true,
+            state: Some(std::path::PathBuf::from("/path/to/profiling_state.json")),
             json: false,
             fail_after_batches: None,
         };
         assert!(valid_args.validate().is_ok());
+
+        let missing_state = StaffAoCandidateArgs {
+            state: None,
+            ..valid_args.clone()
+        };
+        assert!(missing_state.validate().is_err());
+        assert_eq!(
+            missing_state.validate().unwrap_err().to_string(),
+            "missing required profiling-stack state file for Solr write mode (--state)"
+        );
+
+        let empty_state = StaffAoCandidateArgs {
+            state: Some(std::path::PathBuf::from("")),
+            ..valid_args.clone()
+        };
+        assert!(empty_state.validate().is_err());
+
+        let strip_markers_false = StaffAoCandidateArgs {
+            strip_markers: false,
+            ..valid_args.clone()
+        };
+        assert!(strip_markers_false.validate().is_err());
+        assert_eq!(
+            strip_markers_false.validate().unwrap_err().to_string(),
+            "--strip-markers false is forbidden in Solr write mode; marker stripping is mandatory"
+        );
 
         let fail_zero = StaffAoCandidateArgs {
             fail_after_batches: Some(0),
@@ -952,6 +1058,7 @@ mod tests {
             candidate_core: "stage_staff_20261026_candidate".to_string(),
             arks_enabled: false,
             strip_markers: true,
+            state: Some(std::path::PathBuf::from("/path/to/state.json")),
             json: false,
             fail_after_batches: None,
         };
@@ -1099,14 +1206,20 @@ mod tests {
             candidate_core: candidate_core.to_string(),
             arks_enabled: false,
             strip_markers: true,
+            state: Some(std::path::PathBuf::from("/path/to/state.json")),
             json: true,
             fail_after_batches: None,
         };
 
         let mut output = Vec::new();
-        let summary = run_staff_ao_candidate_to_writer(&client, args, &mut output)
-            .await
-            .unwrap();
+        let summary = run_staff_ao_candidate_to_writer_with_verifier(
+            &client,
+            args,
+            &mut output,
+            |_state, _backend, _solr| Ok(()),
+        )
+        .await
+        .unwrap();
 
         assert!(summary.success);
         assert_eq!(summary.failures, 0);
@@ -1259,11 +1372,16 @@ mod tests {
             candidate_core: candidate_core.to_string(),
             arks_enabled: false,
             strip_markers: true,
+            state: Some(std::path::PathBuf::from("/path/to/state.json")),
             json: true,
             fail_after_batches: Some(21),
         };
 
-        let summary = execute_staff_ao_candidate(&client, &args).await;
+        let summary =
+            execute_staff_ao_candidate_with_verifier(&client, &args, |_state, _backend, _solr| {
+                Ok(())
+            })
+            .await;
 
         assert!(!summary.success);
         assert!(summary.failures >= 1);
@@ -1276,5 +1394,90 @@ mod tests {
             .unwrap()
             .contains("Injected deterministic test failure after 21 completed batch"));
         _m_update.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_candidate_verification_failure_fails_closed_before_core_check_or_solr_write() {
+        let aspace_server = Server::new_async().await;
+        let mut client = Client::new(aspace_server.url());
+        client.session_token = Some("dummy-session".to_string());
+
+        let args = StaffAoCandidateArgs {
+            repo: 4,
+            batch_size: 25,
+            concurrency: 4,
+            solr_url: "http://127.0.0.1:18983/solr".to_string(),
+            candidate_core: "stage_staff_20261026_verif99_candidate".to_string(),
+            arks_enabled: false,
+            strip_markers: true,
+            state: Some(std::path::PathBuf::from("/path/to/state.json")),
+            json: false,
+            fail_after_batches: None,
+        };
+
+        // Verifier fails
+        let summary =
+            execute_staff_ao_candidate_with_verifier(&client, &args, |_state, _backend, _solr| {
+                bail!("Challenge-response verification failed: backend not on profiling stack");
+            })
+            .await;
+
+        assert!(!summary.success);
+        assert_eq!(summary.failures, 1);
+        let err_msg = summary.error_message.expect("error message present");
+        assert!(err_msg.contains("Profiling stack verification failed"));
+        assert!(err_msg.contains("Challenge-response verification failed"));
+    }
+
+    #[tokio::test]
+    async fn test_candidate_passes_exact_state_backend_solr_to_verifier() {
+        let aspace_server = Server::new_async().await;
+        let mut client = Client::new(aspace_server.url());
+        client.session_token = Some("dummy-session".to_string());
+
+        let state_path = std::path::PathBuf::from("/benchmarks/profiling_stack_test123.json");
+        let expected_backend = client.base_url().to_string();
+        let expected_solr = "http://127.0.0.1:18983/solr".to_string();
+
+        let args = StaffAoCandidateArgs {
+            repo: 4,
+            batch_size: 25,
+            concurrency: 4,
+            solr_url: expected_solr.clone(),
+            candidate_core: "stage_staff_20261026_verif99_candidate".to_string(),
+            arks_enabled: false,
+            strip_markers: true,
+            state: Some(state_path.clone()),
+            json: false,
+            fail_after_batches: None,
+        };
+
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let verified = Arc::new(AtomicBool::new(false));
+        let verified_clone = Arc::clone(&verified);
+
+        let exp_state_clone = state_path.clone();
+        let exp_back_clone = expected_backend.clone();
+        let exp_solr_clone = expected_solr.clone();
+
+        let _summary = execute_staff_ao_candidate_with_verifier(
+            &client,
+            &args,
+            move |state, backend, solr| {
+                assert_eq!(state, exp_state_clone.as_path());
+                assert_eq!(backend, exp_back_clone.as_str());
+                assert_eq!(solr, exp_solr_clone.as_str());
+                verified_clone.store(true, Ordering::SeqCst);
+                // Return an error to stop execution before any network call
+                bail!("Stop after verifier argument check");
+            },
+        )
+        .await;
+
+        assert!(
+            verified.load(Ordering::SeqCst),
+            "Verifier must have been invoked with exact arguments"
+        );
     }
 }

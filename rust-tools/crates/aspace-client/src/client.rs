@@ -58,6 +58,10 @@ impl Client {
         }
     }
 
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     pub async fn login(&mut self, username: &str, password: &str) -> Result<()> {
         let url = format!("{}/users/{}/login", self.base_url, username);
         let response = self

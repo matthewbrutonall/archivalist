@@ -21,8 +21,12 @@ and accelerating selected archival-management operations.
   and the `aspace-shadow-sidecar` binary.
 
 The application API remains authoritative. The tools do not write directly to the
-application database or primary Solr collection. The index-document endpoint only
-returns prepared JSON to the Ruby indexer, which remains the sole Solr writer.
+application database or primary Solr collection. The sidecar `/index/documents` endpoint
+remains JSON-only, returning prepared JSON to the Ruby production indexer, which remains
+authoritative for production Solr writes. The only Solr write exceptions are the isolated
+experimental CLI commands (`staff-ao-candidate` and `staff-ao-builder`), which write exclusively
+to disposable candidate stage cores under verified profiling-stack isolation. Writing to the
+primary Solr core or application database is strictly forbidden and blocked.
 
 ## Build and test
 
@@ -450,6 +454,21 @@ Scripts under `scripts/` are code-only harnesses:
   that no Solr build or write is measured.
   **Scope caveat:** This is strictly a source-fetch timing and validity experiment, NOT an
   indexer or parity/speedup claim. No Solr documents are built or written.
+- `staff-ao-candidate` (`aspace-cli` subcommand): Full-repository STAFF archival-object candidate
+  pipeline that fetches, prepares, and writes index documents into a dedicated disposable stage core.
+  **Safety Guard:** Requires `--state <path_to_profiling_stack_state.json>` on every invocation.
+  Runs `rust-tools/scripts/profiling_stack.py verify` via subprocess argument arrays before any Solr
+  write or core readiness check, failing closed if verification fails, state is missing, the repository
+  verifier is absent, or endpoints/labels mismatch. Marker removal is mandatory; `--strip-markers false`
+  is strictly rejected in write mode.
+- `staff-ao-builder` (`aspace-cli` subcommand): Targeted STAFF archival-object builder for single or
+  batch document inspection and stage core testing.
+  - Preview mode (default, no `--solr-url` / `--candidate-core`): outputs documents to stdout or `--output`,
+    permits explicit `--strip-markers false`, and does not require a state file.
+  - Write mode (when `--solr-url` and `--candidate-core` are supplied): requires `--state <path>`, executes
+    the repository's `profiling_stack.py verify` identity check before any Solr write or core readiness check,
+    strictly rejects `--strip-markers false`, makes marker removal mandatory before writing/committing, and
+    rejects `--output` to prevent document leakage.
 - Helpers that query records require the caller to provide test-specific values
   through environment variables such as `RESOURCE_URI` and `QUERY`.
 

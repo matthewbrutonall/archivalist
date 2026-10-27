@@ -56,6 +56,13 @@ pub struct StaffAoBuilderArgs {
         help = "Target stage candidate core name (format: stage_staff_<nonce>_candidate)"
     )]
     pub candidate_core: Option<String>,
+
+    #[arg(
+        long,
+        alias = "profiling-stack-state",
+        help = "Path to profiling-stack state JSON file (required for Solr write mode)"
+    )]
+    pub state: Option<PathBuf>,
 }
 
 impl StaffAoBuilderArgs {
@@ -80,6 +87,15 @@ impl StaffAoBuilderArgs {
                     bail!(
                         "--output is not supported in write mode (--solr-url and --candidate-core)"
                     );
+                }
+                if !self.strip_markers {
+                    bail!("--strip-markers false is forbidden in Solr write mode; marker stripping is mandatory");
+                }
+                match &self.state {
+                    Some(path) if !path.as_os_str().is_empty() => {}
+                    _ => bail!(
+                        "missing required profiling-stack state file for Solr write mode (--state)"
+                    ),
                 }
             }
             (None, None) => {}
@@ -120,7 +136,31 @@ pub async fn execute_staff_ao_builder(
     client: &Client,
     args: &StaffAoBuilderArgs,
 ) -> Result<Vec<Value>> {
+    execute_staff_ao_builder_with_verifier(
+        client,
+        args,
+        crate::profiling_stack::verify_profiling_stack,
+    )
+    .await
+}
+
+pub async fn execute_staff_ao_builder_with_verifier<V>(
+    client: &Client,
+    args: &StaffAoBuilderArgs,
+    verifier: V,
+) -> Result<Vec<Value>>
+where
+    V: FnOnce(&Path, &str, &str) -> Result<()>,
+{
     args.validate()?;
+
+    let is_write_mode = args.solr_url.is_some() && args.candidate_core.is_some();
+    if is_write_mode {
+        let state_path = args.state.as_ref().unwrap();
+        let solr_url = args.solr_url.as_ref().unwrap();
+        // Verify profiling stack identity before any Solr write or core readiness check
+        verifier(state_path, client.base_url(), solr_url)?;
+    }
 
     let dynamic_enums = client
         .dynamic_enum_fields_from_schemas()
@@ -168,7 +208,7 @@ pub async fn execute_staff_ao_builder(
         .map_err(|e| anyhow::anyhow!("Failed to build index document batch: {e}"))?;
 
     let mut docs = resp.documents;
-    if args.strip_markers {
+    if is_write_mode || args.strip_markers {
         for doc in &mut docs {
             strip_archivalist_markers(doc);
         }
@@ -255,8 +295,26 @@ pub async fn run_staff_ao_builder_to_writer<W: Write>(
     args: StaffAoBuilderArgs,
     writer: &mut W,
 ) -> Result<()> {
+    run_staff_ao_builder_to_writer_with_verifier(
+        client,
+        args,
+        writer,
+        crate::profiling_stack::verify_profiling_stack,
+    )
+    .await
+}
+
+pub async fn run_staff_ao_builder_to_writer_with_verifier<W: Write, V>(
+    client: &Client,
+    args: StaffAoBuilderArgs,
+    writer: &mut W,
+    verifier: V,
+) -> Result<()>
+where
+    V: FnOnce(&Path, &str, &str) -> Result<()>,
+{
     let is_write_mode = args.solr_url.is_some() && args.candidate_core.is_some();
-    let docs = execute_staff_ao_builder(client, &args).await?;
+    let docs = execute_staff_ao_builder_with_verifier(client, &args, verifier).await?;
 
     if is_write_mode {
         // In write mode, stdout MUST contain only a compact non-sensitive status/count/core,
@@ -344,6 +402,7 @@ mod tests {
             output: None,
             solr_url: None,
             candidate_core: None,
+            state: None,
         };
         assert!(invalid_repo.validate().is_err());
 
@@ -355,6 +414,7 @@ mod tests {
             output: None,
             solr_url: None,
             candidate_core: None,
+            state: None,
         };
         assert!(empty_ids.validate().is_err());
 
@@ -366,6 +426,7 @@ mod tests {
             output: None,
             solr_url: None,
             candidate_core: None,
+            state: None,
         };
         assert!(too_many_ids.validate().is_err());
 
@@ -377,6 +438,7 @@ mod tests {
             output: None,
             solr_url: None,
             candidate_core: None,
+            state: None,
         };
         assert!(valid.validate().is_ok());
 
@@ -389,6 +451,7 @@ mod tests {
             output: None,
             solr_url: Some("http://127.0.0.1:8983/solr".to_string()),
             candidate_core: None,
+            state: None,
         };
         assert!(mismatch1.validate().is_err());
 
@@ -400,6 +463,7 @@ mod tests {
             output: None,
             solr_url: None,
             candidate_core: Some("stage_staff_nonce1_candidate".to_string()),
+            state: None,
         };
         assert!(mismatch2.validate().is_err());
 
@@ -412,6 +476,7 @@ mod tests {
             output: None,
             solr_url: Some("http://remote-solr.com:8983/solr".to_string()),
             candidate_core: Some("stage_staff_nonce1_candidate".to_string()),
+            state: Some(PathBuf::from("/path/to/state.json")),
         };
         assert!(non_loopback.validate().is_err());
 
@@ -424,6 +489,7 @@ mod tests {
             output: None,
             solr_url: Some("http://127.0.0.1:8983/solr".to_string()),
             candidate_core: Some("stage_staff_test_candidate".to_string()),
+            state: Some(PathBuf::from("/path/to/state.json")),
         };
         assert!(forbidden_core.validate().is_err());
 
@@ -435,8 +501,44 @@ mod tests {
             output: None,
             solr_url: Some("http://127.0.0.1:18983/solr".to_string()),
             candidate_core: Some("stage_staff_20261026_candidate".to_string()),
+            state: Some(PathBuf::from("/path/to/state.json")),
         };
         assert!(valid_solr.validate().is_ok());
+
+        // Solr write mode requires --state
+        let write_mode_missing_state = StaffAoBuilderArgs {
+            state: None,
+            ..valid_solr.clone()
+        };
+        assert!(write_mode_missing_state.validate().is_err());
+        assert_eq!(
+            write_mode_missing_state.validate().unwrap_err().to_string(),
+            "missing required profiling-stack state file for Solr write mode (--state)"
+        );
+
+        // Solr write mode forbids --strip-markers false
+        let write_mode_marker_false = StaffAoBuilderArgs {
+            strip_markers: false,
+            ..valid_solr.clone()
+        };
+        assert!(write_mode_marker_false.validate().is_err());
+        assert_eq!(
+            write_mode_marker_false.validate().unwrap_err().to_string(),
+            "--strip-markers false is forbidden in Solr write mode; marker stripping is mandatory"
+        );
+
+        // Preview mode permits --strip-markers false and requires no state
+        let preview_mode_marker_false = StaffAoBuilderArgs {
+            repo: 4,
+            ids: vec![1],
+            arks_enabled: false,
+            strip_markers: false,
+            output: None,
+            solr_url: None,
+            candidate_core: None,
+            state: None,
+        };
+        assert!(preview_mode_marker_false.validate().is_ok());
 
         // Rejects --output in write mode
         let write_mode_with_output = StaffAoBuilderArgs {
@@ -447,6 +549,7 @@ mod tests {
             output: Some(PathBuf::from("/tmp/leaked_records.json")),
             solr_url: Some("http://127.0.0.1:18983/solr".to_string()),
             candidate_core: Some("stage_staff_20261026_candidate".to_string()),
+            state: Some(PathBuf::from("/path/to/state.json")),
         };
         let err = write_mode_with_output.validate().unwrap_err();
         assert!(err.to_string().contains("--output"));
@@ -533,6 +636,7 @@ mod tests {
             output: None,
             solr_url: None,
             candidate_core: None,
+            state: None,
         };
 
         let docs = execute_staff_ao_builder(&client, &args)
@@ -638,11 +742,16 @@ mod tests {
             output: None,
             solr_url: Some(server.url()),
             candidate_core: Some(core_name.to_string()),
+            state: Some(PathBuf::from("/path/to/state.json")),
         };
 
-        let docs = execute_staff_ao_builder(&client, &args)
-            .await
-            .expect("should write and commit to Solr candidate core");
+        let docs = execute_staff_ao_builder_with_verifier(
+            &client,
+            &args,
+            |_state, _backend, _solr| Ok(()),
+        )
+        .await
+        .expect("should write and commit to Solr candidate core");
         assert_eq!(docs.len(), 1);
     }
 
@@ -740,6 +849,7 @@ mod tests {
             output: Some(unwritten_output.clone()),
             solr_url: Some(server.url()),
             candidate_core: Some(core_name.to_string()),
+            state: Some(PathBuf::from("/path/to/state.json")),
         };
         let val_err = invalid_args.validate().unwrap_err();
         assert!(val_err.to_string().contains("--output"));
@@ -751,9 +861,14 @@ mod tests {
         };
 
         let mut writer = Vec::new();
-        run_staff_ao_builder_to_writer(&client, valid_args, &mut writer)
-            .await
-            .expect("should run staff ao builder in write mode");
+        run_staff_ao_builder_to_writer_with_verifier(
+            &client,
+            valid_args,
+            &mut writer,
+            |_state, _backend, _solr| Ok(()),
+        )
+        .await
+        .expect("should run staff ao builder in write mode");
 
         let stdout_str = String::from_utf8(writer).expect("valid utf8");
 
@@ -779,6 +894,82 @@ mod tests {
             "Output file must NOT be created in write mode"
         );
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_run_staff_ao_builder_write_mode_verification_failure_fails_closed() {
+        let server = Server::new_async().await;
+        let mut client = Client::new(server.url());
+        client.session_token = Some("dummy-session".to_string());
+
+        let args = StaffAoBuilderArgs {
+            repo: 4,
+            ids: vec![1221],
+            arks_enabled: false,
+            strip_markers: true,
+            output: None,
+            solr_url: Some(server.url()),
+            candidate_core: Some("stage_staff_20261026_verif99_candidate".to_string()),
+            state: Some(PathBuf::from("/path/to/state.json")),
+        };
+
+        let err =
+            execute_staff_ao_builder_with_verifier(&client, &args, |_state, _backend, _solr| {
+                bail!("Profiling stack identity check failed: Solr is not profiling Solr");
+            })
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("Profiling stack identity check failed"));
+    }
+
+    #[tokio::test]
+    async fn test_run_staff_ao_builder_write_mode_passes_exact_parameters() {
+        let server = Server::new_async().await;
+        let mut client = Client::new(server.url());
+        client.session_token = Some("dummy-session".to_string());
+
+        let state_path = PathBuf::from("/benchmarks/profiling_stack_test_builder.json");
+        let expected_backend = client.base_url().to_string();
+        let expected_solr = server.url();
+
+        let args = StaffAoBuilderArgs {
+            repo: 4,
+            ids: vec![1221],
+            arks_enabled: false,
+            strip_markers: true,
+            output: None,
+            solr_url: Some(expected_solr.clone()),
+            candidate_core: Some("stage_staff_20261026_verif99_candidate".to_string()),
+            state: Some(state_path.clone()),
+        };
+
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let verified = Arc::new(AtomicBool::new(false));
+        let verified_clone = Arc::clone(&verified);
+
+        let exp_state_clone = state_path.clone();
+        let exp_backend_clone = expected_backend.clone();
+        let exp_solr_clone = expected_solr.clone();
+
+        let _ =
+            execute_staff_ao_builder_with_verifier(&client, &args, move |state, backend, solr| {
+                assert_eq!(state, exp_state_clone.as_path());
+                assert_eq!(backend, exp_backend_clone.as_str());
+                assert_eq!(solr, exp_solr_clone.as_str());
+                verified_clone.store(true, Ordering::SeqCst);
+                // Return error to halt before further operations
+                bail!("Halt after verifier parameter confirmation");
+            })
+            .await;
+
+        assert!(
+            verified.load(Ordering::SeqCst),
+            "Verifier must be invoked with exact state, backend_url, and solr_url"
+        );
     }
 
     #[tokio::test]
@@ -842,6 +1033,7 @@ mod tests {
             output: None,
             solr_url: None,
             candidate_core: None,
+            state: None,
         };
 
         let mut stdout_buf = Vec::new();
@@ -866,6 +1058,7 @@ mod tests {
             output: Some(output_file.clone()),
             solr_url: None,
             candidate_core: None,
+            state: None,
         };
 
         let mut empty_buf = Vec::new();

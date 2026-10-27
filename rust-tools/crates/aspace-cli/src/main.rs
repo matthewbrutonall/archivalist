@@ -9,6 +9,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use serde::Serialize;
 use std::{collections::BTreeMap, io};
 
+pub mod profiling_stack;
 pub mod shadow;
 pub mod staff_ao_builder;
 pub mod staff_ao_candidate;
@@ -2159,6 +2160,8 @@ mod tests {
             "false",
             "--strip-markers",
             "true",
+            "--state",
+            "/benchmarks/profiling_stack_state.json",
             "--json",
         ])
         .unwrap();
@@ -2171,6 +2174,12 @@ mod tests {
                 assert_eq!(args.candidate_core, "stage_staff_20261026_candidate");
                 assert!(!args.arks_enabled);
                 assert!(args.strip_markers);
+                assert_eq!(
+                    args.state,
+                    Some(std::path::PathBuf::from(
+                        "/benchmarks/profiling_stack_state.json"
+                    ))
+                );
                 assert!(args.json);
                 assert_eq!(args.fail_after_batches, None);
                 assert!(args.validate().is_ok());
@@ -2187,6 +2196,8 @@ mod tests {
             "http://127.0.0.1:18983/solr",
             "--candidate-core",
             "stage_staff_20261026_candidate",
+            "--state",
+            "/benchmarks/profiling_stack_state.json",
             "--fail-after-batches",
             "5",
         ])
@@ -2194,6 +2205,12 @@ mod tests {
         match cli_candidate_fail.command {
             Commands::StaffAoCandidate(args) => {
                 assert_eq!(args.fail_after_batches, Some(5));
+                assert_eq!(
+                    args.state,
+                    Some(std::path::PathBuf::from(
+                        "/benchmarks/profiling_stack_state.json"
+                    ))
+                );
                 assert!(args.validate().is_ok());
             }
             _ => panic!("Expected Commands::StaffAoCandidate"),
@@ -2215,6 +2232,7 @@ mod tests {
                 assert_eq!(args.ids, vec![1221, 2229]);
                 assert!(args.arks_enabled);
                 assert!(args.strip_markers);
+                assert_eq!(args.state, None);
                 assert!(args.validate().is_ok());
             }
             _ => panic!("Expected Commands::StaffAoBuilder"),
@@ -2231,6 +2249,8 @@ mod tests {
             "http://127.0.0.1:18983/solr",
             "--candidate-core",
             "stage_staff_20261026_candidate",
+            "--state",
+            "/benchmarks/profiling_stack_state.json",
             "--output",
             "/tmp/should_be_rejected.json",
         ])

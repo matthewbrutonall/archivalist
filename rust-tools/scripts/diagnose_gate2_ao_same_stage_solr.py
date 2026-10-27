@@ -717,6 +717,8 @@ def run_diagnostic():
         "--password",
         state["admin_password"],
         "staff-ao-builder",
+        "--state",
+        args.state,
         "--repo",
         str(DEFAULT_REPO_ID),
         "--ids",

@@ -426,6 +426,8 @@ def run_failure_injection_fallback_harness():
         "--password",
         state["admin_password"],
         "staff-ao-candidate",
+        "--state",
+        args.state,
         "--repo",
         str(DEFAULT_REPO_ID),
         "--batch-size",
