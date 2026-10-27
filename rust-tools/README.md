@@ -467,8 +467,11 @@ Scripts under `scripts/` are code-only harnesses:
   prepares documents via `build_index_document_batch` with dynamic enum fields derived from backend `/schemas` and
   authoritative ARKs enablement, extracts synthetic `collection_management` child documents in native hook order
   (parent then child docs) before stripping markers, strips all top-level `_archivalist_*` private markers from both
-  parent and child documents, validates exact child identity and JSON parity, and streams documents to a disposable candidate
-  stage core (`stage_staff_<nonce>_candidate`).
+  parent and child documents, validates exact child identity and structural envelope invariants offline, and streams
+  documents to a disposable candidate stage core (`stage_staff_<nonce>_candidate`). Live type-strict stored-document
+  parity (including byte-for-byte embedded JSON equality) against native reference cores is independently established
+  and measured by dedicated stage comparison harnesses (`rust-tools/scripts/run_gate3_resource_candidate.py`),
+  distinguishing offline structural verification from live native parity.
   **Safety Guard:** Requires `--state <path_to_profiling_stack_state.json>` on every invocation. Runs
   `rust-tools/scripts/profiling_stack.py verify` via subprocess argument arrays before any Solr write or core readiness check,
   failing closed if verification fails, state is missing, the repository verifier is absent, endpoints/labels mismatch,

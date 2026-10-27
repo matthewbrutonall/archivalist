@@ -162,6 +162,25 @@ pub fn extract_resource_batch_documents(
         // Strip all top-level _archivalist_* markers from parent document
         parent_obj.retain(|k, _| !k.starts_with("_archivalist_"));
 
+        // Match native staff indexer apply_pui_fields: published resources receive PUI availability
+        // types ["pui_collection", "pui"] in addition to ["resource"].
+        if parent_obj.get("publish").and_then(Value::as_bool) == Some(true) {
+            let types = parent_obj
+                .entry("types".to_string())
+                .or_insert_with(|| Value::Array(vec![Value::String("resource".to_string())]));
+            if let Value::Array(types_arr) = types {
+                if !types_arr
+                    .iter()
+                    .any(|v| v.as_str() == Some("pui_collection"))
+                {
+                    types_arr.push(Value::String("pui_collection".to_string()));
+                }
+                if !types_arr.iter().any(|v| v.as_str() == Some("pui")) {
+                    types_arr.push(Value::String("pui".to_string()));
+                }
+            }
+        }
+
         let mut children = Vec::new();
         if let Some(cm_val) = cm_value {
             let cm_array = match cm_val {
@@ -726,6 +745,71 @@ mod tests {
             .as_object()
             .unwrap()
             .contains_key("_archivalist_some_flag"));
+    }
+
+    #[test]
+    fn test_published_resource_appends_pui_availability_types() {
+        // 1. Published resource gets ["pui_collection", "pui"] appended to types
+        let published_parent = json!({
+            "id": "/repositories/4/resources/20",
+            "uri": "/repositories/4/resources/20",
+            "title": "Published Resource",
+            "primary_type": "resource",
+            "publish": true,
+            "types": ["resource"],
+        });
+        let extracted_pub = extract_resource_batch_documents(vec![published_parent], 4).unwrap();
+        assert_eq!(
+            extracted_pub.ordered_documents[0]["types"],
+            json!(["resource", "pui_collection", "pui"])
+        );
+
+        // 2. Unpublished resource preserves types without pui additions
+        let unpublished_parent = json!({
+            "id": "/repositories/4/resources/21",
+            "uri": "/repositories/4/resources/21",
+            "title": "Unpublished Resource",
+            "primary_type": "resource",
+            "publish": false,
+            "types": ["resource"],
+        });
+        let extracted_unpub =
+            extract_resource_batch_documents(vec![unpublished_parent], 4).unwrap();
+        assert_eq!(
+            extracted_unpub.ordered_documents[0]["types"],
+            json!(["resource"])
+        );
+
+        // 3. Collection management child does NOT receive pui additions
+        let parent_with_cm = json!({
+            "id": "/repositories/4/resources/22",
+            "uri": "/repositories/4/resources/22",
+            "title": "Published Resource With CM",
+            "primary_type": "resource",
+            "publish": true,
+            "types": ["resource"],
+            "_archivalist_collection_management_documents": [
+                {
+                    "id": "/repositories/4/collection_management/99",
+                    "uri": "/repositories/4/collection_management/99",
+                    "parent_id": "/repositories/4/resources/22",
+                    "parent_type": "resource",
+                    "primary_type": "collection_management",
+                    "types": ["collection_management"],
+                    "title": "Published Resource With CM",
+                    "json": "{}"
+                }
+            ]
+        });
+        let extracted_cm = extract_resource_batch_documents(vec![parent_with_cm], 4).unwrap();
+        assert_eq!(
+            extracted_cm.ordered_documents[0]["types"],
+            json!(["resource", "pui_collection", "pui"])
+        );
+        assert_eq!(
+            extracted_cm.ordered_documents[1]["types"],
+            json!(["collection_management"])
+        );
     }
 
     #[test]
