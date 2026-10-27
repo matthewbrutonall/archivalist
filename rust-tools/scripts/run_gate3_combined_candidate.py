@@ -670,6 +670,12 @@ def parse_args():
         choices=range(1, 33),
         help="Concurrent Rust fetch/build batches in full mode (default: 4)",
     )
+    parser.add_argument(
+        "--inject-failure-after",
+        type=int,
+        default=None,
+        help="Full mode only: abort after this many Rust batches and run native fallback",
+    )
     return parser.parse_args()
 
 
@@ -677,6 +683,10 @@ def run_harness() -> int:
     args = parse_args()
     if args.fresh_native and not args.full:
         raise ValueError("--fresh-native requires --full")
+    if args.inject_failure_after is not None and (
+        not args.full or not args.fresh_native or args.inject_failure_after < 1
+    ):
+        raise ValueError("--inject-failure-after requires --full --fresh-native and a positive count")
     print("=== Gate 3 STAFF Live Parity Harness ===", flush=True)
 
     # 1. Check git branch and HEAD
@@ -994,6 +1004,8 @@ def run_harness() -> int:
             "--candidate-core", cand_core, "--arks-enabled", str(bool(active_arks)).lower(),
             "--strip-markers", "true", "--json",
         ]
+        if args.inject_failure_after is not None:
+            cli_cmd.extend(["--fail-after-batches", str(args.inject_failure_after)])
     else:
         cli_cmd = build_candidate_cli_command(
             cli_bin=cli_bin,
@@ -1017,38 +1029,29 @@ def run_harness() -> int:
     print(
         f"CLI process finished with exit code {cli_proc.returncode} in {t_cli_elapsed:.3f}s"
     )
-    if cli_proc.returncode != 0:
+    injected_failure = args.inject_failure_after is not None
+    if injected_failure and cli_proc.returncode == 0:
+        raise RuntimeError("injected candidate failure unexpectedly succeeded")
+    if cli_proc.returncode != 0 and not injected_failure:
         redacted_err = redact_secrets(cli_proc.stderr)
         print(f"CLI stderr: {redacted_err}", file=sys.stderr)
         raise RuntimeError(
             f"Candidate CLI failed with exit code {cli_proc.returncode}"
         )
 
-    try:
-        cand_summary = json.loads(cli_proc.stdout)
-    except Exception as e:
-        redacted_out = redact_secrets(cli_proc.stdout)
-        print(f"Raw CLI stdout:\n{redacted_out}", file=sys.stderr)
-        raise RuntimeError(
-            f"Failed to parse candidate JSON summary: {redact_secrets(e)}"
-        )
-
-    print("CLI summary:")
-    print(f"  total_ids_discovered: {cand_summary.get('total_ids_discovered')}")
-    print(f"  exact_ids_indexed: {cand_summary.get('exact_ids_indexed')}")
-    print(f"  parent_docs: {cand_summary.get('parent_docs')}")
-    print(f"  child_docs: {cand_summary.get('child_docs')}")
-    print(f"  total_docs_indexed: {cand_summary.get('total_docs_indexed')}")
-    print(f"  archival_objects: {cand_summary.get('archival_objects')}")
-    print(f"  resources: {cand_summary.get('resources')}")
-    print(f"  digital_objects: {cand_summary.get('digital_objects')}")
-    print(f"  top_containers: {cand_summary.get('top_containers')}")
-    print(f"  committed: {cand_summary.get('committed')}")
-    print(f"  success: {cand_summary.get('success')}")
-
-    if not cand_summary.get("success", cand_summary.get("committed", False)):
-        err_msg = redact_secrets(cand_summary.get("error_message"))
-        raise RuntimeError(f"Candidate CLI reported success=false: {err_msg}")
+    cand_summary = None
+    if not injected_failure:
+        try:
+            cand_summary = json.loads(cli_proc.stdout)
+        except Exception as e:
+            redacted_out = redact_secrets(cli_proc.stdout)
+            print(f"Raw CLI stdout:\n{redacted_out}", file=sys.stderr)
+            raise RuntimeError(
+                f"Failed to parse candidate JSON summary: {redact_secrets(e)}"
+            )
+        if not cand_summary.get("success", cand_summary.get("committed", False)):
+            err_msg = redact_secrets(cand_summary.get("error_message"))
+            raise RuntimeError(f"Candidate CLI reported success=false: {err_msg}")
 
     fresh_native_report = None
     if args.fresh_native:
@@ -1107,6 +1110,29 @@ def run_harness() -> int:
         data = json.loads(resp.read().decode())
         solr_num_found = data.get("response", {}).get("numFound", -1)
     print(f"Solr candidate core numFound: {solr_num_found}")
+
+    if injected_failure:
+        if solr_num_found >= EXPECTED_TOTAL_NATIVE_DOCS:
+            raise RuntimeError("failed candidate unexpectedly reached full native document count")
+        report = {
+            "git_head": git_head,
+            "git_dirty": is_dirty,
+            "binary_provenance": provenance,
+            "stack_id": EXPECTED_STACK_ID,
+            "candidate_core": cand_core,
+            "candidate_cli_exit": cli_proc.returncode,
+            "candidate_cli_error": redact_secrets(cli_proc.stderr[-2000:]),
+            "failure_after_batches": args.inject_failure_after,
+            "candidate_visible_documents": solr_num_found,
+            "native_fallback_core": native_core,
+            "native_fallback_report_path": report_path,
+            "native_fallback_documents": len(native_slice_docs_by_id),
+            "candidate_promoted": False,
+        }
+        report_path = os.path.join(args.output_dir, f"gate3_full_failure_fallback_{run_nonce}.json")
+        write_file_mode_0600(report_path, json.dumps(report, indent=2))
+        print(f"Retained failure/fallback report: {report_path}")
+        return 0
 
     # 17. Fetch all stored documents from candidate core
     print(f"Streaming candidate documents from '{cand_core}'...", flush=True)

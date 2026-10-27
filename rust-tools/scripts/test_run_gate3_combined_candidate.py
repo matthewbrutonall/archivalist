@@ -207,6 +207,9 @@ class TestRunGate3CombinedCandidate(unittest.TestCase):
         with patch("run_gate3_combined_candidate.get_mem_available_gib", return_value=12.0):
             with patch("run_gate3_combined_candidate.parse_args") as mock_args:
                 mock_args.return_value = MagicMock(dry_run=True, state=harness.DEFAULT_STATE_FILE)
+                mock_args.return_value.full = False
+                mock_args.return_value.fresh_native = False
+                mock_args.return_value.inject_failure_after = None
                 with patch("run_gate3_combined_candidate.subprocess.run") as mock_subproc:
                     mock_subproc.return_value = MagicMock(returncode=0, stdout="codex/gate3-full-staff\n")
                     with patch(
@@ -216,6 +219,16 @@ class TestRunGate3CombinedCandidate(unittest.TestCase):
                         with self.assertRaises(RuntimeError) as cm:
                             harness.run_harness()
                         self.assertIn("Insufficient memory headroom", str(cm.exception))
+
+    def test_failure_injection_requires_full_native_fallback(self):
+        with patch("run_gate3_combined_candidate.parse_args") as mock_args:
+            args = MagicMock()
+            args.full = True
+            args.fresh_native = False
+            args.inject_failure_after = 60
+            mock_args.return_value = args
+            with self.assertRaisesRegex(ValueError, "requires --full --fresh-native"):
+                harness.run_harness()
 
     def test_build_candidate_cli_command_omits_password_and_secret(self):
         sentinel = "SUPER_SECRET_SENTINEL_XYZ_98765"
