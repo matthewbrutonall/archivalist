@@ -318,8 +318,14 @@ def verify_active_app_arks_enabled(
     admin_password: str,
 ) -> Tuple[str, Optional[bool]]:
     try:
-        login_url = f"{backend_url.rstrip('/')}/users/{urllib.parse.quote(admin_user)}/login?password={urllib.parse.quote(admin_password)}"
-        req = urllib.request.Request(login_url, data=b"", method="POST")
+        login_url = f"{backend_url.rstrip('/')}/users/{urllib.parse.quote(admin_user)}/login"
+        post_data = urllib.parse.urlencode({"password": admin_password}).encode("utf-8")
+        req = urllib.request.Request(
+            login_url,
+            data=post_data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
         with urllib.request.urlopen(req, timeout=10) as resp:
             login_data = json.loads(resp.read().decode("utf-8"))
             session_token = login_data.get("session")
@@ -339,6 +345,82 @@ def verify_active_app_arks_enabled(
     except Exception:
         pass
     return ("unverified", None)
+
+
+_KNOWN_SECRETS: Set[str] = set()
+
+
+def register_secret(secret: Optional[str]) -> None:
+    if secret and isinstance(secret, str):
+        _KNOWN_SECRETS.add(secret)
+
+
+def redact_secrets(text: Any, extra_secrets: Optional[List[str]] = None) -> str:
+    if text is None:
+        return ""
+    str_val = str(text)
+    active_secrets: Set[str] = set(_KNOWN_SECRETS)
+    if extra_secrets:
+        for s in extra_secrets:
+            if s and isinstance(s, str):
+                active_secrets.add(s)
+    result = str_val
+    for s in active_secrets:
+        if not s:
+            continue
+        result = result.replace(s, "<REDACTED>")
+        quoted = urllib.parse.quote(s)
+        if quoted and quoted != s:
+            result = result.replace(quoted, "<REDACTED>")
+    return result
+
+
+def build_candidate_cli_command(
+    cli_bin: str,
+    backend_host_url: str,
+    admin_user: str,
+    state_path: str,
+    repo_id: int,
+    solr_host_url: str,
+    cand_core: str,
+    active_arks: bool,
+) -> List[str]:
+    arks_flag = "true" if active_arks else "false"
+    return [
+        cli_bin,
+        "--url",
+        backend_host_url,
+        "--user",
+        admin_user,
+        "staff-resource-candidate",
+        "--state",
+        state_path,
+        "--repo",
+        str(repo_id),
+        "--batch-size",
+        "25",
+        "--concurrency",
+        "4",
+        "--solr-url",
+        solr_host_url,
+        "--candidate-core",
+        cand_core,
+        "--arks-enabled",
+        arks_flag,
+        "--strip-markers",
+        "true",
+        "--json",
+    ]
+
+
+def build_candidate_cli_env(
+    admin_password: Optional[str] = None,
+    base_env: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+    env = dict(os.environ if base_env is None else base_env)
+    if admin_password is not None:
+        env["ASPACE_PASSWORD"] = admin_password
+    return env
 
 
 def verify_binary_provenance(cli_bin: str) -> Dict[str, Any]:
@@ -606,6 +688,9 @@ def run_harness() -> int:
     with open(args.state) as f:
         state = json.load(f)
 
+    if "admin_password" in state:
+        register_secret(state["admin_password"])
+
     if state.get("stack_id") != EXPECTED_STACK_ID:
         raise RuntimeError(
             f"State file stack_id '{state.get('stack_id')}' != expected '{EXPECTED_STACK_ID}'"
@@ -749,7 +834,7 @@ def run_harness() -> int:
         args.state,
     ]
     verify_res = subprocess.run(verify_cmd, capture_output=True, text=True, check=True)
-    print(verify_res.stdout.strip(), flush=True)
+    print(redact_secrets(verify_res.stdout.strip()), flush=True)
 
     # 12. Authenticated verification of active arks_enabled
     print("\n=== Validating Active App Configuration (/system/info) ===", flush=True)
@@ -831,50 +916,37 @@ def run_harness() -> int:
         raise RuntimeError(f"Candidate core '{cand_core}' contains {c_init_docs} docs; expected 0")
 
     # 15. Execute aspace-cli staff-resource-candidate
-    arks_flag = "true" if active_arks else "false"
-    cli_cmd = [
-        cli_bin,
-        "--url",
-        backend_host_url,
-        "--user",
-        state["admin_user"],
-        "--password",
-        state["admin_password"],
-        "staff-resource-candidate",
-        "--state",
-        args.state,
-        "--repo",
-        str(args.repo),
-        "--batch-size",
-        "25",
-        "--concurrency",
-        "4",
-        "--solr-url",
-        solr_host_url,
-        "--candidate-core",
-        cand_core,
-        "--arks-enabled",
-        arks_flag,
-        "--strip-markers",
-        "true",
-        "--json",
-    ]
+    cli_cmd = build_candidate_cli_command(
+        cli_bin=cli_bin,
+        backend_host_url=backend_host_url,
+        admin_user=state["admin_user"],
+        state_path=args.state,
+        repo_id=args.repo,
+        solr_host_url=solr_host_url,
+        cand_core=cand_core,
+        active_arks=bool(active_arks),
+    )
+    cli_env = build_candidate_cli_env(admin_password=state.get("admin_password"))
 
-    print(f"Running CLI command: {' '.join(cli_cmd)}", flush=True)
+    # Never print entire env or secret
+    rendered_cmd = " ".join(cli_cmd)
+    print(f"Running CLI command: {redact_secrets(rendered_cmd)}", flush=True)
     t_cli_start = time.perf_counter()
-    cli_proc = subprocess.run(cli_cmd, capture_output=True, text=True)
+    cli_proc = subprocess.run(cli_cmd, capture_output=True, text=True, env=cli_env)
     t_cli_elapsed = time.perf_counter() - t_cli_start
 
     print(f"CLI process finished with exit code {cli_proc.returncode} in {t_cli_elapsed:.3f}s")
     if cli_proc.returncode != 0:
-        print(f"CLI stderr: {cli_proc.stderr}", file=sys.stderr)
+        redacted_err = redact_secrets(cli_proc.stderr)
+        print(f"CLI stderr: {redacted_err}", file=sys.stderr)
         raise RuntimeError(f"Candidate CLI failed with exit code {cli_proc.returncode}")
 
     try:
         cand_summary = json.loads(cli_proc.stdout)
     except Exception as e:
-        print(f"Raw CLI stdout:\n{cli_proc.stdout}", file=sys.stderr)
-        raise RuntimeError(f"Failed to parse candidate JSON summary: {e}")
+        redacted_out = redact_secrets(cli_proc.stdout)
+        print(f"Raw CLI stdout:\n{redacted_out}", file=sys.stderr)
+        raise RuntimeError(f"Failed to parse candidate JSON summary: {redact_secrets(e)}")
 
     print("CLI summary:")
     print(f"  total_ids_discovered: {cand_summary.get('total_ids_discovered')}")
@@ -886,7 +958,8 @@ def run_harness() -> int:
     print(f"  success: {cand_summary.get('success')}")
 
     if not cand_summary.get("success", False):
-        raise RuntimeError(f"Candidate CLI reported success=false: {cand_summary.get('error_message')}")
+        err_msg = redact_secrets(cand_summary.get("error_message"))
+        raise RuntimeError(f"Candidate CLI reported success=false: {err_msg}")
 
     # 16. Verify candidate core document count directly from Solr
     cand_select_url = f"{solr_host_url}/{cand_core}/select?q=*:*&rows=0&wt=json"
@@ -968,5 +1041,5 @@ if __name__ == "__main__":
     try:
         sys.exit(run_harness())
     except Exception as e:
-        print(f"\n[FATAL ERROR] {e}", file=sys.stderr)
+        print(f"\n[FATAL ERROR] {redact_secrets(e)}", file=sys.stderr)
         sys.exit(1)

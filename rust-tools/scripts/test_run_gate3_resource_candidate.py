@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Offline Unit Tests for Gate 3 STAFF Resource Slice Parity Harness"""
 
+import contextlib
+import io
 import json
 import os
 import sys
@@ -160,6 +162,132 @@ class TestRunGate3ResourceCandidate(unittest.TestCase):
                         with self.assertRaises(RuntimeError) as cm:
                             harness.run_harness()
                         self.assertIn("Insufficient memory headroom", str(cm.exception))
+
+    def test_build_candidate_cli_command_omits_password_and_secret(self):
+        sentinel = "SUPER_SECRET_SENTINEL_XYZ_98765"
+        cmd = harness.build_candidate_cli_command(
+            cli_bin="/path/to/bin",
+            backend_host_url="http://127.0.0.1:4567",
+            admin_user="admin",
+            state_path="/path/to/state.json",
+            repo_id=4,
+            solr_host_url="http://127.0.0.1:8983/solr",
+            cand_core="cand_core_1",
+            active_arks=True,
+        )
+        self.assertNotIn("--password", cmd)
+        self.assertNotIn("-P", cmd)
+        self.assertNotIn(sentinel, cmd)
+        self.assertNotIn(sentinel, " ".join(cmd))
+        self.assertNotIn(sentinel, str(cmd))
+
+    def test_build_candidate_cli_env_sets_aspace_password_without_modifying_base(self):
+        sentinel = "SUPER_SECRET_SENTINEL_XYZ_98765"
+        base_env = {"EXISTING_VAR": "val1"}
+        env = harness.build_candidate_cli_env(admin_password=sentinel, base_env=base_env)
+        self.assertEqual(env["ASPACE_PASSWORD"], sentinel)
+        self.assertEqual(env["EXISTING_VAR"], "val1")
+        self.assertNotIn("ASPACE_PASSWORD", base_env)
+
+    def test_redact_secrets_filters_plain_and_url_encoded_variants(self):
+        sentinel = "P@ssw0rd with spaces & symbols!"
+        harness.register_secret(sentinel)
+        raw_err = f"Error connecting with password {sentinel} to server"
+        redacted = harness.redact_secrets(raw_err)
+        self.assertNotIn(sentinel, redacted)
+        self.assertIn("<REDACTED>", redacted)
+
+        quoted = "P%40ssw0rd%20with%20spaces%20%26%20symbols%21"
+        raw_url = f"http://localhost:8089/login?password={quoted}"
+        redacted_url = harness.redact_secrets(raw_url)
+        self.assertNotIn(quoted, redacted_url)
+        self.assertIn("<REDACTED>", redacted_url)
+
+    def test_verify_active_app_arks_enabled_login_url_has_no_secret_in_url(self):
+        sentinel = "SECRET_SENTINEL_PASSWORD_456"
+        captured_requests = []
+
+        def mock_urlopen(req, timeout=10):
+            captured_requests.append(req)
+            resp = MagicMock()
+            resp.read.return_value = json.dumps({"session": "mock_session"}).encode("utf-8")
+            resp.__enter__.return_value = resp
+            return resp
+
+        with patch("urllib.request.urlopen", side_effect=mock_urlopen):
+            harness.verify_active_app_arks_enabled(
+                "http://127.0.0.1:4567",
+                "admin",
+                sentinel,
+            )
+
+        self.assertTrue(len(captured_requests) >= 1)
+        login_req = captured_requests[0]
+        self.assertEqual(login_req.full_url, "http://127.0.0.1:4567/users/admin/login")
+        self.assertNotIn(sentinel, login_req.full_url)
+        self.assertNotIn("password=", login_req.full_url)
+        self.assertIn(b"password=", login_req.data)
+
+    def test_cli_error_diagnostics_redact_secret_in_stderr_and_stdout(self):
+        sentinel = "CRITICAL_SENTINEL_SECRET_789"
+        harness.register_secret(sentinel)
+
+        bad_stderr = f"fatal: auth failed for password '{sentinel}'"
+        redacted = harness.redact_secrets(bad_stderr)
+        self.assertNotIn(sentinel, redacted)
+        self.assertIn("<REDACTED>", redacted)
+
+        bad_stdout = f"raw trace dump with {sentinel} inside"
+        redacted_out = harness.redact_secrets(bad_stdout)
+        self.assertNotIn(sentinel, redacted_out)
+        self.assertIn("<REDACTED>", redacted_out)
+
+        ex = RuntimeError(f"Command failed with {sentinel}")
+        redacted_ex = harness.redact_secrets(ex)
+        self.assertNotIn(sentinel, redacted_ex)
+        self.assertIn("<REDACTED>", redacted_ex)
+
+    def test_harness_cli_invocation_never_logs_or_passes_sentinel(self):
+        sentinel = "HARNESS_SENTINEL_SECRET_XYZ"
+        harness.register_secret(sentinel)
+
+        cmd = harness.build_candidate_cli_command(
+            cli_bin="/path/to/bin",
+            backend_host_url="http://127.0.0.1:4567",
+            admin_user="admin",
+            state_path="/tmp/mock_state.json",
+            repo_id=4,
+            solr_host_url="http://127.0.0.1:8983/solr",
+            cand_core="stage_staff_cand",
+            active_arks=False,
+        )
+        env = harness.build_candidate_cli_env(admin_password=sentinel)
+
+        # Assert no password arg in argv
+        self.assertNotIn("--password", cmd)
+        self.assertNotIn("-P", cmd)
+        self.assertNotIn(sentinel, cmd)
+
+        # Assert rendered command string has no sentinel or password flag
+        rendered = " ".join(cmd)
+        logged_cmd = f"Running CLI command: {harness.redact_secrets(rendered)}"
+        self.assertNotIn(sentinel, logged_cmd)
+        self.assertNotIn("--password", logged_cmd)
+
+        # Simulate subprocess run capturing output with sentinel in stderr
+        mock_proc = MagicMock(
+            returncode=1,
+            stdout="{}",
+            stderr=f"Error connecting with {sentinel}",
+        )
+        stderr_io = io.StringIO()
+        with contextlib.redirect_stderr(stderr_io):
+            redacted_err = harness.redact_secrets(mock_proc.stderr)
+            print(f"CLI stderr: {redacted_err}", file=sys.stderr)
+
+        captured_stderr = stderr_io.getvalue()
+        self.assertNotIn(sentinel, captured_stderr)
+        self.assertIn("<REDACTED>", captured_stderr)
 
 
 if __name__ == "__main__":
