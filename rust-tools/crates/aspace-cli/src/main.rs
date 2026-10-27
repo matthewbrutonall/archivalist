@@ -14,6 +14,8 @@ pub mod shadow;
 pub mod staff_ao_builder;
 pub mod staff_ao_candidate;
 pub mod staff_ao_probe;
+pub mod staff_candidate_runner;
+pub mod staff_resource_candidate;
 
 #[derive(Serialize)]
 struct PerfPingReport {
@@ -313,6 +315,8 @@ enum Commands {
     StaffAoProbe(staff_ao_probe::StaffAoProbeArgs),
     #[command(name = "staff-ao-candidate")]
     StaffAoCandidate(staff_ao_candidate::StaffAoCandidateArgs),
+    #[command(name = "staff-resource-candidate")]
+    StaffResourceCandidate(staff_resource_candidate::StaffResourceCandidateArgs),
     #[command(name = "staff-ao-builder")]
     StaffAoBuilder(staff_ao_builder::StaffAoBuilderArgs),
     #[command(name = "build-index-document")]
@@ -1153,6 +1157,9 @@ async fn main() -> Result<()> {
         }
         Commands::StaffAoCandidate(args) => {
             staff_ao_candidate::run_staff_ao_candidate(&client, args.clone()).await?;
+        }
+        Commands::StaffResourceCandidate(args) => {
+            staff_resource_candidate::run_staff_resource_candidate(&client, args.clone()).await?;
         }
         Commands::BuildIndexDocument(_) => {
             unreachable!("build-index-document returns before API login")
@@ -2214,6 +2221,50 @@ mod tests {
                 assert!(args.validate().is_ok());
             }
             _ => panic!("Expected Commands::StaffAoCandidate"),
+        }
+
+        let cli_resource_candidate = Cli::try_parse_from([
+            "aspace",
+            "staff-resource-candidate",
+            "--repo",
+            "4",
+            "--batch-size",
+            "25",
+            "--concurrency",
+            "4",
+            "--solr-url",
+            "http://127.0.0.1:18983/solr",
+            "--candidate-core",
+            "stage_staff_20261027_candidate",
+            "--arks-enabled",
+            "false",
+            "--strip-markers",
+            "true",
+            "--state",
+            "/benchmarks/profiling_stack_state.json",
+            "--json",
+        ])
+        .unwrap();
+        match cli_resource_candidate.command {
+            Commands::StaffResourceCandidate(args) => {
+                assert_eq!(args.repo, 4);
+                assert_eq!(args.batch_size, 25);
+                assert_eq!(args.concurrency, 4);
+                assert_eq!(args.solr_url, "http://127.0.0.1:18983/solr");
+                assert_eq!(args.candidate_core, "stage_staff_20261027_candidate");
+                assert!(!args.arks_enabled);
+                assert!(args.strip_markers);
+                assert_eq!(
+                    args.state,
+                    Some(std::path::PathBuf::from(
+                        "/benchmarks/profiling_stack_state.json"
+                    ))
+                );
+                assert!(args.json);
+                assert_eq!(args.fail_after_batches, None);
+                assert!(args.validate().is_ok());
+            }
+            _ => panic!("Expected Commands::StaffResourceCandidate"),
         }
 
         let cli_builder = Cli::try_parse_from([

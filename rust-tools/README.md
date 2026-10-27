@@ -24,7 +24,7 @@ The application API remains authoritative. The tools do not write directly to th
 application database or primary Solr collection. The sidecar `/index/documents` endpoint
 remains JSON-only, returning prepared JSON to the Ruby production indexer, which remains
 authoritative for production Solr writes. The only Solr write exceptions are the isolated
-experimental CLI commands (`staff-ao-candidate` and `staff-ao-builder`), which write exclusively
+experimental CLI commands (`staff-ao-candidate`, `staff-resource-candidate`, and `staff-ao-builder`), which write exclusively
 to disposable candidate stage cores under verified profiling-stack isolation. Writing to the
 primary Solr core or application database is strictly forbidden and blocked.
 
@@ -461,6 +461,21 @@ Scripts under `scripts/` are code-only harnesses:
   write or core readiness check, failing closed if verification fails, state is missing, the repository
   verifier is absent, or endpoints/labels mismatch. Marker removal is mandatory; `--strip-markers false`
   is strictly rejected in write mode.
+- `staff-resource-candidate` (`aspace-cli` subcommand): Full-repository STAFF resource candidate
+  pipeline that discovers repository-scoped resource IDs using the native full-reindex contract
+  (`all_ids=true`, `modified_since=0`), hydrates bounded `id_set` batches with `IndexerCommonConfig.resolved_attributes`,
+  prepares documents via `build_index_document_batch` with dynamic enum fields derived from backend `/schemas` and
+  authoritative ARKs enablement, extracts synthetic `collection_management` child documents in native hook order
+  (parent then child docs) before stripping markers, strips all top-level `_archivalist_*` private markers from both
+  parent and child documents, validates exact child identity and JSON parity, and streams documents to a disposable candidate
+  stage core (`stage_staff_<nonce>_candidate`).
+  **Safety Guard:** Requires `--state <path_to_profiling_stack_state.json>` on every invocation. Runs
+  `rust-tools/scripts/profiling_stack.py verify` via subprocess argument arrays before any Solr write or core readiness check,
+  failing closed if verification fails, state is missing, the repository verifier is absent, endpoints/labels mismatch,
+  or child envelope/markers are malformed. Marker removal is mandatory; `--strip-markers false` is strictly rejected.
+  Outputs JSON metrics reporting separate source IDs, parent docs, child docs, committed status, and error details.
+  **Scope caveat:** This is an isolated bounded candidate vertical slice; fresh-core full rebuild only. No incremental
+  deletes, checkpointing, production indexing, or full-STAFF speed claims.
 - `staff-ao-builder` (`aspace-cli` subcommand): Targeted STAFF archival-object builder for single or
   batch document inspection and stage core testing.
   - Preview mode (default, no `--solr-url` / `--candidate-core`): outputs documents to stdout or `--output`,

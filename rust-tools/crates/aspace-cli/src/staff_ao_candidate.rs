@@ -1,143 +1,18 @@
 use anyhow::{bail, Context, Result};
-use aspace_client::isolated_solr_writer::{
-    validate_isolated_solr_base_url, validate_stage_candidate_core, IsolatedSolrStaffAoWriter,
-};
 use aspace_client::{
     build_index_document_batch, Client, IndexDocumentBatchRequest, IndexDocumentInput,
 };
-use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
 use std::io::{self, Write};
-use std::time::Instant;
 
 use crate::staff_ao_builder::strip_archivalist_markers;
-
-pub const DEFAULT_CANDIDATE_BATCH_SIZE: usize = 25;
-pub const MAX_CANDIDATE_BATCH_SIZE: usize = 25;
-pub const DEFAULT_CANDIDATE_CONCURRENCY: usize = 4;
-pub const MAX_CANDIDATE_CONCURRENCY: usize = 32;
-
-#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
-pub struct StaffAoCandidateArgs {
-    #[arg(
-        short,
-        long,
-        alias = "repo-id",
-        help = "Repository ID",
-        default_value_t = 4
-    )]
-    pub repo: u32,
-
-    #[arg(
-        long,
-        help = "Batch size for AO hydration (default: 25, max: 25)",
-        default_value_t = DEFAULT_CANDIDATE_BATCH_SIZE
-    )]
-    pub batch_size: usize,
-
-    #[arg(
-        long,
-        help = "Worker concurrency for batch fetching (default: 4, max: 32)",
-        default_value_t = DEFAULT_CANDIDATE_CONCURRENCY
-    )]
-    pub concurrency: usize,
-
-    #[arg(
-        long,
-        help = "Isolated Solr base URL (e.g. http://127.0.0.1:18983/solr)"
-    )]
-    pub solr_url: String,
-
-    #[arg(
-        long,
-        help = "Target stage candidate core name (format: stage_staff_<nonce>_candidate)"
-    )]
-    pub candidate_core: String,
-
-    #[arg(
-        long,
-        default_value_t = false,
-        num_args = 0..=1,
-        default_missing_value = "true",
-        action = clap::ArgAction::Set,
-        help = "Whether ARKs are enabled (default: false)"
-    )]
-    pub arks_enabled: bool,
-
-    #[arg(
-        long,
-        default_value_t = true,
-        num_args = 0..=1,
-        default_missing_value = "true",
-        action = clap::ArgAction::Set,
-        help = "Strip private _archivalist_* capability markers (default: true)"
-    )]
-    pub strip_markers: bool,
-
-    #[arg(
-        long,
-        alias = "profiling-stack-state",
-        help = "Path to profiling-stack state JSON file (required for Solr write verification)"
-    )]
-    pub state: Option<std::path::PathBuf>,
-
-    #[arg(
-        long,
-        help = "Output machine-readable JSON summary (default: human-readable)"
-    )]
-    pub json: bool,
-
-    #[arg(
-        long,
-        help = "Test-only: inject deterministic failure after completing N batches"
-    )]
-    pub fail_after_batches: Option<usize>,
-}
-
-impl StaffAoCandidateArgs {
-    pub fn validate(&self) -> Result<()> {
-        if self.repo == 0 {
-            bail!("repo ID must be greater than 0");
-        }
-        if self.batch_size == 0 {
-            bail!("batch size must be greater than 0");
-        }
-        if self.batch_size > MAX_CANDIDATE_BATCH_SIZE {
-            bail!(
-                "batch size cannot exceed {} (requested: {})",
-                MAX_CANDIDATE_BATCH_SIZE,
-                self.batch_size
-            );
-        }
-        if self.concurrency == 0 {
-            bail!("worker concurrency must be greater than 0");
-        }
-        if self.concurrency > MAX_CANDIDATE_CONCURRENCY {
-            bail!(
-                "worker concurrency cannot exceed {} (requested: {})",
-                MAX_CANDIDATE_CONCURRENCY,
-                self.concurrency
-            );
-        }
-        if let Some(limit) = self.fail_after_batches {
-            if limit == 0 {
-                bail!("fail_after_batches must be greater than 0 if specified");
-            }
-        }
-        validate_isolated_solr_base_url(&self.solr_url)?;
-        validate_stage_candidate_core(&self.candidate_core, None)?;
-        if !self.strip_markers {
-            bail!("--strip-markers false is forbidden in Solr write mode; marker stripping is mandatory");
-        }
-        match &self.state {
-            Some(path) if !path.as_os_str().is_empty() => {}
-            _ => bail!("missing required profiling-stack state file for Solr write mode (--state)"),
-        }
-        Ok(())
-    }
-}
+pub use crate::staff_candidate_runner::{
+    partition_ids_into_batches, render_candidate_summary_to_writer, CandidateBatchOutput,
+    StaffCandidateArgs, StaffCandidateArgs as StaffAoCandidateArgs, StaffCandidateExecutionResult,
+    DEFAULT_CANDIDATE_BATCH_SIZE, DEFAULT_CANDIDATE_CONCURRENCY, MAX_CANDIDATE_BATCH_SIZE,
+    MAX_CANDIDATE_CONCURRENCY,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StaffAoCandidateSummary {
@@ -178,11 +53,36 @@ pub struct StaffAoCandidateSummary {
     pub error_message: Option<String>,
 }
 
-pub fn partition_ids_into_batches(ids: &[u32], batch_size: usize) -> Vec<Vec<u32>> {
-    if ids.is_empty() || batch_size == 0 {
-        return Vec::new();
+impl From<StaffCandidateExecutionResult> for StaffAoCandidateSummary {
+    fn from(res: StaffCandidateExecutionResult) -> Self {
+        Self {
+            repository_id: res.repository_id,
+            total_ids_discovered: res.total_ids_discovered,
+            batch_size: res.batch_size,
+            concurrency: res.concurrency,
+            total_batches: res.total_batches,
+            batches_completed: res.batches_completed,
+            batches_failed: res.batches_failed,
+            failures: res.failures,
+            exact_ids_indexed: res.exact_ids_indexed,
+            unique_uris: res.unique_uris,
+            missing_ids: res.missing_ids,
+            duplicate_ids: res.duplicate_ids,
+            unexpected_ids: res.unexpected_ids,
+            candidate_core: res.candidate_core,
+            solr_url: res.solr_url,
+            arks_enabled: res.arks_enabled,
+            id_list_elapsed_sec: res.id_list_elapsed_sec,
+            batch_loop_wall_elapsed_sec: res.batch_loop_wall_elapsed_sec,
+            solr_write_elapsed_sec: res.solr_write_elapsed_sec,
+            solr_update_requests_sent: res.solr_update_requests_sent,
+            solr_commit_elapsed_sec: res.solr_commit_elapsed_sec,
+            total_wall_elapsed_sec: res.total_wall_elapsed_sec,
+            records_per_second: res.records_per_second,
+            success: res.success,
+            error_message: res.error_message,
+        }
     }
-    ids.chunks(batch_size).map(|c| c.to_vec()).collect()
 }
 
 pub async fn execute_staff_ao_candidate(
@@ -205,305 +105,31 @@ pub async fn execute_staff_ao_candidate_with_verifier<V>(
 where
     V: FnOnce(&std::path::Path, &str, &str) -> Result<()>,
 {
-    if let Err(err) = args.validate() {
-        return StaffAoCandidateSummary {
-            repository_id: args.repo,
-            total_ids_discovered: 0,
-            batch_size: args.batch_size,
-            concurrency: args.concurrency,
-            total_batches: 0,
-            batches_completed: 0,
-            batches_failed: 0,
-            failures: 1,
-            exact_ids_indexed: 0,
-            unique_uris: 0,
-            missing_ids: 0,
-            duplicate_ids: 0,
-            unexpected_ids: 0,
-            candidate_core: args.candidate_core.clone(),
-            solr_url: args.solr_url.clone(),
-            arks_enabled: args.arks_enabled,
-            id_list_elapsed_sec: 0.0,
-            batch_loop_wall_elapsed_sec: 0.0,
-            solr_write_elapsed_sec: 0.0,
-            solr_update_requests_sent: 0,
-            solr_commit_elapsed_sec: 0.0,
-            total_wall_elapsed_sec: 0.0,
-            records_per_second: 0.0,
-            success: false,
-            error_message: Some(format!("Invalid arguments: {err}")),
-        };
-    }
-
-    let state_path = args.state.as_ref().unwrap();
-
-    // Verify profiling stack identity before any Solr write or core readiness check
-    if let Err(err) = verifier(state_path, client.base_url(), &args.solr_url) {
-        return StaffAoCandidateSummary {
-            repository_id: args.repo,
-            total_ids_discovered: 0,
-            batch_size: args.batch_size,
-            concurrency: args.concurrency,
-            total_batches: 0,
-            batches_completed: 0,
-            batches_failed: 0,
-            failures: 1,
-            exact_ids_indexed: 0,
-            unique_uris: 0,
-            missing_ids: 0,
-            duplicate_ids: 0,
-            unexpected_ids: 0,
-            candidate_core: args.candidate_core.clone(),
-            solr_url: args.solr_url.clone(),
-            arks_enabled: args.arks_enabled,
-            id_list_elapsed_sec: 0.0,
-            batch_loop_wall_elapsed_sec: 0.0,
-            solr_write_elapsed_sec: 0.0,
-            solr_update_requests_sent: 0,
-            solr_commit_elapsed_sec: 0.0,
-            total_wall_elapsed_sec: 0.0,
-            records_per_second: 0.0,
-            success: false,
-            error_message: Some(format!("Profiling stack verification failed: {err}")),
-        };
-    }
-
-    // Pre-flight check: construct writer and verify candidate core is ready and empty
-    let mut writer = match IsolatedSolrStaffAoWriter::new(&args.solr_url, &args.candidate_core) {
-        Ok(w) => w,
-        Err(err) => {
-            return StaffAoCandidateSummary {
-                repository_id: args.repo,
-                total_ids_discovered: 0,
-                batch_size: args.batch_size,
-                concurrency: args.concurrency,
-                total_batches: 0,
-                batches_completed: 0,
-                batches_failed: 0,
-                failures: 1,
-                exact_ids_indexed: 0,
-                unique_uris: 0,
-                missing_ids: 0,
-                duplicate_ids: 0,
-                unexpected_ids: 0,
-                candidate_core: args.candidate_core.clone(),
-                solr_url: args.solr_url.clone(),
-                arks_enabled: args.arks_enabled,
-                id_list_elapsed_sec: 0.0,
-                batch_loop_wall_elapsed_sec: 0.0,
-                solr_write_elapsed_sec: 0.0,
-                solr_update_requests_sent: 0,
-                solr_commit_elapsed_sec: 0.0,
-                total_wall_elapsed_sec: 0.0,
-                records_per_second: 0.0,
-                success: false,
-                error_message: Some(format!(
-                    "Failed to initialize IsolatedSolrStaffAoWriter: {err}"
-                )),
-            };
-        }
-    };
-
-    if let Err(err) = writer.verify_target_core_ready().await {
-        return StaffAoCandidateSummary {
-            repository_id: args.repo,
-            total_ids_discovered: 0,
-            batch_size: args.batch_size,
-            concurrency: args.concurrency,
-            total_batches: 0,
-            batches_completed: 0,
-            batches_failed: 0,
-            failures: 1,
-            exact_ids_indexed: 0,
-            unique_uris: 0,
-            missing_ids: 0,
-            duplicate_ids: 0,
-            unexpected_ids: 0,
-            candidate_core: args.candidate_core.clone(),
-            solr_url: args.solr_url.clone(),
-            arks_enabled: args.arks_enabled,
-            id_list_elapsed_sec: 0.0,
-            batch_loop_wall_elapsed_sec: 0.0,
-            solr_write_elapsed_sec: 0.0,
-            solr_update_requests_sent: 0,
-            solr_commit_elapsed_sec: 0.0,
-            total_wall_elapsed_sec: 0.0,
-            records_per_second: 0.0,
-            success: false,
-            error_message: Some(format!(
-                "Candidate core '{}' readiness verification failed: {err}",
-                args.candidate_core
-            )),
-        };
-    }
-
-    // Pre-flight check: derive dynamic enum fields once from GET /schemas
-    let dynamic_enums = match client.dynamic_enum_fields_from_schemas().await {
-        Ok(e) => e,
-        Err(err) => {
-            return StaffAoCandidateSummary {
-                repository_id: args.repo,
-                total_ids_discovered: 0,
-                batch_size: args.batch_size,
-                concurrency: args.concurrency,
-                total_batches: 0,
-                batches_completed: 0,
-                batches_failed: 0,
-                failures: 1,
-                exact_ids_indexed: 0,
-                unique_uris: 0,
-                missing_ids: 0,
-                duplicate_ids: 0,
-                unexpected_ids: 0,
-                candidate_core: args.candidate_core.clone(),
-                solr_url: args.solr_url.clone(),
-                arks_enabled: args.arks_enabled,
-                id_list_elapsed_sec: 0.0,
-                batch_loop_wall_elapsed_sec: 0.0,
-                solr_write_elapsed_sec: 0.0,
-                solr_update_requests_sent: 0,
-                solr_commit_elapsed_sec: 0.0,
-                total_wall_elapsed_sec: 0.0,
-                records_per_second: 0.0,
-                success: false,
-                error_message: Some(format!(
-                    "Failed to derive dynamic enum fields from GET /schemas: {err}"
-                )),
-            };
-        }
-    };
-
-    // Measurement envelope begins here (matches native baseline: starts before ID enumeration)
-    let wall_start = Instant::now();
-
-    // 1. Enumerate all AO IDs modified since 0
-    let id_start = Instant::now();
-    let id_result = client
-        .archival_object_ids_modified_since(args.repo, Some(0))
-        .await;
-    let id_list_elapsed_sec = id_start.elapsed().as_secs_f64();
-
-    let ids = match id_result {
-        Ok(ids) => ids,
-        Err(err) => {
-            let total_wall_elapsed_sec = wall_start.elapsed().as_secs_f64();
-            return StaffAoCandidateSummary {
-                repository_id: args.repo,
-                total_ids_discovered: 0,
-                batch_size: args.batch_size,
-                concurrency: args.concurrency,
-                total_batches: 0,
-                batches_completed: 0,
-                batches_failed: 0,
-                failures: 1,
-                exact_ids_indexed: 0,
-                unique_uris: 0,
-                missing_ids: 0,
-                duplicate_ids: 0,
-                unexpected_ids: 0,
-                candidate_core: args.candidate_core.clone(),
-                solr_url: args.solr_url.clone(),
-                arks_enabled: args.arks_enabled,
-                id_list_elapsed_sec,
-                batch_loop_wall_elapsed_sec: 0.0,
-                solr_write_elapsed_sec: 0.0,
-                solr_update_requests_sent: 0,
-                solr_commit_elapsed_sec: 0.0,
-                total_wall_elapsed_sec,
-                records_per_second: 0.0,
-                success: false,
-                error_message: Some(format!(
-                    "Failed to fetch archival object ID list from backend: {err}"
-                )),
-            };
-        }
-    };
-
-    let mut initial_ids_set = HashSet::with_capacity(ids.len());
-    let mut duplicate_input_ids = 0;
-    for &id in &ids {
-        if !initial_ids_set.insert(id) {
-            duplicate_input_ids += 1;
-        }
-    }
-
-    if duplicate_input_ids > 0 {
-        let total_wall_elapsed_sec = wall_start.elapsed().as_secs_f64();
-        return StaffAoCandidateSummary {
-            repository_id: args.repo,
-            total_ids_discovered: ids.len(),
-            batch_size: args.batch_size,
-            concurrency: args.concurrency,
-            total_batches: 0,
-            batches_completed: 0,
-            batches_failed: 0,
-            failures: 1,
-            exact_ids_indexed: 0,
-            unique_uris: 0,
-            missing_ids: 0,
-            duplicate_ids: duplicate_input_ids,
-            unexpected_ids: 0,
-            candidate_core: args.candidate_core.clone(),
-            solr_url: args.solr_url.clone(),
-            arks_enabled: args.arks_enabled,
-            id_list_elapsed_sec,
-            batch_loop_wall_elapsed_sec: 0.0,
-            solr_write_elapsed_sec: 0.0,
-            solr_update_requests_sent: 0,
-            solr_commit_elapsed_sec: 0.0,
-            total_wall_elapsed_sec,
-            records_per_second: 0.0,
-            success: false,
-            error_message: Some(format!(
-                "Backend returned {} duplicate ID(s) in repository AO ID list",
-                duplicate_input_ids
-            )),
-        };
-    }
-
-    if ids.is_empty() {
-        let total_wall_elapsed_sec = wall_start.elapsed().as_secs_f64();
-        return StaffAoCandidateSummary {
-            repository_id: args.repo,
-            total_ids_discovered: 0,
-            batch_size: args.batch_size,
-            concurrency: args.concurrency,
-            total_batches: 0,
-            batches_completed: 0,
-            batches_failed: 0,
-            failures: 0,
-            exact_ids_indexed: 0,
-            unique_uris: 0,
-            missing_ids: 0,
-            duplicate_ids: 0,
-            unexpected_ids: 0,
-            candidate_core: args.candidate_core.clone(),
-            solr_url: args.solr_url.clone(),
-            arks_enabled: args.arks_enabled,
-            id_list_elapsed_sec,
-            batch_loop_wall_elapsed_sec: 0.0,
-            solr_write_elapsed_sec: 0.0,
-            solr_update_requests_sent: 0,
-            solr_commit_elapsed_sec: 0.0,
-            total_wall_elapsed_sec,
-            records_per_second: 0.0,
-            success: true,
-            error_message: None,
-        };
-    }
-
-    let batches = partition_ids_into_batches(&ids, args.batch_size);
-    let total_batches = batches.len();
-    let batch_start = Instant::now();
-
     let repo_id = args.repo;
     let arks_enabled = args.arks_enabled;
+    let expected_prefix = format!("/repositories/{}/archival_objects/", repo_id);
+    let descriptor = crate::staff_candidate_runner::StaffCandidateDescriptor {
+        expected_parent_prefix: &expected_prefix,
+        id_type_label: "archival object",
+        id_list_label: "AO",
+    };
 
-    let stream = stream::iter(batches.into_iter().enumerate().map(|(batch_idx, chunk)| {
-        let client = client.clone();
-        let dynamic_enums = dynamic_enums.clone();
-        async move {
-            let res: Result<Vec<Value>> = async {
+    let client_for_ids = client.clone();
+    let client_for_batches = client.clone();
+
+    let res = crate::staff_candidate_runner::execute_staff_candidate(
+        client,
+        args,
+        descriptor,
+        verifier,
+        || async move {
+            client_for_ids
+                .archival_object_ids_modified_since(repo_id, Some(0))
+                .await
+        },
+        move |batch_idx, chunk, dynamic_enums| {
+            let client = client_for_batches.clone();
+            async move {
                 let raw_records = client
                     .fetch_staff_archival_objects_by_ids(repo_id, &chunk)
                     .await
@@ -533,7 +159,7 @@ where
                         repository: repo_scope.clone(),
                         record,
                         enrich: true,
-                        dynamic_enum_fields: dynamic_enums.clone(),
+                        dynamic_enum_fields: (*dynamic_enums).clone(),
                         arks_enabled,
                         ..Default::default()
                     };
@@ -551,254 +177,100 @@ where
                 for doc in &mut docs {
                     strip_archivalist_markers(doc);
                 }
-                Ok(docs)
+
+                let parent_uris = docs
+                    .iter()
+                    .map(|d| d.get("uri").and_then(Value::as_str).map(|s| s.to_string()))
+                    .collect();
+
+                let parent_count = docs.len();
+                Ok(CandidateBatchOutput {
+                    ordered_documents: docs,
+                    parent_uris,
+                    child_uris: Vec::new(),
+                    parent_count,
+                    child_count: 0,
+                })
             }
-            .await;
+        },
+    )
+    .await;
 
-            (batch_idx, chunk, res)
-        }
-    }))
-    .buffer_unordered(args.concurrency);
-
-    let mut batches_completed = 0;
-    let mut batches_failed = 0;
-    let mut returned_ids = HashSet::with_capacity(ids.len());
-    let mut unique_uris = HashSet::with_capacity(ids.len());
-    let mut duplicate_ids_count = 0;
-    let mut unexpected_ids_count = 0;
-    let mut first_error: Option<String> = None;
-    let mut solr_write_elapsed_sec = 0.0;
-
-    let mut stream = stream;
-    let expected_prefix = format!("/repositories/{}/archival_objects/", repo_id);
-
-    while let Some((batch_idx, chunk, res)) = stream.next().await {
-        match res {
-            Ok(docs) => {
-                batches_completed += 1;
-                for (rec_idx, doc) in docs.iter().enumerate() {
-                    let uri = match doc.get("uri").and_then(|v| v.as_str()) {
-                        Some(u) => u.to_string(),
-                        None => {
-                            unexpected_ids_count += 1;
-                            if first_error.is_none() {
-                                first_error = Some(format!(
-                                    "Doc at index {} in batch {} missing string 'uri'",
-                                    rec_idx, batch_idx
-                                ));
-                            }
-                            continue;
-                        }
-                    };
-
-                    if !uri.starts_with(&expected_prefix) {
-                        unexpected_ids_count += 1;
-                        if first_error.is_none() {
-                            first_error = Some(format!(
-                                "Doc URI '{}' does not match expected prefix '{}'",
-                                uri, expected_prefix
-                            ));
-                        }
-                        continue;
-                    }
-
-                    let id_str = &uri[expected_prefix.len()..];
-                    let record_id: u32 = match id_str.parse() {
-                        Ok(id) => id,
-                        Err(_) => {
-                            unexpected_ids_count += 1;
-                            if first_error.is_none() {
-                                first_error = Some(format!(
-                                    "Doc URI '{}' contains non-numeric ID '{}'",
-                                    uri, id_str
-                                ));
-                            }
-                            continue;
-                        }
-                    };
-
-                    if !initial_ids_set.contains(&record_id) {
-                        unexpected_ids_count += 1;
-                        if first_error.is_none() {
-                            first_error = Some(format!(
-                                "Returned ID {} was not present in repository AO ID list",
-                                record_id
-                            ));
-                        }
-                    }
-
-                    if !returned_ids.insert(record_id) {
-                        duplicate_ids_count += 1;
-                        if first_error.is_none() {
-                            first_error = Some(format!(
-                                "Duplicate record returned for ID {} across batches",
-                                record_id
-                            ));
-                        }
-                    }
-
-                    unique_uris.insert(uri);
-                }
-
-                // Add documents to writer in bounded memory chunks
-                let t_write = Instant::now();
-                if let Err(w_err) = writer.add_documents(docs).await {
-                    batches_failed += 1;
-                    if first_error.is_none() {
-                        first_error = Some(format!(
-                            "Failed to write documents to candidate Solr core: {w_err}"
-                        ));
-                    }
-                    break;
-                }
-                solr_write_elapsed_sec += t_write.elapsed().as_secs_f64();
-
-                if let Some(fail_limit) = args.fail_after_batches {
-                    if batches_completed >= fail_limit {
-                        batches_failed += 1;
-                        if first_error.is_none() {
-                            first_error = Some(format!(
-                                "Injected deterministic test failure after {} completed batch(es) (fail_after_batches={})",
-                                batches_completed, fail_limit
-                            ));
-                        }
-                        break;
-                    }
-                }
-            }
-            Err(err) => {
-                batches_failed += 1;
-                if first_error.is_none() {
-                    first_error = Some(format!("Batch {} (chunk {:?}): {}", batch_idx, chunk, err));
-                }
-                break;
-            }
-        }
-    }
-
-    let batch_loop_wall_elapsed_sec = batch_start.elapsed().as_secs_f64();
-
-    // Commit only if all batches succeeded and zero unexpected/duplicate anomalies occurred
-    let mut solr_commit_elapsed_sec = 0.0;
-    let mut commit_failed = false;
-
-    if batches_failed == 0
-        && unexpected_ids_count == 0
-        && duplicate_ids_count == 0
-        && returned_ids.len() == ids.len()
-    {
-        let t_commit = Instant::now();
-        if let Err(c_err) = writer.commit().await {
-            commit_failed = true;
-            if first_error.is_none() {
-                first_error = Some(format!("Failed to commit candidate Solr core: {c_err}"));
-            }
-        }
-        solr_commit_elapsed_sec = t_commit.elapsed().as_secs_f64();
-    }
-
-    let total_wall_elapsed_sec = wall_start.elapsed().as_secs_f64();
-    let exact_ids_indexed = returned_ids.len();
-    let missing_ids = ids.len().saturating_sub(exact_ids_indexed);
-
-    let failures = batches_failed
-        + if commit_failed { 1 } else { 0 }
-        + if duplicate_ids_count > 0 { 1 } else { 0 }
-        + if unexpected_ids_count > 0 { 1 } else { 0 }
-        + if missing_ids > 0 && batches_failed == 0 {
-            1
-        } else {
-            0
-        };
-
-    let success = failures == 0
-        && exact_ids_indexed == ids.len()
-        && missing_ids == 0
-        && duplicate_ids_count == 0
-        && unexpected_ids_count == 0
-        && first_error.is_none();
-
-    let records_per_second = if total_wall_elapsed_sec > 0.0 && success {
-        exact_ids_indexed as f64 / total_wall_elapsed_sec
-    } else {
-        0.0
-    };
-
-    StaffAoCandidateSummary {
-        repository_id: repo_id,
-        total_ids_discovered: ids.len(),
-        batch_size: args.batch_size,
-        concurrency: args.concurrency,
-        total_batches,
-        batches_completed,
-        batches_failed,
-        failures,
-        exact_ids_indexed,
-        unique_uris: unique_uris.len(),
-        missing_ids,
-        duplicate_ids: duplicate_ids_count,
-        unexpected_ids: unexpected_ids_count,
-        candidate_core: args.candidate_core.clone(),
-        solr_url: args.solr_url.clone(),
-        arks_enabled: args.arks_enabled,
-        id_list_elapsed_sec,
-        batch_loop_wall_elapsed_sec,
-        solr_write_elapsed_sec,
-        solr_update_requests_sent: writer.update_requests_sent(),
-        solr_commit_elapsed_sec,
-        total_wall_elapsed_sec,
-        records_per_second,
-        success,
-        error_message: first_error,
-    }
+    res.into()
 }
 
 pub fn print_human_candidate_summary(summary: &StaffAoCandidateSummary) {
-    println!("=== STAFF Archival Object Candidate Indexer Summary ===");
-    println!("Repository ID: {}", summary.repository_id);
-    println!("Candidate Core: {}", summary.candidate_core);
-    println!("Total Discovered IDs: {}", summary.total_ids_discovered);
-    println!("Batch Size: {}", summary.batch_size);
-    println!("Concurrency: {}", summary.concurrency);
-    println!("Total Batches: {}", summary.total_batches);
-    println!("Batches Completed: {}", summary.batches_completed);
-    println!("Batches Failed: {}", summary.batches_failed);
-    println!("Total Failures: {}", summary.failures);
-    println!("Exact IDs Indexed: {}", summary.exact_ids_indexed);
-    println!("Unique URIs: {}", summary.unique_uris);
-    println!("Missing IDs: {}", summary.missing_ids);
-    println!("Duplicate IDs: {}", summary.duplicate_ids);
-    println!("Unexpected IDs: {}", summary.unexpected_ids);
-    println!("ARKs Enabled: {}", summary.arks_enabled);
-    println!("ID List Elapsed: {:.4}s", summary.id_list_elapsed_sec);
-    println!(
+    let mut stdout = io::stdout();
+    let _ = print_human_candidate_summary_to_writer(summary, &mut stdout);
+}
+
+pub fn print_human_candidate_summary_to_writer<W: Write>(
+    summary: &StaffAoCandidateSummary,
+    writer: &mut W,
+) -> io::Result<()> {
+    writeln!(
+        writer,
+        "=== STAFF Archival Object Candidate Indexer Summary ==="
+    )?;
+    writeln!(writer, "Repository ID: {}", summary.repository_id)?;
+    writeln!(writer, "Candidate Core: {}", summary.candidate_core)?;
+    writeln!(
+        writer,
+        "Total Discovered IDs: {}",
+        summary.total_ids_discovered
+    )?;
+    writeln!(writer, "Batch Size: {}", summary.batch_size)?;
+    writeln!(writer, "Concurrency: {}", summary.concurrency)?;
+    writeln!(writer, "Total Batches: {}", summary.total_batches)?;
+    writeln!(writer, "Batches Completed: {}", summary.batches_completed)?;
+    writeln!(writer, "Batches Failed: {}", summary.batches_failed)?;
+    writeln!(writer, "Total Failures: {}", summary.failures)?;
+    writeln!(writer, "Exact IDs Indexed: {}", summary.exact_ids_indexed)?;
+    writeln!(writer, "Unique URIs: {}", summary.unique_uris)?;
+    writeln!(writer, "Missing IDs: {}", summary.missing_ids)?;
+    writeln!(writer, "Duplicate IDs: {}", summary.duplicate_ids)?;
+    writeln!(writer, "Unexpected IDs: {}", summary.unexpected_ids)?;
+    writeln!(writer, "ARKs Enabled: {}", summary.arks_enabled)?;
+    writeln!(
+        writer,
+        "ID List Elapsed: {:.4}s",
+        summary.id_list_elapsed_sec
+    )?;
+    writeln!(
+        writer,
         "Combined Batch Loop Wall Elapsed: {:.4}s (pipelined fetch, build & writes)",
         summary.batch_loop_wall_elapsed_sec
-    );
-    println!(
+    )?;
+    writeln!(
+        writer,
         "  Solr Writes Elapsed: {:.4}s (awaiting Solr update POSTs; overlaps batch loop)",
         summary.solr_write_elapsed_sec
-    );
-    println!(
+    )?;
+    writeln!(
+        writer,
         "  Solr Update POST Requests: {}",
         summary.solr_update_requests_sent
-    );
-    println!(
+    )?;
+    writeln!(
+        writer,
         "Solr Hard Commit Elapsed: {:.4}s",
         summary.solr_commit_elapsed_sec
-    );
-    println!(
+    )?;
+    writeln!(
+        writer,
         "Total Wall Elapsed: {:.4}s (id_list + batch_loop_wall + solr_commit)",
         summary.total_wall_elapsed_sec
-    );
-    println!("Records / Sec: {:.2}", summary.records_per_second);
+    )?;
+    writeln!(writer, "Records / Sec: {:.2}", summary.records_per_second)?;
     if let Some(ref err) = summary.error_message {
-        println!("Error: {}", err);
+        writeln!(writer, "Error: {}", err)?;
     }
-    println!(
+    writeln!(
+        writer,
         "Status: {}",
         if summary.success { "SUCCESS" } else { "FAILED" }
-    );
+    )?;
+    Ok(())
 }
 
 pub async fn run_staff_ao_candidate(
@@ -833,84 +305,15 @@ where
 {
     let summary = execute_staff_ao_candidate_with_verifier(client, &args, verifier).await;
 
-    if args.json {
-        let json_out = serde_json::to_string_pretty(&summary)?;
-        writeln!(writer, "{}", json_out)?;
-    } else {
-        // Output human readable summary to the writer
-        let mut buffer = Vec::new();
-        {
-            let mut cursor = io::Cursor::new(&mut buffer);
-            writeln!(
-                cursor,
-                "=== STAFF Archival Object Candidate Indexer Summary ==="
-            )?;
-            writeln!(cursor, "Repository ID: {}", summary.repository_id)?;
-            writeln!(cursor, "Candidate Core: {}", summary.candidate_core)?;
-            writeln!(
-                cursor,
-                "Total Discovered IDs: {}",
-                summary.total_ids_discovered
-            )?;
-            writeln!(cursor, "Batch Size: {}", summary.batch_size)?;
-            writeln!(cursor, "Concurrency: {}", summary.concurrency)?;
-            writeln!(cursor, "Total Batches: {}", summary.total_batches)?;
-            writeln!(cursor, "Batches Completed: {}", summary.batches_completed)?;
-            writeln!(cursor, "Batches Failed: {}", summary.batches_failed)?;
-            writeln!(cursor, "Total Failures: {}", summary.failures)?;
-            writeln!(cursor, "Exact IDs Indexed: {}", summary.exact_ids_indexed)?;
-            writeln!(cursor, "Unique URIs: {}", summary.unique_uris)?;
-            writeln!(cursor, "Missing IDs: {}", summary.missing_ids)?;
-            writeln!(cursor, "Duplicate IDs: {}", summary.duplicate_ids)?;
-            writeln!(cursor, "Unexpected IDs: {}", summary.unexpected_ids)?;
-            writeln!(cursor, "ARKs Enabled: {}", summary.arks_enabled)?;
-            writeln!(
-                cursor,
-                "ID List Elapsed: {:.4}s",
-                summary.id_list_elapsed_sec
-            )?;
-            writeln!(
-                cursor,
-                "Combined Batch Loop Wall Elapsed: {:.4}s (pipelined fetch, build & writes)",
-                summary.batch_loop_wall_elapsed_sec
-            )?;
-            writeln!(
-                cursor,
-                "  Solr Writes Elapsed: {:.4}s (awaiting Solr update POSTs; overlaps batch loop)",
-                summary.solr_write_elapsed_sec
-            )?;
-            writeln!(
-                cursor,
-                "Solr Hard Commit Elapsed: {:.4}s",
-                summary.solr_commit_elapsed_sec
-            )?;
-            writeln!(
-                cursor,
-                "Total Wall Elapsed: {:.4}s (id_list + batch_loop_wall + solr_commit)",
-                summary.total_wall_elapsed_sec
-            )?;
-            writeln!(cursor, "Records / Sec: {:.2}", summary.records_per_second)?;
-            if let Some(ref err) = summary.error_message {
-                writeln!(cursor, "Error: {}", err)?;
-            }
-            writeln!(
-                cursor,
-                "Status: {}",
-                if summary.success { "SUCCESS" } else { "FAILED" }
-            )?;
-        }
-        writer.write_all(&buffer)?;
-    }
-
-    if !summary.success {
-        bail!(
-            "STAFF archival object candidate indexing failed: {}",
-            summary
-                .error_message
-                .as_deref()
-                .unwrap_or("validation, missing ID, or batch failure")
-        );
-    }
+    render_candidate_summary_to_writer(
+        writer,
+        &summary,
+        args.json,
+        summary.success,
+        summary.error_message.as_deref(),
+        "archival object",
+        |w| print_human_candidate_summary_to_writer(&summary, w),
+    )?;
 
     Ok(summary)
 }
@@ -919,6 +322,7 @@ where
 mod tests {
     use super::*;
     use mockito::Server;
+    use serde_json::json;
 
     #[test]
     fn test_cli_argument_bounds() {
@@ -1030,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partition_ids_into_batches() {
+    fn test_partition_ids_into_batches_compat() {
         assert_eq!(partition_ids_into_batches(&[], 25), Vec::<Vec<u32>>::new());
         assert_eq!(
             partition_ids_into_batches(&[1, 2, 3], 0),
@@ -1076,7 +480,6 @@ mod tests {
 
         let candidate_core = "stage_staff_20261026_1234_candidate";
 
-        // Mock Solr STATUS
         let _m_status = solr_server
             .mock(
                 "GET",
@@ -1085,7 +488,7 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                serde_json::json!({
+                json!({
                     "responseHeader": {"status": 0},
                     "status": {
                         candidate_core: {
@@ -1099,7 +502,6 @@ mod tests {
             .create_async()
             .await;
 
-        // Mock Solr select empty check
         let _m_empty = solr_server
             .mock(
                 "GET",
@@ -1108,7 +510,7 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                serde_json::json!({
+                json!({
                     "responseHeader": {"status": 0},
                     "response": {
                         "numFound": 0,
@@ -1121,13 +523,12 @@ mod tests {
             .create_async()
             .await;
 
-        // Mock ASpace schemas for dynamic enums
         let _m_schemas = aspace_server
             .mock("GET", "/schemas")
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                serde_json::json!({
+                json!({
                     "archival_object": {
                         "properties": {
                             "level": {
@@ -1142,7 +543,6 @@ mod tests {
             .create_async()
             .await;
 
-        // Mock ASpace AO IDs modified since 0
         let _m_ids = aspace_server
             .mock(
                 "GET",
@@ -1154,7 +554,6 @@ mod tests {
             .create_async()
             .await;
 
-        // Mock batch fetch
         let _m_batch = aspace_server
             .mock(
                 "GET",
@@ -1163,7 +562,7 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                serde_json::json!([
+                json!([
                     {
                         "uri": "/repositories/4/archival_objects/101",
                         "title": "Item 101",
@@ -1184,7 +583,6 @@ mod tests {
             .create_async()
             .await;
 
-        // Mock Solr updates and commit
         let _m_update = solr_server
             .mock("POST", format!("/{candidate_core}/update").as_str())
             .with_status(200)
@@ -1249,7 +647,7 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                serde_json::json!({
+                json!({
                     "responseHeader": {"status": 0},
                     "status": {
                         candidate_core: {
@@ -1271,7 +669,7 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                serde_json::json!({
+                json!({
                     "responseHeader": {"status": 0},
                     "response": {
                         "numFound": 0,
@@ -1289,7 +687,7 @@ mod tests {
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
-                serde_json::json!({
+                json!({
                     "archival_object": {
                         "properties": {
                             "level": {
@@ -1327,7 +725,7 @@ mod tests {
                 &chunk
                     .iter()
                     .map(|id| {
-                        serde_json::json!({
+                        json!({
                             "uri": format!("/repositories/4/archival_objects/{id}"),
                             "title": format!("Item {id}"),
                             "level": "item",
@@ -1415,7 +813,6 @@ mod tests {
             fail_after_batches: None,
         };
 
-        // Verifier fails
         let summary =
             execute_staff_ao_candidate_with_verifier(&client, &args, |_state, _backend, _solr| {
                 bail!("Challenge-response verification failed: backend not on profiling stack");
@@ -1469,7 +866,6 @@ mod tests {
                 assert_eq!(backend, exp_back_clone.as_str());
                 assert_eq!(solr, exp_solr_clone.as_str());
                 verified_clone.store(true, Ordering::SeqCst);
-                // Return an error to stop execution before any network call
                 bail!("Stop after verifier argument check");
             },
         )
@@ -1479,5 +875,116 @@ mod tests {
             verified.load(Ordering::SeqCst),
             "Verifier must have been invoked with exact arguments"
         );
+    }
+
+    #[tokio::test]
+    async fn test_ao_batch_fetch_failure_without_commit() {
+        let mut aspace_server = Server::new_async().await;
+        let mut solr_server = Server::new_async().await;
+
+        let candidate_core = "stage_staff_20261026_ao_fail_candidate";
+
+        let _m_status = solr_server
+            .mock(
+                "GET",
+                format!("/admin/cores?action=STATUS&core={candidate_core}&wt=json").as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "responseHeader": {"status": 0},
+                    "status": {
+                        candidate_core: {
+                            "name": candidate_core,
+                            "instanceDir": "/var/solr/data/stage_staff_20261026_ao_fail_candidate"
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let _m_empty = solr_server
+            .mock(
+                "GET",
+                format!("/{candidate_core}/select?q=*:*&rows=0&wt=json").as_str(),
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "responseHeader": {"status": 0},
+                    "response": {
+                        "numFound": 0,
+                        "start": 0,
+                        "docs": []
+                    }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let _m_schemas = aspace_server
+            .mock("GET", "/schemas")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{}"#)
+            .create_async()
+            .await;
+
+        let _m_ids = aspace_server
+            .mock(
+                "GET",
+                "/repositories/4/archival_objects?all_ids=true&modified_since=0",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body("[101, 102]")
+            .create_async()
+            .await;
+
+        let _m_batch = aspace_server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/repositories/4/archival_objects\?id_set=".to_string()),
+            )
+            .with_status(500)
+            .with_body("Backend exploded on AO batch fetch")
+            .create_async()
+            .await;
+
+        let mut client = Client::new(aspace_server.url());
+        client.session_token = Some("dummy-session".to_string());
+
+        let args = StaffAoCandidateArgs {
+            repo: 4,
+            batch_size: 25,
+            concurrency: 4,
+            solr_url: solr_server.url(),
+            candidate_core: candidate_core.to_string(),
+            arks_enabled: false,
+            strip_markers: true,
+            state: Some(std::path::PathBuf::from("/path/to/state.json")),
+            json: false,
+            fail_after_batches: None,
+        };
+
+        let summary =
+            execute_staff_ao_candidate_with_verifier(&client, &args, |_state, _backend, _solr| {
+                Ok(())
+            })
+            .await;
+
+        assert!(!summary.success);
+        assert_eq!(summary.batches_failed, 1);
+        assert!(summary.failures >= 1);
+        assert_eq!(summary.solr_commit_elapsed_sec, 0.0);
+        assert!(summary
+            .error_message
+            .unwrap()
+            .contains("Failed to fetch AO batch 0"));
     }
 }

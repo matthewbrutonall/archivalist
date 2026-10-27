@@ -9,6 +9,7 @@ use crate::schema_enums::extract_dynamic_enum_fields_from_schemas;
 
 pub const DEFAULT_STAFF_BATCH_SIZE: usize = 25;
 pub const DEFAULT_STAFF_ARCHIVAL_OBJECT_BATCH_SIZE: usize = DEFAULT_STAFF_BATCH_SIZE;
+pub const DEFAULT_STAFF_RESOURCE_BATCH_SIZE: usize = DEFAULT_STAFF_BATCH_SIZE;
 
 pub const STAFF_INDEXER_RESOLVED_ATTRIBUTES: &[&str] = &[
     "container_locations",
@@ -109,8 +110,22 @@ impl Client {
     }
 
     pub async fn resource_ids(&self, repo_id: u32) -> Result<Vec<u32>> {
-        let path = format!("repositories/{}/resources?all_ids=true", repo_id);
-        let res = self.get(&path)?.send().await?;
+        self.resource_ids_modified_since(repo_id, None).await
+    }
+
+    pub async fn resource_ids_modified_since(
+        &self,
+        repo_id: u32,
+        modified_since: Option<u64>,
+    ) -> Result<Vec<u32>> {
+        let path = format!("repositories/{}/resources", repo_id);
+        let modified_since_str = modified_since.map(|ts| ts.to_string());
+        let mut query: Vec<(&str, &str)> = vec![("all_ids", "true")];
+        if let Some(ref ts_str) = modified_since_str {
+            query.push(("modified_since", ts_str.as_str()));
+        }
+
+        let res = self.get(&path)?.query(&query).send().await?;
         if !res.status().is_success() {
             return Err(ASpaceError::Api {
                 status: res.status().as_u16(),
@@ -288,6 +303,49 @@ impl Client {
         ids: &[u32],
         max_batch_size: usize,
     ) -> Result<Vec<serde_json::Value>> {
+        self.fetch_staff_records_by_ids_bounded_impl(
+            repo_id,
+            ids,
+            max_batch_size,
+            "archival_objects",
+        )
+        .await
+    }
+
+    pub async fn fetch_staff_resources_by_ids(
+        &self,
+        repo_id: u32,
+        ids: &[u32],
+    ) -> Result<Vec<serde_json::Value>> {
+        self.fetch_staff_resources_by_ids_bounded(repo_id, ids, DEFAULT_STAFF_RESOURCE_BATCH_SIZE)
+            .await
+    }
+
+    pub async fn staff_resources_by_ids(
+        &self,
+        repo_id: u32,
+        ids: &[u32],
+    ) -> Result<Vec<serde_json::Value>> {
+        self.fetch_staff_resources_by_ids(repo_id, ids).await
+    }
+
+    pub async fn fetch_staff_resources_by_ids_bounded(
+        &self,
+        repo_id: u32,
+        ids: &[u32],
+        max_batch_size: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        self.fetch_staff_records_by_ids_bounded_impl(repo_id, ids, max_batch_size, "resources")
+            .await
+    }
+
+    async fn fetch_staff_records_by_ids_bounded_impl(
+        &self,
+        repo_id: u32,
+        ids: &[u32],
+        max_batch_size: usize,
+        record_type_plural: &str,
+    ) -> Result<Vec<serde_json::Value>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -314,7 +372,7 @@ impl Client {
             .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        let path = format!("repositories/{}/archival_objects", repo_id);
+        let path = format!("repositories/{}/{}", repo_id, record_type_plural);
 
         let mut query_params: Vec<(&str, &str)> =
             Vec::with_capacity(1 + STAFF_INDEXER_RESOLVED_ATTRIBUTES.len());
@@ -343,7 +401,7 @@ impl Client {
             }
         };
 
-        let expected_prefix = format!("/repositories/{}/archival_objects/", repo_id);
+        let expected_prefix = format!("/repositories/{}/{}/", repo_id, record_type_plural);
         let mut seen_returned_ids = HashSet::with_capacity(ids.len());
 
         for (idx, record) in records.iter().enumerate() {
@@ -1754,5 +1812,214 @@ mod tests {
         // NOT sorted alphabetically ("a_field", "m_field", "z_field")
         // Repeated "z_field" deduplicated
         assert_eq!(fields, vec!["z_field", "a_field", "m_field"]);
+    }
+
+    #[tokio::test]
+    async fn test_resource_ids_modified_since_none_and_zero() {
+        let mut server = Server::new_async().await;
+
+        let _login = server
+            .mock("POST", "/users/admin/login")
+            .with_status(200)
+            .with_body(r#"{"session": "token"}"#)
+            .create_async()
+            .await;
+
+        let mock_none = server
+            .mock("GET", "/repositories/2/resources")
+            .match_query(mockito::Matcher::Exact("all_ids=true".to_string()))
+            .with_status(200)
+            .with_body("[1, 2]")
+            .create_async()
+            .await;
+
+        let mock_zero = server
+            .mock("GET", "/repositories/2/resources")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("all_ids".to_string(), "true".to_string()),
+                mockito::Matcher::UrlEncoded("modified_since".to_string(), "0".to_string()),
+            ]))
+            .with_status(200)
+            .with_body("[1, 2, 3]")
+            .create_async()
+            .await;
+
+        let mut client = Client::new(server.url());
+        client.login("admin", "pass").await.unwrap();
+
+        let ids_none = client.resource_ids_modified_since(2, None).await.unwrap();
+        assert_eq!(ids_none, vec![1, 2]);
+        mock_none.assert_async().await;
+
+        let ids_zero = client
+            .resource_ids_modified_since(2, Some(0))
+            .await
+            .unwrap();
+        assert_eq!(ids_zero, vec![1, 2, 3]);
+        mock_zero.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_resource_ids_modified_since_http_error_and_unauthed() {
+        let mut server = Server::new_async().await;
+
+        let _login = server
+            .mock("POST", "/users/admin/login")
+            .with_status(200)
+            .with_body(r#"{"session": "token"}"#)
+            .create_async()
+            .await;
+
+        let _err_mock = server
+            .mock("GET", "/repositories/2/resources")
+            .match_query(mockito::Matcher::Any)
+            .with_status(500)
+            .with_body("Server Error")
+            .create_async()
+            .await;
+
+        let mut client = Client::new(server.url());
+        client.login("admin", "pass").await.unwrap();
+
+        let err = client
+            .resource_ids_modified_since(2, Some(0))
+            .await
+            .unwrap_err();
+        match err {
+            ASpaceError::Api { status, message } => {
+                assert_eq!(status, 500);
+                assert_eq!(message, "Server Error");
+            }
+            _ => panic!("Expected Api error, got: {:?}", err),
+        }
+
+        let unauthed_client = Client::new("http://dummy");
+        let err_unauthed = unauthed_client
+            .resource_ids_modified_since(2, Some(0))
+            .await
+            .unwrap_err();
+        match err_unauthed {
+            ASpaceError::NotAuthenticated => (),
+            _ => panic!("Expected NotAuthenticated error, got: {:?}", err_unauthed),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_staff_resources_mocked_success_and_order() {
+        let mut server = Server::new_async().await;
+
+        let _login = server
+            .mock("POST", "/users/admin/login")
+            .with_status(200)
+            .with_body(r#"{"session": "token"}"#)
+            .create_async()
+            .await;
+
+        let expected_query = format!(
+            "id_set=10%2C20&{}",
+            STAFF_INDEXER_RESOLVED_ATTRIBUTES
+                .iter()
+                .map(|attr| format!("resolve%5B%5D={}", attr.replace("::", "%3A%3A")))
+                .collect::<Vec<_>>()
+                .join("&")
+        );
+
+        let body = r#"[
+            {"uri": "/repositories/2/resources/10", "title": "Resource 10"},
+            {"uri": "/repositories/2/resources/20", "title": "Resource 20"}
+        ]"#;
+
+        let res_mock = server
+            .mock("GET", "/repositories/2/resources")
+            .match_header("X-ArchivesSpace-Session", "token")
+            .match_query(mockito::Matcher::Exact(expected_query))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .expect(2)
+            .create_async()
+            .await;
+
+        let mut client = Client::new(server.url());
+        client.login("admin", "pass").await.unwrap();
+
+        let records = client
+            .fetch_staff_resources_by_ids(2, &[10, 20])
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["uri"], "/repositories/2/resources/10");
+        assert_eq!(records[1]["uri"], "/repositories/2/resources/20");
+
+        // Alias method
+        let records_alias = client.staff_resources_by_ids(2, &[10, 20]).await.unwrap();
+        assert_eq!(records_alias.len(), 2);
+        res_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_staff_resources_validation_errors() {
+        let mut server = Server::new_async().await;
+
+        let _login = server
+            .mock("POST", "/users/admin/login")
+            .with_status(200)
+            .with_body(r#"{"session": "token"}"#)
+            .create_async()
+            .await;
+
+        // Empty returns empty without network
+        let client_offline = Client::new("http://127.0.0.1:9");
+        let empty_res = client_offline
+            .fetch_staff_resources_by_ids(2, &[])
+            .await
+            .unwrap();
+        assert!(empty_res.is_empty());
+
+        let mut client = Client::new(server.url());
+        client.login("admin", "pass").await.unwrap();
+
+        // Duplicate input ID
+        let err_dup = client
+            .fetch_staff_resources_by_ids(2, &[1, 1])
+            .await
+            .unwrap_err();
+        match err_dup {
+            ASpaceError::InvalidRequest(msg) => assert!(msg.contains("Duplicate id 1")),
+            _ => panic!("Expected InvalidRequest, got: {:?}", err_dup),
+        }
+
+        // Batch size exceeded
+        let err_batch = client
+            .fetch_staff_resources_by_ids_bounded(2, &[1, 2, 3], 2)
+            .await
+            .unwrap_err();
+        match err_batch {
+            ASpaceError::BatchSizeExceeded { requested, max } => {
+                assert_eq!(requested, 3);
+                assert_eq!(max, 2);
+            }
+            _ => panic!("Expected BatchSizeExceeded, got: {:?}", err_batch),
+        }
+
+        // Unexpected URI prefix
+        let _mock_bad_uri = server
+            .mock("GET", "/repositories/2/resources")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"[{"uri": "/repositories/2/archival_objects/1"}]"#)
+            .create_async()
+            .await;
+
+        let err_uri = client
+            .fetch_staff_resources_by_ids(2, &[1])
+            .await
+            .unwrap_err();
+        match err_uri {
+            ASpaceError::HydrationValidation(msg) => {
+                assert!(msg.contains("unexpected URI"));
+            }
+            _ => panic!("Expected HydrationValidation, got: {:?}", err_uri),
+        }
     }
 }

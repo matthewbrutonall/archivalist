@@ -401,6 +401,9 @@ pub struct IsolatedSolrStaffAoWriter {
     committed: bool,
 }
 
+/// Generalized type alias for isolated candidate stage writes across staff record types.
+pub type IsolatedSolrStaffWriter = IsolatedSolrStaffAoWriter;
+
 impl IsolatedSolrStaffAoWriter {
     /// Constructs a new writer for the specified Solr base URL and candidate stage core name.
     ///
