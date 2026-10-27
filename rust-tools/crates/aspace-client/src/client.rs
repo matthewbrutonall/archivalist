@@ -111,6 +111,41 @@ impl Client {
         Ok(res.json().await?)
     }
 
+    pub async fn staff_repositories_raw(&self) -> Result<Vec<serde_json::Value>> {
+        let mut query = Vec::with_capacity(STAFF_INDEXER_RESOLVED_ATTRIBUTES.len());
+        for attr in STAFF_INDEXER_RESOLVED_ATTRIBUTES {
+            query.push(("resolve[]", *attr));
+        }
+        let res = self.get("repositories")?.query(&query).send().await?;
+        if !res.status().is_success() {
+            return Err(ASpaceError::Api {
+                status: res.status().as_u16(),
+                message: res.text().await.unwrap_or_default(),
+            });
+        }
+        Ok(res.json().await?)
+    }
+
+    pub async fn staff_record_ids_by_path(
+        &self,
+        path: &str,
+        modified_since: u64,
+    ) -> Result<Vec<u32>> {
+        let timestamp = modified_since.to_string();
+        let res = self
+            .get(path)?
+            .query(&[("all_ids", "true"), ("modified_since", timestamp.as_str())])
+            .send()
+            .await?;
+        if !res.status().is_success() {
+            return Err(ASpaceError::Api {
+                status: res.status().as_u16(),
+                message: res.text().await.unwrap_or_default(),
+            });
+        }
+        Ok(res.json().await?)
+    }
+
     pub async fn resource_ids(&self, repo_id: u32) -> Result<Vec<u32>> {
         self.resource_ids_modified_since(repo_id, None).await
     }
@@ -455,6 +490,17 @@ impl Client {
         max_batch_size: usize,
         record_type_plural: &str,
     ) -> Result<Vec<serde_json::Value>> {
+        let path = format!("repositories/{}/{}", repo_id, record_type_plural);
+        self.fetch_staff_records_by_ids_bounded_path(&path, ids, max_batch_size)
+            .await
+    }
+
+    pub async fn fetch_staff_records_by_ids_bounded_path(
+        &self,
+        path: &str,
+        ids: &[u32],
+        max_batch_size: usize,
+    ) -> Result<Vec<serde_json::Value>> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -481,8 +527,6 @@ impl Client {
             .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(",");
-        let path = format!("repositories/{}/{}", repo_id, record_type_plural);
-
         let mut query_params: Vec<(&str, &str)> =
             Vec::with_capacity(1 + STAFF_INDEXER_RESOLVED_ATTRIBUTES.len());
         query_params.push(("id_set", &id_str));
@@ -490,7 +534,7 @@ impl Client {
             query_params.push(("resolve[]", attr));
         }
 
-        let res = self.get(&path)?.query(&query_params).send().await?;
+        let res = self.get(path)?.query(&query_params).send().await?;
         let status = res.status();
         if !status.is_success() {
             return Err(ASpaceError::Api {
@@ -510,7 +554,7 @@ impl Client {
             }
         };
 
-        let expected_prefix = format!("/repositories/{}/{}/", repo_id, record_type_plural);
+        let expected_prefix = format!("/{}/", path.trim_matches('/'));
         let mut seen_returned_ids = HashSet::with_capacity(ids.len());
 
         for (idx, record) in records.iter().enumerate() {
@@ -2564,5 +2608,74 @@ mod tests {
             }
             _ => panic!("Expected HydrationValidation, got: {:?}", err_uri),
         }
+    }
+
+    #[tokio::test]
+    async fn test_full_staff_global_authority_paths() {
+        let mut server = Server::new_async().await;
+        let _login = server
+            .mock("POST", "/users/admin/login")
+            .with_status(200)
+            .with_body(r#"{"session":"token"}"#)
+            .create_async()
+            .await;
+        let ids_mock = server
+            .mock("GET", "/agents/people")
+            .match_header("X-ArchivesSpace-Session", "token")
+            .match_query(mockito::Matcher::Exact(
+                "all_ids=true&modified_since=0".to_string(),
+            ))
+            .with_status(200)
+            .with_body("[7]")
+            .create_async()
+            .await;
+        let records_mock = server
+            .mock("GET", "/agents/people")
+            .match_header("X-ArchivesSpace-Session", "token")
+            .match_query(mockito::Matcher::Regex("id_set=7&resolve".to_string()))
+            .with_status(200)
+            .with_body(r#"[{"uri":"/agents/people/7","jsonmodel_type":"agent_person"}]"#)
+            .create_async()
+            .await;
+        let mut client = Client::new(server.url());
+        client.login("admin", "pass").await.unwrap();
+        assert_eq!(
+            client
+                .staff_record_ids_by_path("agents/people", 0)
+                .await
+                .unwrap(),
+            vec![7]
+        );
+        let records = client
+            .fetch_staff_records_by_ids_bounded_path("agents/people", &[7], 25)
+            .await
+            .unwrap();
+        assert_eq!(records[0]["uri"], "/agents/people/7");
+        ids_mock.assert_async().await;
+        records_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_full_staff_repository_listing() {
+        let mut server = Server::new_async().await;
+        let _login = server
+            .mock("POST", "/users/admin/login")
+            .with_status(200)
+            .with_body(r#"{"session":"token"}"#)
+            .create_async()
+            .await;
+        let repos_mock = server
+            .mock("GET", "/repositories")
+            .match_header("X-ArchivesSpace-Session", "token")
+            .match_query(mockito::Matcher::Regex("resolve".to_string()))
+            .with_status(200)
+            .with_body(r#"[{"uri":"/repositories/2","jsonmodel_type":"repository"}]"#)
+            .create_async()
+            .await;
+        let mut client = Client::new(server.url());
+        client.login("admin", "pass").await.unwrap();
+        let repos = client.staff_repositories_raw().await.unwrap();
+        assert_eq!(repos[0]["uri"], "/repositories/2");
+        repos_mock.assert_async().await;
     }
 }

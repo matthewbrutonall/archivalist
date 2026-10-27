@@ -653,12 +653,31 @@ def parse_args():
         action="store_true",
         help="Run safety and static checks without starting containers or writing Solr",
     )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Run the full STAFF candidate and compare the entire native core",
+    )
+    parser.add_argument(
+        "--fresh-native",
+        action="store_true",
+        help="After a full candidate pass, run a same-state native STAFF round in a fresh isolated core",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=4,
+        choices=range(1, 33),
+        help="Concurrent Rust fetch/build batches in full mode (default: 4)",
+    )
     return parser.parse_args()
 
 
 def run_harness() -> int:
     args = parse_args()
-    print("=== Gate 3 STAFF Combined Slice Live Parity Harness ===", flush=True)
+    if args.fresh_native and not args.full:
+        raise ValueError("--fresh-native requires --full")
+    print("=== Gate 3 STAFF Live Parity Harness ===", flush=True)
 
     # 1. Check git branch and HEAD
     git_branch_proc = subprocess.run(
@@ -879,7 +898,7 @@ def run_harness() -> int:
 
     # 13. Pre-fetch native reference documents for Repo 4 combined slice
     repo_scope = f"/repositories/{args.repo}"
-    native_fq = f'repository:"{repo_scope}" AND (primary_type:archival_object OR primary_type:resource OR primary_type:digital_object OR primary_type:top_container OR (primary_type:collection_management AND (parent_type:resource OR parent_type:digital_object)))'
+    native_fq = None if args.full else f'repository:"{repo_scope}" AND (primary_type:archival_object OR primary_type:resource OR primary_type:digital_object OR primary_type:top_container OR (primary_type:collection_management AND (parent_type:resource OR parent_type:digital_object)))'
     print(
         f"\nStreaming native reference combined slice docs from '{native_core}' (fq: {native_fq})...",
         flush=True,
@@ -967,16 +986,25 @@ def run_harness() -> int:
         )
 
     # 15. Execute aspace-cli staff-combined-candidate
-    cli_cmd = build_candidate_cli_command(
-        cli_bin=cli_bin,
-        backend_host_url=backend_host_url,
-        admin_user=state["admin_user"],
-        state_path=args.state,
-        repo_id=args.repo,
-        solr_host_url=solr_host_url,
-        cand_core=cand_core,
-        active_arks=bool(active_arks),
-    )
+    if args.full:
+        cli_cmd = [
+            cli_bin, "--url", backend_host_url, "--user", state["admin_user"],
+            "staff-full-candidate", "--state", args.state, "--batch-size", "25",
+            "--concurrency", str(args.concurrency), "--solr-url", solr_host_url,
+            "--candidate-core", cand_core, "--arks-enabled", str(bool(active_arks)).lower(),
+            "--strip-markers", "true", "--json",
+        ]
+    else:
+        cli_cmd = build_candidate_cli_command(
+            cli_bin=cli_bin,
+            backend_host_url=backend_host_url,
+            admin_user=state["admin_user"],
+            state_path=args.state,
+            repo_id=args.repo,
+            solr_host_url=solr_host_url,
+            cand_core=cand_core,
+            active_arks=bool(active_arks),
+        )
     cli_env = build_candidate_cli_env(admin_password=state.get("admin_password"))
 
     # Never print entire env or secret
@@ -1018,9 +1046,60 @@ def run_harness() -> int:
     print(f"  committed: {cand_summary.get('committed')}")
     print(f"  success: {cand_summary.get('success')}")
 
-    if not cand_summary.get("success", False):
+    if not cand_summary.get("success", cand_summary.get("committed", False)):
         err_msg = redact_secrets(cand_summary.get("error_message"))
         raise RuntimeError(f"Candidate CLI reported success=false: {err_msg}")
+
+    fresh_native_report = None
+    if args.fresh_native:
+        identity_url = f"{backend_host_url}/repositories/{state['identity_repo_id']}"
+        with urllib.request.urlopen(identity_url, timeout=10) as response:
+            identity = json.load(response)
+        prefix = "archivalist profiling identity "
+        identity_name = identity.get("name", "")
+        if identity.get("repo_code") != state["identity_repo_code"] or not identity_name.startswith(prefix):
+            raise RuntimeError("profiling backend identity changed unexpectedly after candidate pass")
+        nonce = identity_name[len(prefix):]
+        if not re.fullmatch(r"[0-9a-f]{32}", nonce):
+            raise RuntimeError("profiling backend identity nonce is malformed")
+        java_opts = subprocess.run(
+            ["docker", "exec", state["app_container"], "printenv", "JAVA_OPTS"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        native_cmd = [
+            "docker", "exec",
+            "-e", f"BACKEND_URL={state['backend_network_url']}",
+            "-e", f"SOLR_BASE_URL={state['solr_network_url']}",
+            "-e", f"ARCHIVALIST_PROFILING_STACK_ID={state['stack_id']}",
+            "-e", f"ARCHIVALIST_PROFILING_STACK_NONCE={nonce}",
+            "-e", f"ARCHIVALIST_PROFILING_STACK_IDENTITY_REPO_ID={state['identity_repo_id']}",
+            "-e", f"ARCHIVALIST_PROFILING_STACK_IDENTITY_CORE={state['identity_core']}",
+            "-e", "MODES=staff", "-e", "REPEATS=1", "-e", "TIMERS=0",
+            "-e", f"JAVA_OPTS={java_opts} -Xss16m",
+            "-w", "/archivesspace", state["app_container"],
+            "/archivesspace/scripts/jruby",
+            "/archivesspace/rust-tools/scripts/native_indexing_profile.rb",
+        ]
+        print("Running same-state native STAFF round in a fresh isolated core...", flush=True)
+        native_proc = subprocess.run(native_cmd, capture_output=True, text=True)
+        if native_proc.returncode != 0:
+            raise RuntimeError(f"native STAFF round failed: {redact_secrets(native_proc.stderr[-4000:])}")
+        report_match = re.search(r"^Report: (.+)$", native_proc.stdout, re.MULTILINE)
+        if not report_match:
+            raise RuntimeError("native STAFF round did not report its evidence path")
+        report_path = report_match.group(1).replace("/archivesspace/", REPO_ROOT + "/", 1)
+        with open(report_path) as report_file:
+            fresh_native_report = json.load(report_file)
+        results = fresh_native_report.get("results", [])
+        if len(results) != 1 or results[0].get("mode") != "staff" or results[0].get("solr_doc_count") != EXPECTED_TOTAL_NATIVE_DOCS:
+            raise RuntimeError("native STAFF report has unexpected mode or document count")
+        native_core = results[0]["core"]
+        print(f"Same-state native core: {native_core}; wall {results[0]['wall_ms']} ms", flush=True)
+        native_slice_docs_by_id, native_marker_leaks = stream_fetch_solr_core_documents(
+            solr_host_url, native_core, fq=None, batch_size=1000,
+        )
+        if len(native_slice_docs_by_id) != EXPECTED_TOTAL_NATIVE_DOCS or native_marker_leaks:
+            raise RuntimeError("fresh native core has incorrect count or marker leaks")
 
     # 16. Verify candidate core document count directly from Solr
     cand_select_url = f"{solr_host_url}/{cand_core}/select?q=*:*&rows=0&wt=json"
@@ -1088,13 +1167,14 @@ def run_harness() -> int:
         "stack_id": EXPECTED_STACK_ID,
         "repo_id": args.repo,
         "native_core": native_core,
+        "fresh_native_report_path": report_path if fresh_native_report else None,
         "candidate_core": cand_core,
         "active_arks_enabled": active_arks,
         "cli_summary": cand_summary,
         "solr_verified_docs": solr_num_found,
         "parity_result": parity_result,
     }
-    report_filename = f"gate3_combined_slice_parity_{run_nonce}.json"
+    report_filename = f"gate3_{'full' if args.full else 'combined_slice'}_parity_{run_nonce}.json"
     report_path = os.path.join(args.output_dir, report_filename)
     write_file_mode_0600(report_path, json.dumps(report, indent=2))
     print(f"\nRetained mode 0600 evidence report at: {report_path}")

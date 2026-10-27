@@ -16,6 +16,7 @@ pub mod staff_ao_candidate;
 pub mod staff_ao_probe;
 pub mod staff_candidate_runner;
 pub mod staff_combined_candidate;
+pub mod staff_full_candidate;
 pub mod staff_resource_candidate;
 
 #[derive(Serialize)]
@@ -320,6 +321,8 @@ enum Commands {
     StaffResourceCandidate(staff_resource_candidate::StaffResourceCandidateArgs),
     #[command(name = "staff-combined-candidate", alias = "staff-candidate")]
     StaffCombinedCandidate(staff_combined_candidate::StaffCombinedCandidateArgs),
+    #[command(name = "staff-full-candidate")]
+    StaffFullCandidate(staff_full_candidate::StaffFullCandidateArgs),
     #[command(name = "staff-ao-builder")]
     StaffAoBuilder(staff_ao_builder::StaffAoBuilderArgs),
     #[command(name = "build-index-document")]
@@ -1166,6 +1169,9 @@ async fn main() -> Result<()> {
         }
         Commands::StaffCombinedCandidate(args) => {
             staff_combined_candidate::run_staff_combined_candidate(&client, args.clone()).await?;
+        }
+        Commands::StaffFullCandidate(args) => {
+            staff_full_candidate::run_staff_full_candidate(&client, args).await?;
         }
         Commands::BuildIndexDocument(_) => {
             unreachable!("build-index-document returns before API login")
