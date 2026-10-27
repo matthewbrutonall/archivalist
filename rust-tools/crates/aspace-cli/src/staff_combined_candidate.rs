@@ -1,8 +1,12 @@
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
+use aspace_client::index_document::COLLECTION_MANAGEMENT_DOCUMENTS_KEY;
 use aspace_client::isolated_solr_writer::IsolatedSolrStaffAoWriter;
-use aspace_client::Client;
+use aspace_client::{
+    build_index_document_batch, Client, IndexDocumentBatchRequest, IndexDocumentInput,
+};
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashSet;
 use std::future::Future;
 use std::io::{self, Write};
@@ -17,6 +21,272 @@ pub use crate::staff_candidate_runner::{
     MAX_CANDIDATE_CONCURRENCY,
 };
 pub use crate::staff_resource_candidate::fetch_and_build_resource_candidate_batch;
+
+/// Extracts synthetic `collection_management` child documents from built parent digital object documents
+/// in native hook order (parent, then child docs), preserving exact child JSON and identity,
+/// applies PUI availability types for published digital objects,
+/// and strips all top-level `_archivalist_*` private markers from both parent and child docs.
+///
+/// Fails closed if child envelope is malformed, not an array, child is not an object,
+/// or child identity/envelope does not match expected parent URI.
+pub fn extract_digital_object_batch_documents(
+    batch_documents: Vec<Value>,
+    repo_id: u32,
+) -> Result<CandidateBatchOutput> {
+    let expected_do_prefix = format!("/repositories/{}/digital_objects/", repo_id);
+    let expected_cm_prefix = format!("/repositories/{}/collection_management/", repo_id);
+
+    let mut ordered_documents = Vec::new();
+    let mut parent_count = 0;
+    let mut child_count = 0;
+    let mut parent_uris = Vec::new();
+    let mut child_uris = Vec::new();
+
+    for mut parent_doc in batch_documents {
+        let parent_obj = parent_doc
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("Built parent document must be a JSON object"))?;
+
+        let parent_uri = parent_obj
+            .get("uri")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Built parent document missing string 'uri'"))?
+            .to_string();
+
+        if !parent_uri.starts_with(&expected_do_prefix) {
+            bail!(
+                "Parent digital_object URI '{}' does not match expected prefix '{}'",
+                parent_uri,
+                expected_do_prefix
+            );
+        }
+
+        let parent_id_suffix = &parent_uri[expected_do_prefix.len()..];
+        if parent_id_suffix.parse::<u32>().is_err() {
+            bail!(
+                "Parent digital_object URI '{}' contains non-numeric ID suffix '{}'",
+                parent_uri,
+                parent_id_suffix
+            );
+        }
+
+        // Extract collection management child documents BEFORE stripping markers
+        let cm_value = parent_obj.remove(COLLECTION_MANAGEMENT_DOCUMENTS_KEY);
+
+        // Strip all top-level _archivalist_* markers from parent document
+        parent_obj.retain(|k, _| !k.starts_with("_archivalist_"));
+
+        // Match native staff indexer apply_pui_fields: published digital objects receive PUI availability
+        // types ["pui_record", "pui_digital_object", "pui"] in addition to ["digital_object"].
+        if parent_obj.get("publish").and_then(Value::as_bool) == Some(true) {
+            let types = parent_obj
+                .entry("types".to_string())
+                .or_insert_with(|| Value::Array(vec![Value::String("digital_object".to_string())]));
+            if let Value::Array(types_arr) = types {
+                for pui_type in ["pui_record", "pui_digital_object", "pui"] {
+                    if !types_arr.iter().any(|v| v.as_str() == Some(pui_type)) {
+                        types_arr.push(Value::String(pui_type.to_string()));
+                    }
+                }
+            }
+        }
+
+        let mut children = Vec::new();
+        if let Some(cm_val) = cm_value {
+            let cm_array = match cm_val {
+                Value::Array(arr) => arr,
+                _ => bail!(
+                    "Parent digital_object '{}' has malformed {}: expected JSON array",
+                    parent_uri,
+                    COLLECTION_MANAGEMENT_DOCUMENTS_KEY
+                ),
+            };
+
+            for (idx, mut child_doc) in cm_array.into_iter().enumerate() {
+                let child_obj = child_doc.as_object_mut().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Child document at index {} for parent '{}' is not a JSON object",
+                        idx,
+                        parent_uri
+                    )
+                })?;
+
+                let child_id = child_obj
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Child document at index {} for parent '{}' missing string 'id'",
+                            idx,
+                            parent_uri
+                        )
+                    })?
+                    .to_string();
+
+                let child_uri = child_obj
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Child document at index {} for parent '{}' missing string 'uri'",
+                            idx,
+                            parent_uri
+                        )
+                    })?
+                    .to_string();
+
+                if child_id != child_uri {
+                    bail!(
+                        "Child document 'id' ('{}') does not match 'uri' ('{}')",
+                        child_id,
+                        child_uri
+                    );
+                }
+
+                if !child_uri.starts_with(&expected_cm_prefix) {
+                    bail!(
+                        "Child document URI '{}' does not match expected prefix '{}'",
+                        child_uri,
+                        expected_cm_prefix
+                    );
+                }
+
+                let child_id_suffix = &child_uri[expected_cm_prefix.len()..];
+                if child_id_suffix.parse::<u32>().is_err() {
+                    bail!(
+                        "Child document URI '{}' contains non-numeric ID suffix '{}'",
+                        child_uri,
+                        child_id_suffix
+                    );
+                }
+
+                let parent_id_val = child_obj
+                    .get("parent_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Child document '{}' missing string 'parent_id'", child_uri)
+                    })?;
+                if parent_id_val != parent_uri {
+                    bail!(
+                        "Child document '{}' parent_id '{}' does not match parent URI '{}'",
+                        child_uri,
+                        parent_id_val,
+                        parent_uri
+                    );
+                }
+
+                let parent_type_val = child_obj
+                    .get("parent_type")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Child document '{}' missing string 'parent_type'",
+                            child_uri
+                        )
+                    })?;
+                if parent_type_val != "digital_object" {
+                    bail!(
+                        "Child document '{}' parent_type '{}' must be 'digital_object'",
+                        child_uri,
+                        parent_type_val
+                    );
+                }
+
+                let primary_type_val = child_obj
+                    .get("primary_type")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Child document '{}' missing string 'primary_type'",
+                            child_uri
+                        )
+                    })?;
+                if primary_type_val != "collection_management" {
+                    bail!(
+                        "Child document '{}' primary_type '{}' must be 'collection_management'",
+                        child_uri,
+                        primary_type_val
+                    );
+                }
+
+                // Strip all top-level _archivalist_* markers from child document
+                child_obj.retain(|k, _| !k.starts_with("_archivalist_"));
+
+                child_uris.push(child_uri);
+                children.push(child_doc);
+            }
+        }
+
+        // Native hook order: emit parent document first, followed by its child docs
+        parent_uris.push(Some(parent_uri));
+        ordered_documents.push(parent_doc);
+        parent_count += 1;
+
+        for child in children {
+            ordered_documents.push(child);
+            child_count += 1;
+        }
+    }
+
+    Ok(CandidateBatchOutput {
+        ordered_documents,
+        parent_uris,
+        child_uris,
+        parent_count,
+        child_count,
+    })
+}
+
+pub async fn fetch_and_build_digital_object_candidate_batch(
+    client: &Client,
+    repo_id: u32,
+    chunk: &[u32],
+    batch_idx: usize,
+    batch_size: usize,
+    dynamic_enums: Arc<Vec<String>>,
+    arks_enabled: bool,
+) -> Result<CandidateBatchOutput> {
+    let raw_records = client
+        .fetch_staff_digital_objects_by_ids_bounded(repo_id, chunk, batch_size)
+        .await
+        .with_context(|| format!("Failed to fetch digital_object batch {}", batch_idx))?;
+
+    if raw_records.len() != chunk.len() {
+        bail!(
+            "Backend returned {} records for batch {}, expected {}",
+            raw_records.len(),
+            batch_idx,
+            chunk.len()
+        );
+    }
+
+    let repo_scope = Value::String(format!("/repositories/{}", repo_id));
+    let mut inputs = Vec::with_capacity(raw_records.len());
+    for record in raw_records {
+        let uri = record
+            .get("uri")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Record missing valid string uri"))?
+            .to_string();
+
+        let input = IndexDocumentInput {
+            uri,
+            record_type: "digital_object".to_string(),
+            repository: repo_scope.clone(),
+            record,
+            enrich: true,
+            dynamic_enum_fields: (*dynamic_enums).clone(),
+            arks_enabled,
+            ..Default::default()
+        };
+        inputs.push(input);
+    }
+
+    let batch_resp = build_index_document_batch(IndexDocumentBatchRequest { records: inputs })
+        .map_err(|e| anyhow::anyhow!("Failed to build index document batch: {e}"))?;
+
+    extract_digital_object_batch_documents(batch_resp.documents, repo_id)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TypeSliceSummary {
@@ -64,6 +334,7 @@ pub struct StaffCombinedCandidateSummary {
 
     pub archival_objects: TypeSliceSummary,
     pub resources: TypeSliceSummary,
+    pub digital_objects: TypeSliceSummary,
 
     pub total_ids_discovered: usize,
     pub exact_ids_indexed: usize,
@@ -104,6 +375,7 @@ impl StaffCombinedCandidateSummary {
             concurrency: args.concurrency,
             archival_objects: TypeSliceSummary::empty("archival_object"),
             resources: TypeSliceSummary::empty("resource"),
+            digital_objects: TypeSliceSummary::empty("digital_object"),
             total_ids_discovered: 0,
             exact_ids_indexed: 0,
             parent_docs: 0,
@@ -364,8 +636,10 @@ where
 
     let client_for_ao_ids = client.clone();
     let client_for_res_ids = client.clone();
+    let client_for_do_ids = client.clone();
     let client_for_ao_batches = client.clone();
     let client_for_res_batches = client.clone();
+    let client_for_do_batches = client.clone();
 
     execute_staff_combined_candidate_custom(
         client,
@@ -382,6 +656,14 @@ where
         move || {
             let client = client_for_res_ids.clone();
             async move { client.resource_ids_modified_since(repo_id, Some(0)).await }
+        },
+        move || {
+            let client = client_for_do_ids.clone();
+            async move {
+                client
+                    .digital_object_ids_modified_since(repo_id, Some(0))
+                    .await
+            }
         },
         move |batch_idx, chunk, dynamic_enums| {
             let client = client_for_ao_batches.clone();
@@ -412,10 +694,26 @@ where
                 .await
             }
         },
+        move |batch_idx, chunk, dynamic_enums| {
+            let client = client_for_do_batches.clone();
+            async move {
+                fetch_and_build_digital_object_candidate_batch(
+                    &client,
+                    repo_id,
+                    &chunk,
+                    batch_idx,
+                    batch_size,
+                    dynamic_enums,
+                    arks_enabled,
+                )
+                .await
+            }
+        },
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_staff_combined_candidate_custom<
     V,
     FAoIds,
@@ -424,18 +722,25 @@ pub async fn execute_staff_combined_candidate_custom<
     FResIds,
     FutResIds,
     EResIds,
+    FDoIds,
+    FutDoIds,
+    EDoIds,
     FAoBatch,
     FutAoBatch,
     FResBatch,
     FutResBatch,
+    FDoBatch,
+    FutDoBatch,
 >(
     client: &Client,
     args: &StaffCombinedCandidateArgs,
     verifier: V,
     fetch_ao_ids: FAoIds,
     fetch_res_ids: FResIds,
+    fetch_do_ids: FDoIds,
     fetch_and_build_ao_batch: FAoBatch,
     fetch_and_build_res_batch: FResBatch,
+    fetch_and_build_do_batch: FDoBatch,
 ) -> StaffCombinedCandidateSummary
 where
     V: FnOnce(&std::path::Path, &str, &str) -> Result<()>,
@@ -445,10 +750,15 @@ where
     FResIds: FnOnce() -> FutResIds,
     FutResIds: Future<Output = std::result::Result<Vec<u32>, EResIds>>,
     EResIds: std::fmt::Display,
+    FDoIds: FnOnce() -> FutDoIds,
+    FutDoIds: Future<Output = std::result::Result<Vec<u32>, EDoIds>>,
+    EDoIds: std::fmt::Display,
     FAoBatch: Fn(usize, Vec<u32>, Arc<Vec<String>>) -> FutAoBatch + Send + Sync + 'static,
     FutAoBatch: Future<Output = Result<CandidateBatchOutput>> + Send,
     FResBatch: Fn(usize, Vec<u32>, Arc<Vec<String>>) -> FutResBatch + Send + Sync + 'static,
     FutResBatch: Future<Output = Result<CandidateBatchOutput>> + Send,
+    FDoBatch: Fn(usize, Vec<u32>, Arc<Vec<String>>) -> FutDoBatch + Send + Sync + 'static,
+    FutDoBatch: Future<Output = Result<CandidateBatchOutput>> + Send,
 {
     if let Err(err) = args.validate() {
         return StaffCombinedCandidateSummary::failure_preflight(
@@ -502,10 +812,11 @@ where
     // Measurement envelope begins here
     let wall_start = Instant::now();
 
-    // 1. Enumerate IDs for both types
+    // 1. Enumerate IDs for all three types
     let id_start = Instant::now();
     let ao_ids_res = fetch_ao_ids().await;
     let res_ids_res = fetch_res_ids().await;
+    let do_ids_res = fetch_do_ids().await;
     let id_list_elapsed_sec = id_start.elapsed().as_secs_f64();
 
     let ao_ids = match ao_ids_res {
@@ -536,6 +847,20 @@ where
         }
     };
 
+    let do_ids = match do_ids_res {
+        Ok(ids) => ids,
+        Err(err) => {
+            let total_wall_elapsed_sec = wall_start.elapsed().as_secs_f64();
+            let mut res = StaffCombinedCandidateSummary::failure_preflight(
+                args,
+                format!("Failed to fetch digital object ID list from backend: {err}"),
+            );
+            res.id_list_elapsed_sec = id_list_elapsed_sec;
+            res.total_wall_elapsed_sec = total_wall_elapsed_sec;
+            return res;
+        }
+    };
+
     // Check duplicate input IDs in discovered sets
     let ao_dup_input = check_input_id_duplicates(&ao_ids);
     if ao_dup_input > 0 {
@@ -547,9 +872,10 @@ where
                 ao_dup_input
             ),
         );
-        res.total_ids_discovered = ao_ids.len() + resource_ids.len();
+        res.total_ids_discovered = ao_ids.len() + resource_ids.len() + do_ids.len();
         res.archival_objects.ids_discovered = ao_ids.len();
         res.resources.ids_discovered = resource_ids.len();
+        res.digital_objects.ids_discovered = do_ids.len();
         res.archival_objects.duplicate_ids = ao_dup_input;
         res.duplicate_ids = ao_dup_input;
         res.id_list_elapsed_sec = id_list_elapsed_sec;
@@ -567,9 +893,10 @@ where
                 res_dup_input
             ),
         );
-        res.total_ids_discovered = ao_ids.len() + resource_ids.len();
+        res.total_ids_discovered = ao_ids.len() + resource_ids.len() + do_ids.len();
         res.archival_objects.ids_discovered = ao_ids.len();
         res.resources.ids_discovered = resource_ids.len();
+        res.digital_objects.ids_discovered = do_ids.len();
         res.resources.duplicate_ids = res_dup_input;
         res.duplicate_ids = res_dup_input;
         res.id_list_elapsed_sec = id_list_elapsed_sec;
@@ -577,14 +904,37 @@ where
         return res;
     }
 
-    let total_discovered_ids = ao_ids.len() + resource_ids.len();
+    let do_dup_input = check_input_id_duplicates(&do_ids);
+    if do_dup_input > 0 {
+        let total_wall_elapsed_sec = wall_start.elapsed().as_secs_f64();
+        let mut res = StaffCombinedCandidateSummary::failure_preflight(
+            args,
+            format!(
+                "Backend returned {} duplicate ID(s) in repository DO ID list",
+                do_dup_input
+            ),
+        );
+        res.total_ids_discovered = ao_ids.len() + resource_ids.len() + do_ids.len();
+        res.archival_objects.ids_discovered = ao_ids.len();
+        res.resources.ids_discovered = resource_ids.len();
+        res.digital_objects.ids_discovered = do_ids.len();
+        res.digital_objects.duplicate_ids = do_dup_input;
+        res.duplicate_ids = do_dup_input;
+        res.id_list_elapsed_sec = id_list_elapsed_sec;
+        res.total_wall_elapsed_sec = total_wall_elapsed_sec;
+        return res;
+    }
+
+    let total_discovered_ids = ao_ids.len() + resource_ids.len() + do_ids.len();
 
     let res_batches = partition_ids_into_batches(&resource_ids, args.batch_size);
+    let do_batches = partition_ids_into_batches(&do_ids, args.batch_size);
     let ao_batches = partition_ids_into_batches(&ao_ids, args.batch_size);
-    let total_batches = res_batches.len() + ao_batches.len();
+    let total_batches = res_batches.len() + do_batches.len() + ao_batches.len();
 
     let expected_ao_prefix = format!("/repositories/{}/archival_objects/", args.repo);
     let expected_res_prefix = format!("/repositories/{}/resources/", args.repo);
+    let expected_do_prefix = format!("/repositories/{}/digital_objects/", args.repo);
 
     let mut global_unique_uris = HashSet::with_capacity(total_discovered_ids * 2);
     let mut cross_type_duplicate_uris_count = 0;
@@ -619,7 +969,21 @@ where
     )
     .await;
 
-    // 3. Process Archival Object Batches (if resources succeeded)
+    // 3. Process Digital Object Batches (digital objects second)
+    let (do_slice_summary, do_returned_ids) = process_type_candidate_batches(
+        "digital_object",
+        &expected_do_prefix,
+        &do_ids,
+        do_batches,
+        &mut shared,
+        |batch_idx, chunk| {
+            let dynamic_enums = Arc::clone(&dynamic_enums);
+            fetch_and_build_do_batch(batch_idx, chunk, dynamic_enums)
+        },
+    )
+    .await;
+
+    // 4. Process Archival Object Batches
     let (ao_slice_summary, ao_returned_ids) = process_type_candidate_batches(
         "archival_object",
         &expected_ao_prefix,
@@ -635,19 +999,29 @@ where
 
     let batch_loop_wall_elapsed_sec = batch_loop_start.elapsed().as_secs_f64();
 
-    let total_batches_failed = res_slice_summary.batches_failed + ao_slice_summary.batches_failed;
-    let total_missing_ids = res_slice_summary.missing_ids + ao_slice_summary.missing_ids;
-    let total_duplicate_ids = res_slice_summary.duplicate_ids + ao_slice_summary.duplicate_ids;
-    let total_unexpected_ids = res_slice_summary.unexpected_ids + ao_slice_summary.unexpected_ids;
-    let total_exact_ids_indexed =
-        res_slice_summary.exact_ids_indexed + ao_slice_summary.exact_ids_indexed;
-    let total_parent_docs = res_slice_summary.parent_docs + ao_slice_summary.parent_docs;
-    let total_child_docs = res_slice_summary.child_docs + ao_slice_summary.child_docs;
+    let total_batches_failed = res_slice_summary.batches_failed
+        + do_slice_summary.batches_failed
+        + ao_slice_summary.batches_failed;
+    let total_missing_ids =
+        res_slice_summary.missing_ids + do_slice_summary.missing_ids + ao_slice_summary.missing_ids;
+    let total_duplicate_ids = res_slice_summary.duplicate_ids
+        + do_slice_summary.duplicate_ids
+        + ao_slice_summary.duplicate_ids;
+    let total_unexpected_ids = res_slice_summary.unexpected_ids
+        + do_slice_summary.unexpected_ids
+        + ao_slice_summary.unexpected_ids;
+    let total_exact_ids_indexed = res_slice_summary.exact_ids_indexed
+        + do_slice_summary.exact_ids_indexed
+        + ao_slice_summary.exact_ids_indexed;
+    let total_parent_docs =
+        res_slice_summary.parent_docs + do_slice_summary.parent_docs + ao_slice_summary.parent_docs;
+    let total_child_docs =
+        res_slice_summary.child_docs + do_slice_summary.child_docs + ao_slice_summary.child_docs;
     let total_docs_indexed = total_parent_docs + total_child_docs;
 
-    // 4. Commit Decision:
+    // 5. Commit Decision:
     // Only commit if all batches succeeded, zero unexpected/duplicate anomalies occurred,
-    // exact ID counts match for both slices, and no errors occurred.
+    // exact ID counts match for all slices, and no errors occurred.
     let mut solr_commit_elapsed_sec = 0.0;
     let mut commit_failed = false;
 
@@ -656,6 +1030,7 @@ where
         && total_duplicate_ids == 0
         && total_missing_ids == 0
         && res_returned_ids.len() == resource_ids.len()
+        && do_returned_ids.len() == do_ids.len()
         && ao_returned_ids.len() == ao_ids.len()
         && global_unique_uris.len() == total_docs_indexed
         && first_error.is_none();
@@ -708,6 +1083,7 @@ where
         concurrency: args.concurrency,
         archival_objects: ao_slice_summary,
         resources: res_slice_summary,
+        digital_objects: do_slice_summary,
         total_ids_discovered: total_discovered_ids,
         exact_ids_indexed: total_exact_ids_indexed,
         parent_docs: total_parent_docs,
@@ -750,7 +1126,7 @@ pub async fn run_staff_combined_candidate(
         json_output,
         success,
         error_message.as_deref(),
-        "combined (AO + Resource)",
+        "combined (AO + Resource + Digital Object)",
         |w| print_human_combined_candidate_summary_to_writer(&summary, w),
     )
 }
@@ -805,6 +1181,21 @@ pub fn print_human_combined_candidate_summary_to_writer<W: Write>(
         summary.resources.missing_ids,
         summary.resources.duplicate_ids,
         summary.resources.unexpected_ids,
+    )?;
+    writeln!(
+        writer,
+        "Digital Objects:\n  Discovered: {} | Indexed: {} | Parent Docs: {} | Child Docs: {} | Total Docs: {}\n  Batches: {} (completed: {}, failed: {}) | Missing: {} | Duplicate: {} | Unexpected: {}",
+        summary.digital_objects.ids_discovered,
+        summary.digital_objects.exact_ids_indexed,
+        summary.digital_objects.parent_docs,
+        summary.digital_objects.child_docs,
+        summary.digital_objects.total_docs,
+        summary.digital_objects.batches,
+        summary.digital_objects.batches_completed,
+        summary.digital_objects.batches_failed,
+        summary.digital_objects.missing_ids,
+        summary.digital_objects.duplicate_ids,
+        summary.digital_objects.unexpected_ids,
     )?;
     writeln!(writer)?;
     writeln!(writer, "--- Overall Combined Totals ---")?;
@@ -1002,6 +1393,8 @@ mod tests {
             |_state, _backend, _solr| bail!("Injected verifier failure before writer"),
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![1]) },
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![1]) },
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![1]) },
+            |_idx, _chunk, _enums| async { unreachable!() },
             |_idx, _chunk, _enums| async { unreachable!() },
             |_idx, _chunk, _enums| async { unreachable!() },
         )
@@ -1028,6 +1421,7 @@ mod tests {
             |_state, _backend, _solr| Ok(()),
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![101]) },
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![1]) },
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![]) },
             |_idx, _chunk, _enums| async {
                 Ok(CandidateBatchOutput {
                     ordered_documents: vec![
@@ -1046,6 +1440,15 @@ mod tests {
                     parent_uris: vec![Some("/repositories/4/resources/1".to_string())],
                     child_uris: vec![],
                     parent_count: 1,
+                    child_count: 0,
+                })
+            },
+            |_idx, _chunk, _enums| async {
+                Ok(CandidateBatchOutput {
+                    ordered_documents: vec![],
+                    parent_uris: vec![],
+                    child_uris: vec![],
+                    parent_count: 0,
                     child_count: 0,
                 })
             },
@@ -1074,6 +1477,7 @@ mod tests {
             |_state, _backend, _solr| Ok(()),
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![101]) },
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![1]) },
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![]) },
             |_idx, _chunk, _enums| async {
                 Ok(CandidateBatchOutput {
                     ordered_documents: vec![json!({"id": "/repositories/4/archival_objects/101", "uri": "/repositories/4/archival_objects/101"})],
@@ -1093,6 +1497,15 @@ mod tests {
                     child_uris: vec!["/repositories/4/archival_objects/101".to_string()],
                     parent_count: 1,
                     child_count: 1,
+                })
+            },
+            |_idx, _chunk, _enums| async {
+                Ok(CandidateBatchOutput {
+                    ordered_documents: vec![],
+                    parent_uris: vec![],
+                    child_uris: vec![],
+                    parent_count: 0,
+                    child_count: 0,
                 })
             },
         )
@@ -1119,6 +1532,7 @@ mod tests {
             |_state, _backend, _solr| Ok(()),
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![101]) },
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![1]) },
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![]) },
             |_idx, _chunk, _enums| async {
                 panic!("AO stage must not be called when resource stage encounters duplicate ID");
             },
@@ -1134,6 +1548,15 @@ mod tests {
                     ],
                     child_uris: vec![],
                     parent_count: 2,
+                    child_count: 0,
+                })
+            },
+            |_idx, _chunk, _enums| async {
+                Ok(CandidateBatchOutput {
+                    ordered_documents: vec![],
+                    parent_uris: vec![],
+                    child_uris: vec![],
+                    parent_count: 0,
                     child_count: 0,
                 })
             },
@@ -1162,6 +1585,7 @@ mod tests {
             |_state, _backend, _solr| Ok(()),
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![101]) },
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![1]) },
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![]) },
             |_idx, _chunk, _enums| async {
                 panic!("AO stage must not run when resource stage has unexpected ID");
             },
@@ -1171,6 +1595,15 @@ mod tests {
                     parent_uris: vec![Some("/repositories/4/resources/999".to_string())],
                     child_uris: vec![],
                     parent_count: 1,
+                    child_count: 0,
+                })
+            },
+            |_idx, _chunk, _enums| async {
+                Ok(CandidateBatchOutput {
+                    ordered_documents: vec![],
+                    parent_uris: vec![],
+                    child_uris: vec![],
+                    parent_count: 0,
                     child_count: 0,
                 })
             },
@@ -1199,6 +1632,7 @@ mod tests {
             |_state, _backend, _solr| Ok(()),
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![101]) },
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![1]) },
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![]) },
             |_idx, _chunk, _enums| async {
                 Ok(CandidateBatchOutput {
                     ordered_documents: vec![
@@ -1220,6 +1654,15 @@ mod tests {
                     parent_uris: vec![Some("/repositories/4/resources/1".to_string())],
                     child_uris: vec![],
                     parent_count: 1,
+                    child_count: 0,
+                })
+            },
+            |_idx, _chunk, _enums| async {
+                Ok(CandidateBatchOutput {
+                    ordered_documents: vec![],
+                    parent_uris: vec![],
+                    child_uris: vec![],
+                    parent_count: 0,
                     child_count: 0,
                 })
             },
@@ -1250,6 +1693,7 @@ mod tests {
             |_state, _backend, _solr| Ok(()),
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![101]) },
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![1]) },
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![]) },
             |_idx, _chunk, _enums| async {
                 Ok(CandidateBatchOutput {
                     ordered_documents: vec![json!({"id": "/repositories/4/archival_objects/999", "uri": "/repositories/4/archival_objects/999"})],
@@ -1265,6 +1709,15 @@ mod tests {
                     parent_uris: vec![Some("/repositories/4/resources/1".to_string())],
                     child_uris: vec![],
                     parent_count: 1,
+                    child_count: 0,
+                })
+            },
+            |_idx, _chunk, _enums| async {
+                Ok(CandidateBatchOutput {
+                    ordered_documents: vec![],
+                    parent_uris: vec![],
+                    child_uris: vec![],
+                    parent_count: 0,
                     child_count: 0,
                 })
             },
@@ -1293,6 +1746,7 @@ mod tests {
             |_state, _backend, _solr| Ok(()),
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![101, 102]) },
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![1]) },
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![]) },
             |_idx, _chunk, _enums| async {
                 Ok(CandidateBatchOutput {
                     ordered_documents: vec![json!({"id": "/repositories/4/archival_objects/101", "uri": "/repositories/4/archival_objects/101"})],
@@ -1308,6 +1762,15 @@ mod tests {
                     parent_uris: vec![Some("/repositories/4/resources/1".to_string())],
                     child_uris: vec![],
                     parent_count: 1,
+                    child_count: 0,
+                })
+            },
+            |_idx, _chunk, _enums| async {
+                Ok(CandidateBatchOutput {
+                    ordered_documents: vec![],
+                    parent_uris: vec![],
+                    child_uris: vec![],
+                    parent_count: 0,
                     child_count: 0,
                 })
             },
@@ -1333,6 +1796,7 @@ mod tests {
             |_state, _backend, _solr| Ok(()),
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![101]) },
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![1, 2]) },
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![]) },
             |_idx, _chunk, _enums| async {
                 Ok(CandidateBatchOutput {
                     ordered_documents: vec![json!({"id": "/repositories/4/archival_objects/101", "uri": "/repositories/4/archival_objects/101"})],
@@ -1348,6 +1812,15 @@ mod tests {
                     parent_uris: vec![Some("/repositories/4/resources/1".to_string())],
                     child_uris: vec![],
                     parent_count: 1,
+                    child_count: 0,
+                })
+            },
+            |_idx, _chunk, _enums| async {
+                Ok(CandidateBatchOutput {
+                    ordered_documents: vec![],
+                    parent_uris: vec![],
+                    child_uris: vec![],
+                    parent_count: 0,
                     child_count: 0,
                 })
             },
@@ -1372,6 +1845,7 @@ mod tests {
             |_state, _backend, _solr| Ok(()),
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![101]) },
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![1]) },
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![]) },
             |_idx, _chunk, _enums| async {
                 Ok(CandidateBatchOutput {
                     ordered_documents: vec![json!({"id": "/repositories/4/archival_objects/101", "uri": "/repositories/4/archival_objects/101"})],
@@ -1383,6 +1857,15 @@ mod tests {
             },
             |_idx, _chunk, _enums| async {
                 bail!("Child document missing string 'parent_id'")
+            },
+            |_idx, _chunk, _enums| async {
+                Ok(CandidateBatchOutput {
+                    ordered_documents: vec![],
+                    parent_uris: vec![],
+                    child_uris: vec![],
+                    parent_count: 0,
+                    child_count: 0,
+                })
             },
         )
         .await;
@@ -1408,6 +1891,7 @@ mod tests {
             |_state, _backend, _solr| Ok(()),
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![101]) },
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![1]) },
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![]) },
             |_idx, _chunk, _enums| async {
                 bail!("Injected AO network timeout")
             },
@@ -1417,6 +1901,15 @@ mod tests {
                     parent_uris: vec![Some("/repositories/4/resources/1".to_string())],
                     child_uris: vec![],
                     parent_count: 1,
+                    child_count: 0,
+                })
+            },
+            |_idx, _chunk, _enums| async {
+                Ok(CandidateBatchOutput {
+                    ordered_documents: vec![],
+                    parent_uris: vec![],
+                    child_uris: vec![],
+                    parent_count: 0,
                     child_count: 0,
                 })
             },
@@ -1445,6 +1938,7 @@ mod tests {
             |_state, _backend, _solr| Ok(()),
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![101]) },
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![1]) },
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![]) },
             |_idx, _chunk, _enums| async {
                 Ok(CandidateBatchOutput {
                     ordered_documents: vec![json!({"id": "/repositories/4/archival_objects/101", "uri": "/repositories/4/archival_objects/101"})],
@@ -1460,6 +1954,15 @@ mod tests {
                     parent_uris: vec![Some("/repositories/4/resources/1".to_string())],
                     child_uris: vec![],
                     parent_count: 1,
+                    child_count: 0,
+                })
+            },
+            |_idx, _chunk, _enums| async {
+                Ok(CandidateBatchOutput {
+                    ordered_documents: vec![],
+                    parent_uris: vec![],
+                    child_uris: vec![],
+                    parent_count: 0,
                     child_count: 0,
                 })
             },
@@ -1476,8 +1979,131 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_combined_candidate_clean_success() {
-        let candidate_core = "stage_staff_20261027_success_candidate";
+    async fn test_extract_digital_object_batch_documents_clean_and_marker_stripping() {
+        let repo_id = 4;
+        let batch = vec![
+            json!({
+                "uri": "/repositories/4/digital_objects/50",
+                "title": "Published DO",
+                "publish": true,
+                "primary_type": "digital_object",
+                "_archivalist_rust_fields": ["common_metadata"],
+                "_archivalist_private": "marker_parent",
+                COLLECTION_MANAGEMENT_DOCUMENTS_KEY: [
+                    {
+                        "id": "/repositories/4/collection_management/500",
+                        "uri": "/repositories/4/collection_management/500",
+                        "parent_id": "/repositories/4/digital_objects/50",
+                        "parent_type": "digital_object",
+                        "primary_type": "collection_management",
+                        "_archivalist_marker": "marker_child",
+                        "processing_priority": "high"
+                    }
+                ]
+            }),
+            json!({
+                "uri": "/repositories/4/digital_objects/51",
+                "title": "Unpublished DO",
+                "publish": false,
+                "primary_type": "digital_object",
+                "_archivalist_marker": "strip_me"
+            }),
+        ];
+
+        let extracted = extract_digital_object_batch_documents(batch, repo_id).unwrap();
+        assert_eq!(extracted.parent_count, 2);
+        assert_eq!(extracted.child_count, 1);
+        assert_eq!(extracted.ordered_documents.len(), 3);
+
+        // Document 0: parent DO 50 (parent before child)
+        let doc0 = &extracted.ordered_documents[0];
+        assert_eq!(doc0["uri"], "/repositories/4/digital_objects/50");
+        assert!(doc0.get("_archivalist_rust_fields").is_none());
+        assert!(doc0.get("_archivalist_private").is_none());
+        assert!(doc0.get(COLLECTION_MANAGEMENT_DOCUMENTS_KEY).is_none());
+        // Verify PUI types added for published DO
+        let types0 = doc0["types"].as_array().unwrap();
+        assert!(types0.iter().any(|v| v == "pui_record"));
+        assert!(types0.iter().any(|v| v == "pui_digital_object"));
+        assert!(types0.iter().any(|v| v == "pui"));
+
+        // Document 1: child collection_management 500
+        let doc1 = &extracted.ordered_documents[1];
+        assert_eq!(doc1["uri"], "/repositories/4/collection_management/500");
+        assert_eq!(doc1["parent_id"], "/repositories/4/digital_objects/50");
+        assert_eq!(doc1["parent_type"], "digital_object");
+        assert_eq!(doc1["primary_type"], "collection_management");
+        assert!(doc1.get("_archivalist_marker").is_none());
+
+        // Document 2: parent DO 51 (unpublished, no PUI additions)
+        let doc2 = &extracted.ordered_documents[2];
+        assert_eq!(doc2["uri"], "/repositories/4/digital_objects/51");
+        assert!(doc2.get("_archivalist_marker").is_none());
+        assert!(doc2.get("types").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_extract_digital_object_batch_documents_validation_failures() {
+        let repo_id = 4;
+
+        // 1. Wrong parent URI prefix
+        let bad_prefix = vec![json!({"uri": "/repositories/4/resources/50"})];
+        assert!(extract_digital_object_batch_documents(bad_prefix, repo_id).is_err());
+
+        // 2. Non-numeric parent ID
+        let bad_id = vec![json!({"uri": "/repositories/4/digital_objects/abc"})];
+        assert!(extract_digital_object_batch_documents(bad_id, repo_id).is_err());
+
+        // 3. Child not object
+        let bad_child = vec![json!({
+            "uri": "/repositories/4/digital_objects/50",
+            COLLECTION_MANAGEMENT_DOCUMENTS_KEY: ["not an object"]
+        })];
+        assert!(extract_digital_object_batch_documents(bad_child, repo_id).is_err());
+
+        // 4. Child id != uri
+        let bad_child_id = vec![json!({
+            "uri": "/repositories/4/digital_objects/50",
+            COLLECTION_MANAGEMENT_DOCUMENTS_KEY: [{
+                "id": "/repositories/4/collection_management/1",
+                "uri": "/repositories/4/collection_management/2",
+                "parent_id": "/repositories/4/digital_objects/50",
+                "parent_type": "digital_object",
+                "primary_type": "collection_management"
+            }]
+        })];
+        assert!(extract_digital_object_batch_documents(bad_child_id, repo_id).is_err());
+
+        // 5. Child parent_type not digital_object
+        let bad_parent_type = vec![json!({
+            "uri": "/repositories/4/digital_objects/50",
+            COLLECTION_MANAGEMENT_DOCUMENTS_KEY: [{
+                "id": "/repositories/4/collection_management/1",
+                "uri": "/repositories/4/collection_management/1",
+                "parent_id": "/repositories/4/digital_objects/50",
+                "parent_type": "resource",
+                "primary_type": "collection_management"
+            }]
+        })];
+        assert!(extract_digital_object_batch_documents(bad_parent_type, repo_id).is_err());
+
+        // 6. Child parent_id mismatch
+        let bad_parent_id = vec![json!({
+            "uri": "/repositories/4/digital_objects/50",
+            COLLECTION_MANAGEMENT_DOCUMENTS_KEY: [{
+                "id": "/repositories/4/collection_management/1",
+                "uri": "/repositories/4/collection_management/1",
+                "parent_id": "/repositories/4/digital_objects/99",
+                "parent_type": "digital_object",
+                "primary_type": "collection_management"
+            }]
+        })];
+        assert!(extract_digital_object_batch_documents(bad_parent_id, repo_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_do_duplicate_id_fails_closed() {
+        let candidate_core = "stage_staff_20261027_do_dup_candidate";
         let (_aspace, _solr, client, args) = setup_test_harness(candidate_core).await;
 
         let res = execute_staff_combined_candidate_custom(
@@ -1486,6 +2112,107 @@ mod tests {
             |_state, _backend, _solr| Ok(()),
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![101]) },
             || async { Ok::<Vec<u32>, anyhow::Error>(vec![1]) },
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![50]) },
+            |_idx, _chunk, _enums| async {
+                panic!("AO stage must not run when DO stage encounters duplicate");
+            },
+            |_idx, _chunk, _enums| async {
+                Ok(CandidateBatchOutput {
+                    ordered_documents: vec![json!({"id": "/repositories/4/resources/1", "uri": "/repositories/4/resources/1"})],
+                    parent_uris: vec![Some("/repositories/4/resources/1".to_string())],
+                    child_uris: vec![],
+                    parent_count: 1,
+                    child_count: 0,
+                })
+            },
+            |_idx, _chunk, _enums| async {
+                Ok(CandidateBatchOutput {
+                    ordered_documents: vec![
+                        json!({"id": "/repositories/4/digital_objects/50", "uri": "/repositories/4/digital_objects/50"}),
+                        json!({"id": "/repositories/4/digital_objects/50", "uri": "/repositories/4/digital_objects/50"}),
+                    ],
+                    parent_uris: vec![
+                        Some("/repositories/4/digital_objects/50".to_string()),
+                        Some("/repositories/4/digital_objects/50".to_string()),
+                    ],
+                    child_uris: vec![],
+                    parent_count: 2,
+                    child_count: 0,
+                })
+            },
+        )
+        .await;
+
+        assert!(!res.success);
+        assert!(!res.committed);
+        assert_eq!(res.resources.exact_ids_indexed, 1);
+        assert!(res.digital_objects.duplicate_ids > 0);
+        assert!(res.duplicate_ids > 0);
+        assert!(res
+            .error_message
+            .unwrap()
+            .contains("Duplicate record returned for digital_object ID 50 across batches"));
+    }
+
+    #[tokio::test]
+    async fn test_do_unexpected_id_fails_closed() {
+        let candidate_core = "stage_staff_20261027_do_unexp_candidate";
+        let (_aspace, _solr, client, args) = setup_test_harness(candidate_core).await;
+
+        let res = execute_staff_combined_candidate_custom(
+            &client,
+            &args,
+            |_state, _backend, _solr| Ok(()),
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![101]) },
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![1]) },
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![50]) },
+            |_idx, _chunk, _enums| async {
+                panic!("AO stage must not run when DO stage encounters unexpected ID");
+            },
+            |_idx, _chunk, _enums| async {
+                Ok(CandidateBatchOutput {
+                    ordered_documents: vec![json!({"id": "/repositories/4/resources/1", "uri": "/repositories/4/resources/1"})],
+                    parent_uris: vec![Some("/repositories/4/resources/1".to_string())],
+                    child_uris: vec![],
+                    parent_count: 1,
+                    child_count: 0,
+                })
+            },
+            |_idx, _chunk, _enums| async {
+                Ok(CandidateBatchOutput {
+                    ordered_documents: vec![json!({"id": "/repositories/4/digital_objects/999", "uri": "/repositories/4/digital_objects/999"})],
+                    parent_uris: vec![Some("/repositories/4/digital_objects/999".to_string())],
+                    child_uris: vec![],
+                    parent_count: 1,
+                    child_count: 0,
+                })
+            },
+        )
+        .await;
+
+        assert!(!res.success);
+        assert!(!res.committed);
+        assert_eq!(res.resources.exact_ids_indexed, 1);
+        assert_eq!(res.digital_objects.unexpected_ids, 1);
+        assert_eq!(res.unexpected_ids, 1);
+        assert!(res.error_message.unwrap().contains(
+            "Returned digital_object ID 999 was not present in repository digital_object ID list"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_missing_digital_object_ids_fails_closed_and_no_commit() {
+        let candidate_core = "stage_staff_20261027_missing_do_candidate";
+        let (_aspace, _solr, client, args) = setup_test_harness(candidate_core).await;
+
+        // Discovered DO IDs: [50, 51], but batch only returns doc for [50]
+        let res = execute_staff_combined_candidate_custom(
+            &client,
+            &args,
+            |_state, _backend, _solr| Ok(()),
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![101]) },
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![1]) },
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![50, 51]) },
             |_idx, _chunk, _enums| async {
                 Ok(CandidateBatchOutput {
                     ordered_documents: vec![json!({"id": "/repositories/4/archival_objects/101", "uri": "/repositories/4/archival_objects/101"})],
@@ -1504,6 +2231,114 @@ mod tests {
                     child_count: 0,
                 })
             },
+            |_idx, _chunk, _enums| async {
+                Ok(CandidateBatchOutput {
+                    ordered_documents: vec![json!({"id": "/repositories/4/digital_objects/50", "uri": "/repositories/4/digital_objects/50"})],
+                    parent_uris: vec![Some("/repositories/4/digital_objects/50".to_string())],
+                    child_uris: vec![],
+                    parent_count: 1,
+                    child_count: 0,
+                })
+            },
+        )
+        .await;
+
+        assert!(!res.success);
+        assert!(!res.committed);
+        assert_eq!(res.digital_objects.missing_ids, 1);
+        assert_eq!(res.missing_ids, 1);
+        assert_eq!(res.resources.missing_ids, 0);
+        assert_eq!(res.archival_objects.missing_ids, 0);
+    }
+
+    #[tokio::test]
+    async fn test_do_batch_failure_fails_closed_and_no_commit() {
+        let candidate_core = "stage_staff_20261027_do_batch_err_candidate";
+        let (_aspace, _solr, client, args) = setup_test_harness(candidate_core).await;
+
+        let res = execute_staff_combined_candidate_custom(
+            &client,
+            &args,
+            |_state, _backend, _solr| Ok(()),
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![101]) },
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![1]) },
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![50]) },
+            |_idx, _chunk, _enums| async {
+                panic!("AO stage must not run when DO batch fails");
+            },
+            |_idx, _chunk, _enums| async {
+                Ok(CandidateBatchOutput {
+                    ordered_documents: vec![json!({"id": "/repositories/4/resources/1", "uri": "/repositories/4/resources/1"})],
+                    parent_uris: vec![Some("/repositories/4/resources/1".to_string())],
+                    child_uris: vec![],
+                    parent_count: 1,
+                    child_count: 0,
+                })
+            },
+            |_idx, _chunk, _enums| async {
+                bail!("Injected DO batch network error")
+            },
+        )
+        .await;
+
+        assert!(!res.success);
+        assert!(!res.committed);
+        assert_eq!(res.resources.exact_ids_indexed, 1);
+        assert_eq!(res.digital_objects.batches_failed, 1);
+        assert!(res
+            .error_message
+            .unwrap()
+            .contains("Injected DO batch network error"));
+    }
+
+    #[tokio::test]
+    async fn test_combined_candidate_clean_success() {
+        let candidate_core = "stage_staff_20261027_success_candidate";
+        let (_aspace, _solr, client, args) = setup_test_harness(candidate_core).await;
+
+        let res = execute_staff_combined_candidate_custom(
+            &client,
+            &args,
+            |_state, _backend, _solr| Ok(()),
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![101]) },
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![1]) },
+            || async { Ok::<Vec<u32>, anyhow::Error>(vec![50]) },
+            |_idx, _chunk, _enums| async {
+                Ok(CandidateBatchOutput {
+                    ordered_documents: vec![json!({"id": "/repositories/4/archival_objects/101", "uri": "/repositories/4/archival_objects/101"})],
+                    parent_uris: vec![Some("/repositories/4/archival_objects/101".to_string())],
+                    child_uris: vec![],
+                    parent_count: 1,
+                    child_count: 0,
+                })
+            },
+            |_idx, _chunk, _enums| async {
+                Ok(CandidateBatchOutput {
+                    ordered_documents: vec![json!({"id": "/repositories/4/resources/1", "uri": "/repositories/4/resources/1"})],
+                    parent_uris: vec![Some("/repositories/4/resources/1".to_string())],
+                    child_uris: vec![],
+                    parent_count: 1,
+                    child_count: 0,
+                })
+            },
+            |_idx, _chunk, _enums| async {
+                Ok(CandidateBatchOutput {
+                    ordered_documents: vec![
+                        json!({"id": "/repositories/4/digital_objects/50", "uri": "/repositories/4/digital_objects/50"}),
+                        json!({
+                            "id": "/repositories/4/collection_management/500",
+                            "uri": "/repositories/4/collection_management/500",
+                            "parent_id": "/repositories/4/digital_objects/50",
+                            "parent_type": "digital_object",
+                            "primary_type": "collection_management"
+                        }),
+                    ],
+                    parent_uris: vec![Some("/repositories/4/digital_objects/50".to_string())],
+                    child_uris: vec!["/repositories/4/collection_management/500".to_string()],
+                    parent_count: 1,
+                    child_count: 1,
+                })
+            },
         )
         .await;
 
@@ -1513,17 +2348,21 @@ mod tests {
             eprintln!("Committed: {}", res.committed);
             eprintln!("AO: {:?}", res.archival_objects);
             eprintln!("Res: {:?}", res.resources);
+            eprintln!("DO: {:?}", res.digital_objects);
         }
         assert!(res.success);
         assert!(res.committed);
         assert_eq!(res.failures, 0);
-        assert_eq!(res.total_ids_discovered, 2);
-        assert_eq!(res.exact_ids_indexed, 2);
-        assert_eq!(res.parent_docs, 2);
-        assert_eq!(res.child_docs, 0);
-        assert_eq!(res.total_docs_indexed, 2);
-        assert_eq!(res.unique_uris, 2);
+        assert_eq!(res.total_ids_discovered, 3);
+        assert_eq!(res.exact_ids_indexed, 3);
+        assert_eq!(res.parent_docs, 3);
+        assert_eq!(res.child_docs, 1);
+        assert_eq!(res.total_docs_indexed, 4);
+        assert_eq!(res.unique_uris, 4);
         assert_eq!(res.archival_objects.exact_ids_indexed, 1);
         assert_eq!(res.resources.exact_ids_indexed, 1);
+        assert_eq!(res.digital_objects.exact_ids_indexed, 1);
+        assert_eq!(res.digital_objects.parent_docs, 1);
+        assert_eq!(res.digital_objects.child_docs, 1);
     }
 }

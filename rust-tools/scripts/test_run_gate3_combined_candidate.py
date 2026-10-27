@@ -106,6 +106,19 @@ class TestRunGate3CombinedCandidate(unittest.TestCase):
                 "parent_type": "resource",
                 "json": '{"processing_priority":"high"}',
             },
+            "/repositories/4/digital_objects/501": {
+                "id": "/repositories/4/digital_objects/501",
+                "uri": "/repositories/4/digital_objects/501",
+                "title": "DO 501",
+                "json": '{"title":"DO 501"}',
+            },
+            "/repositories/4/collection_management/2": {
+                "id": "/repositories/4/collection_management/2",
+                "uri": "/repositories/4/collection_management/2",
+                "parent_id": "/repositories/4/digital_objects/501",
+                "parent_type": "digital_object",
+                "json": '{"processing_priority":"medium"}',
+            },
         }
         native_docs = {
             "/repositories/4/resources/1": {
@@ -130,6 +143,21 @@ class TestRunGate3CombinedCandidate(unittest.TestCase):
                 "json": '{"processing_priority":"high"}',
                 "_version_": 67890,
             },
+            "/repositories/4/digital_objects/501": {
+                "id": "/repositories/4/digital_objects/501",
+                "uri": "/repositories/4/digital_objects/501",
+                "title": "DO 501",
+                "json": '{"title":"DO 501"}',
+                "_version_": 98765,
+            },
+            "/repositories/4/collection_management/2": {
+                "id": "/repositories/4/collection_management/2",
+                "uri": "/repositories/4/collection_management/2",
+                "parent_id": "/repositories/4/digital_objects/501",
+                "parent_type": "digital_object",
+                "json": '{"processing_priority":"medium"}',
+                "_version_": 87654,
+            },
         }
 
         res = harness.run_slice_parity_comparison(cand_docs, native_docs, [])
@@ -137,7 +165,7 @@ class TestRunGate3CombinedCandidate(unittest.TestCase):
         self.assertEqual(res["total_differences"], 0)
         self.assertEqual(res["candidate_marker_leaks_count"], 0)
         self.assertEqual(res["embedded_json_mismatches_count"], 0)
-        self.assertEqual(res["records_with_exact_equality"], 3)
+        self.assertEqual(res["records_with_exact_equality"], 5)
 
     def test_run_slice_parity_comparison_embedded_json_mismatch(self):
         cand_docs = {

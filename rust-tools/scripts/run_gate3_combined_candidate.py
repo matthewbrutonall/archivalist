@@ -7,7 +7,7 @@ Executes end-to-end Rust STAFF combined candidate indexing for isolated stack e6
   - Starts profiling Solr & backend if stopped (tracks for finally/atexit cleanup).
   - Verifies native reference core stage_staff_20261025_204522_55378_7bdd9fd1_native
     exists and has exactly 28,201 docs.
-  - Verifies repo 4 native combined slice (archival_objects + resources + collection_management children).
+  - Verifies repo 4 native combined slice (archival_objects + resources + digital_objects + collection_management children).
   - Creates a fresh, empty candidate core (stage_staff_<nonce>_candidate).
   - Runs CLI staff-combined-candidate using --state and exact isolated backend/Solr URLs.
   - Fetches every stored candidate document and compares against corresponding
@@ -879,7 +879,7 @@ def run_harness() -> int:
 
     # 13. Pre-fetch native reference documents for Repo 4 combined slice
     repo_scope = f"/repositories/{args.repo}"
-    native_fq = f'repository:"{repo_scope}" AND (primary_type:archival_object OR primary_type:resource OR (primary_type:collection_management AND parent_type:resource))'
+    native_fq = f'repository:"{repo_scope}" AND (primary_type:archival_object OR primary_type:resource OR primary_type:digital_object OR (primary_type:collection_management AND (parent_type:resource OR parent_type:digital_object)))'
     print(
         f"\nStreaming native reference combined slice docs from '{native_core}' (fq: {native_fq})...",
         flush=True,
@@ -907,13 +907,18 @@ def run_harness() -> int:
         for k, v in native_slice_docs_by_id.items()
         if v.get("primary_type") == "resource"
     ]
+    do_native_ids = [
+        k
+        for k, v in native_slice_docs_by_id.items()
+        if v.get("primary_type") == "digital_object"
+    ]
     cm_native_ids = [
         k
         for k, v in native_slice_docs_by_id.items()
         if v.get("primary_type") == "collection_management"
     ]
     print(
-        f"Native breakdown: {len(ao_native_ids)} archival objects, {len(resource_native_ids)} resources, {len(cm_native_ids)} collection_management children."
+        f"Native breakdown: {len(ao_native_ids)} archival objects, {len(resource_native_ids)} resources, {len(do_native_ids)} digital objects, {len(cm_native_ids)} collection_management children."
     )
 
     # 14. Create empty candidate core
@@ -1003,6 +1008,7 @@ def run_harness() -> int:
     print(f"  total_docs_indexed: {cand_summary.get('total_docs_indexed')}")
     print(f"  archival_objects: {cand_summary.get('archival_objects')}")
     print(f"  resources: {cand_summary.get('resources')}")
+    print(f"  digital_objects: {cand_summary.get('digital_objects')}")
     print(f"  committed: {cand_summary.get('committed')}")
     print(f"  success: {cand_summary.get('success')}")
 
