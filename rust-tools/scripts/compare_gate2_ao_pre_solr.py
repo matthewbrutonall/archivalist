@@ -767,7 +767,7 @@ def main():
         print("\n[STOP] Mismatches exist between native pre-Solr and Rust candidate pre-Solr documents.")
         print("STOPPING short of full 24,200 run per protocol.")
         report["stop_reason"] = "Sample comparison detected pre-Solr document field differences; stopped short of full run."
-        
+
         # Determine exact proposed fix based on top paths
         top_diff_paths = [p["path"] for p in sample_comparison["top_differing_paths"]]
         fix_proposals = []
