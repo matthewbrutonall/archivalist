@@ -16,6 +16,18 @@ import run_gate3_combined_candidate as harness
 
 
 class TestRunGate3CombinedCandidate(unittest.TestCase):
+    def test_mixed_type_coverage_requires_every_type_and_child_parent(self):
+        docs = {kind: {"primary_type": kind} for kind in harness.EXPECTED_STAFF_TYPES}
+        for parent in harness.EXPECTED_CHILD_PARENTS:
+            docs[f"child-{parent}"] = {"primary_type": "collection_management", "parent_type": parent}
+        types, parents = harness.mixed_type_counts(docs)
+        harness.require_mixed_type_coverage("native", types, parents)
+        del docs["job"]
+        del docs["child-accession"]
+        types, parents = harness.mixed_type_counts(docs)
+        with self.assertRaisesRegex(RuntimeError, "job"):
+            harness.require_mixed_type_coverage("native", types, parents)
+
     def test_canonical_json_key_and_strict_equality(self):
         self.assertTrue(harness.json_values_strictly_equal(1, 1))
         self.assertFalse(harness.json_values_strictly_equal(1, 1.0))
@@ -209,6 +221,7 @@ class TestRunGate3CombinedCandidate(unittest.TestCase):
                 mock_args.return_value = MagicMock(dry_run=True, state=harness.DEFAULT_STATE_FILE)
                 mock_args.return_value.full = False
                 mock_args.return_value.fresh_native = False
+                mock_args.return_value.require_mixed_types = False
                 mock_args.return_value.inject_failure_after = None
                 with patch("run_gate3_combined_candidate.subprocess.run") as mock_subproc:
                     mock_subproc.return_value = MagicMock(returncode=0, stdout="codex/gate3-full-staff\n")

@@ -6,9 +6,12 @@ use aspace_client::isolated_solr_writer::{
 use aspace_client::{
     build_index_document_batch, Client, IndexDocumentBatchRequest, IndexDocumentInput,
 };
-use serde::Serialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -38,6 +41,10 @@ pub struct StaffFullCandidateArgs {
     pub strip_markers: bool,
     #[arg(long)]
     pub json: bool,
+    #[arg(long)]
+    pub job_locale_file: Option<PathBuf>,
+    #[arg(long)]
+    pub job_time_zone: Option<String>,
     #[arg(long, hide = true)]
     pub fail_after_batches: Option<usize>,
 }
@@ -57,6 +64,14 @@ impl StaffFullCandidateArgs {
         }
         if self.fail_after_batches == Some(0) {
             bail!("fail_after_batches must be positive");
+        }
+        if self.job_time_zone.as_deref() == Some("") {
+            bail!("job_time_zone must not be empty");
+        }
+        if let Some(path) = &self.job_locale_file {
+            if !path.is_file() {
+                bail!("job locale file is missing or not a regular file");
+            }
         }
         Ok(())
     }
@@ -147,13 +162,14 @@ const TYPES: &[TypeSpec] = &[
         record_type: "container_profile",
         endpoint: "container_profiles",
         global_path: true,
-        first_repository_only: false,
+        // The API path is global: a full rebuild needs one final document per URI.
+        first_repository_only: true,
     },
     TypeSpec {
         record_type: "location_profile",
         endpoint: "location_profiles",
         global_path: true,
-        first_repository_only: false,
+        first_repository_only: true,
     },
     TypeSpec {
         record_type: "archival_object",
@@ -274,7 +290,67 @@ fn sanitize_native_index_record(record: &mut Value, record_type: &str) -> Result
             .context("agent record is not an object")?;
         obj.insert("agent_contacts".to_string(), Value::Array(Vec::new()));
     }
+    if record_type == "job" {
+        let obj = record
+            .as_object_mut()
+            .context("job record is not an object")?;
+        obj.entry("has_modified_records".to_string())
+            .or_insert(Value::Bool(false));
+    }
     Ok(())
+}
+
+fn clean_document_whitespace(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            let trimmed = text.trim_matches(|c: char| c.is_ascii_whitespace());
+            if trimmed.len() != text.len() {
+                *text = trimmed.to_string();
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(clean_document_whitespace),
+        Value::Object(fields) => fields.values_mut().for_each(clean_document_whitespace),
+        _ => {}
+    }
+}
+
+fn parse_accession_years(records: &[Value]) -> Result<Vec<i32>> {
+    let dates = records
+        .iter()
+        .map(|record| {
+            record
+                .get("accession_date")
+                .and_then(Value::as_str)
+                .context("accession missing string accession_date")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut child = Command::new("ruby")
+        .args([
+            "-rdate",
+            "-rjson",
+            "-e",
+            "STDOUT.write(JSON.generate(JSON.parse(STDIN.read).map { |date| Date.parse(date).year }))",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("cannot launch Ruby Date.parse for accession year parity")?;
+    child
+        .stdin
+        .take()
+        .context("Ruby date parser stdin unavailable")?
+        .write_all(&serde_json::to_vec(&dates)?)?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        bail!("Ruby Date.parse rejected an accession date");
+    }
+    let years: Vec<i32> = serde_json::from_slice(&output.stdout)
+        .context("invalid accession year response from Ruby Date.parse")?;
+    if years.len() != records.len() {
+        bail!("Ruby Date.parse returned the wrong number of accession years");
+    }
+    Ok(years)
 }
 
 fn extract_generic_documents(
@@ -361,6 +437,54 @@ struct FullBatchContext {
     batch_size: usize,
     dynamic_enums: Arc<Vec<String>>,
     arks_enabled: bool,
+    job_locale_file: Option<PathBuf>,
+    job_time_zone: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JobProjection {
+    title: String,
+    files: Vec<String>,
+    job_data: Vec<String>,
+    time_submitted: Option<String>,
+    time_started: Option<String>,
+    time_finished: Option<String>,
+}
+
+fn project_job_fields(
+    entries: &[(Value, Vec<Value>)],
+    locale_file: &PathBuf,
+    time_zone: &str,
+) -> Result<Vec<JobProjection>> {
+    let input = json!({"entries": entries.iter().map(|(record, files)| json!({"record":record,"output_files":files})).collect::<Vec<_>>()});
+    let mut child = Command::new("ruby")
+        .args([
+            "-e",
+            include_str!("../../../scripts/staff_job_projection.rb"),
+        ])
+        .arg(locale_file)
+        .env("TZ", time_zone)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("cannot launch Ruby job compatibility projection")?;
+    child
+        .stdin
+        .take()
+        .context("job projection stdin unavailable")?
+        .write_all(&serde_json::to_vec(&input)?)?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        bail!("Ruby job compatibility projection failed");
+    }
+    let projections: Vec<JobProjection> =
+        serde_json::from_slice(&output.stdout).context("invalid Ruby job projection response")?;
+    if projections.len() != entries.len() {
+        bail!("Ruby job projection returned the wrong number of records");
+    }
+    Ok(projections)
 }
 
 async fn fetch_and_build_batch(
@@ -375,6 +499,8 @@ async fn fetch_and_build_batch(
         batch_size,
         dynamic_enums,
         arks_enabled,
+        job_locale_file,
+        job_time_zone,
     } = ctx;
     match spec.record_type {
         "archival_object" => {
@@ -426,12 +552,83 @@ async fn fetch_and_build_batch(
         }
         _ => {}
     }
-    let records = client
+    let mut records = client
         .fetch_staff_records_by_ids_bounded_path(&spec.path(repo_id), &ids, batch_size)
         .await?;
+    let location_owner_codes = if spec.record_type == "location" {
+        let mut codes = Vec::with_capacity(records.len());
+        for record in &records {
+            let owner = record.get("owner_repo").and_then(Value::as_object);
+            if let Some(owner) = owner {
+                let owner_ref = owner
+                    .get("ref")
+                    .and_then(Value::as_str)
+                    .context("location owner missing ref")?;
+                let owner_id: u32 = owner_ref
+                    .strip_prefix("/repositories/")
+                    .context("invalid location owner URI")?
+                    .parse()?;
+                if owner_id == 0 {
+                    bail!("invalid location owner repository ID");
+                }
+                let response = client
+                    .get(&format!("repositories/{owner_id}"))?
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                let owner_record: Value = response.json().await?;
+                let code = owner_record
+                    .get("repo_code")
+                    .and_then(Value::as_str)
+                    .context("location owner repository missing code")?;
+                codes.push(Some(code.to_string()));
+            } else {
+                codes.push(None);
+            }
+        }
+        Some(codes)
+    } else {
+        None
+    };
+    let job_projections = if spec.record_type == "job" {
+        let locale_file = job_locale_file
+            .as_ref()
+            .context("--job-locale-file is required when indexing jobs")?;
+        let time_zone = job_time_zone
+            .as_deref()
+            .context("--job-time-zone is required when indexing jobs")?;
+        let mut entries = Vec::with_capacity(records.len());
+        for record in &mut records {
+            sanitize_native_index_record(record, "job")?;
+            let uri = record
+                .get("uri")
+                .and_then(Value::as_str)
+                .context("job missing URI")?;
+            let path = uri.strip_prefix('/').context("invalid job URI")?;
+            let response = client
+                .get(&format!("{path}/output_files"))?
+                .send()
+                .await?
+                .error_for_status()?;
+            let files: Vec<Value> = response.json().await?;
+            entries.push((record.clone(), files));
+        }
+        Some(project_job_fields(&entries, locale_file, time_zone)?)
+    } else {
+        None
+    };
+    let accession_years = if spec.record_type == "accession" {
+        parse_accession_years(&records)?
+            .into_iter()
+            .map(Some)
+            .collect()
+    } else {
+        vec![None; records.len()]
+    };
     let inputs = records
         .into_iter()
-        .map(|mut record| {
+        .zip(accession_years)
+        .map(|(mut record, accession_year): (Value, Option<i32>)| {
             sanitize_native_index_record(&mut record, spec.record_type)?;
             let uri = record
                 .get("uri")
@@ -450,11 +647,50 @@ async fn fetch_and_build_batch(
                 enrich: true,
                 dynamic_enum_fields: (*dynamic_enums).clone(),
                 arks_enabled,
+                parsed_accession_date_year: accession_year.map(|year| serde_json::json!(year)),
                 ..Default::default()
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let built = build_index_document_batch(IndexDocumentBatchRequest { records: inputs })?;
+    let mut built = build_index_document_batch(IndexDocumentBatchRequest { records: inputs })?;
+    if let Some(codes) = location_owner_codes {
+        if built.documents.len() != codes.len() {
+            bail!("location builder returned the wrong number of documents");
+        }
+        for (document, code) in built.documents.iter_mut().zip(codes) {
+            if let Some(code) = code {
+                let fields = document
+                    .as_object_mut()
+                    .context("location document is not an object")?;
+                fields.insert(
+                    "owner_repo_display_string_u_ssort".to_string(),
+                    Value::String(code),
+                );
+            }
+        }
+    }
+    if let Some(projections) = job_projections {
+        if built.documents.len() != projections.len() {
+            bail!("job builder returned the wrong number of documents");
+        }
+        for (document, projection) in built.documents.iter_mut().zip(projections) {
+            let fields = document
+                .as_object_mut()
+                .context("job document is not an object")?;
+            fields.insert("title".to_string(), Value::String(projection.title));
+            fields.insert("files".to_string(), json!(projection.files));
+            fields.insert("job_data".to_string(), json!(projection.job_data));
+            for (key, value) in [
+                ("time_submitted", projection.time_submitted),
+                ("time_started", projection.time_started),
+                ("time_finished", projection.time_finished),
+            ] {
+                if let Some(value) = value {
+                    fields.insert(key.to_string(), Value::String(value));
+                }
+            }
+        }
+    }
     extract_generic_documents(built.documents, spec, repo_id)
 }
 
@@ -520,6 +756,7 @@ pub async fn execute_staff_full_candidate(
         }
         repo_obj.retain(|key, _| !key.starts_with("_archivalist_"));
         append_native_pui_types(&mut repo_doc, "repository")?;
+        clean_document_whitespace(&mut repo_doc);
         if !global_unique_uris.insert(repo_uri) {
             bail!("duplicate repository document");
         }
@@ -537,9 +774,6 @@ pub async fn execute_staff_full_candidate(
                 .staff_record_ids_by_path(&path, 0)
                 .await
                 .with_context(|| format!("ID list for {path}"))?;
-            if spec.global_path && repo_index > 0 && !ids.is_empty() {
-                bail!("repeated global profile writes across repositories are not yet supported: {path}");
-            }
             if check_duplicate_ids(&ids) {
                 bail!("duplicate ID in {path}");
             }
@@ -551,6 +785,8 @@ pub async fn execute_staff_full_candidate(
                 batch_size: args.batch_size,
                 dynamic_enums: Arc::clone(&dynamic_enums),
                 arks_enabled: args.arks_enabled,
+                job_locale_file: args.job_locale_file.clone(),
+                job_time_zone: args.job_time_zone.clone(),
             };
             let mut shared = SharedCandidateState {
                 writer: &mut writer,
@@ -562,22 +798,26 @@ pub async fn execute_staff_full_candidate(
                 concurrency: args.concurrency,
                 fail_after_batches: args.fail_after_batches,
             };
-            let (slice, _) =
-                process_type_candidate_batches(
-                    spec.record_type,
-                    &expected_prefix,
-                    &ids,
-                    batches,
-                    &mut shared,
-                    move |batch_index, chunk| {
-                        let client = client_for_batch.clone();
-                        let ctx = batch_context.clone();
-                        async move {
-                            fetch_and_build_batch(client, *spec, chunk, batch_index, ctx).await
+            let (slice, _) = process_type_candidate_batches(
+                spec.record_type,
+                &expected_prefix,
+                &ids,
+                batches,
+                &mut shared,
+                move |batch_index, chunk| {
+                    let client = client_for_batch.clone();
+                    let ctx = batch_context.clone();
+                    async move {
+                        let mut output =
+                            fetch_and_build_batch(client, *spec, chunk, batch_index, ctx).await?;
+                        for document in &mut output.ordered_documents {
+                            clean_document_whitespace(document);
                         }
-                    },
-                )
-                .await;
+                        Ok(output)
+                    }
+                },
+            )
+            .await;
             total_ids += ids.len();
             total_documents += slice.total_docs;
             let failed = slice.batches_failed > 0
@@ -648,6 +888,22 @@ mod tests {
         assert_eq!(TYPES.last().unwrap().record_type, "job");
         assert_eq!(TYPES[3].path(4), "agents/people");
         assert_eq!(TYPES[14].path(4), "repositories/4/archival_objects");
+        assert!(TYPES[12].first_repository_only);
+        assert!(TYPES[13].first_repository_only);
+    }
+
+    #[test]
+    fn accession_years_follow_ruby_date_parse() {
+        let records = vec![
+            json!({"accession_date":"2026-01-01"}),
+            json!({"accession_date":"2026-2-03"}),
+            json!({"accession_date":"9999-12-31"}),
+        ];
+        assert_eq!(
+            parse_accession_years(&records).unwrap(),
+            vec![2026, 2026, 9999]
+        );
+        assert!(parse_accession_years(&[json!({"accession_date":"invalid"})]).is_err());
     }
 
     #[test]
@@ -679,6 +935,20 @@ mod tests {
         let mut resource = json!({"jsonmodel_type":"resource","agent_contacts":[{"name":"kept"}]});
         sanitize_native_index_record(&mut resource, "resource").unwrap();
         assert_eq!(resource["agent_contacts"], json!([{"name":"kept"}]));
+        let mut job = json!({"jsonmodel_type":"job"});
+        sanitize_native_index_record(&mut job, "job").unwrap();
+        assert_eq!(job["has_modified_records"], false);
+    }
+
+    #[test]
+    fn final_document_whitespace_matches_native_cleanup() {
+        let mut document =
+            json!({"identifier_sort":"G  ","dates":["2026 - "],"nested":{"text":"  value  "}});
+        clean_document_whitespace(&mut document);
+        assert_eq!(
+            document,
+            json!({"identifier_sort":"G","dates":["2026 -"],"nested":{"text":"value"}})
+        );
     }
 
     #[test]

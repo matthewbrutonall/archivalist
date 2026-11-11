@@ -470,9 +470,9 @@ Scripts under `scripts/` are code-only harnesses:
   parent and child documents, validates exact child identity and structural envelope invariants offline, and streams
   documents to a disposable candidate stage core (`stage_staff_<nonce>_candidate`). Live type-strict stored-document
   parity (including byte-for-byte embedded JSON equality) against native reference cores is independently established
-  and measured for parent resource documents by dedicated stage comparison harnesses (`rust-tools/scripts/run_gate3_resource_candidate.py`),
-  distinguishing offline structural verification from live native parent parity (the current live profiling dataset contains 0
-  `collection_management` child records, so live child parity remains unexercised in live data).
+  and measured for parent resource documents by dedicated stage comparison harnesses (`rust-tools/scripts/run_gate3_resource_candidate.py`).
+  Those earlier slice runs had no `collection_management` children; the later mixed full-STAFF fixture covers
+  resource, digital-object, and accession children.
   **Safety Guard:** Requires `--state <path_to_profiling_stack_state.json>` on every invocation. Runs
   `rust-tools/scripts/profiling_stack.py verify` via subprocess argument arrays before any Solr write or core readiness check,
   failing closed if verification fails, state is missing, the repository verifier is absent, endpoints/labels mismatch,
@@ -482,7 +482,7 @@ Scripts under `scripts/` are code-only harnesses:
   deletes, checkpointing, production indexing, or full-STAFF speed claims.
 - `staff-combined-candidate` (`aspace-cli` subcommand, alias `staff-candidate`): Full-repository STAFF composite candidate
   pipeline combining `archival_objects` and `resources` (including synthetic `collection_management` child document support;
-  current live dataset contains 0 child records, so live child parity remains unexercised in live data)
+  the earlier combined-slice run had no child records)
   under a single verified isolated writer and atomic hard commit. Discovers repository-scoped IDs for both types using
   native full-reindex contracts (`all_ids=true`, `modified_since=0`), hydrates bounded `id_set` batches with
   `IndexerCommonConfig.resolved_attributes`, prepares documents via `build_index_document_batch` with dynamic enum
@@ -499,6 +499,19 @@ Scripts under `scripts/` are code-only harnesses:
   unique URIs, timings, committed status).
   **Scope caveat:** This is an isolated bounded candidate vertical slice; fresh-core full rebuild only. No incremental
   deletes, checkpointing, production indexing, or full-STAFF speed claims.
+- `staff-full-candidate` (`aspace-cli` subcommand): Isolated full STAFF rebuild over the native 19-type order,
+  all repositories and global authorities. It uses a single verified stage core and writer, checks exact IDs and
+  URIs, strips private markers, and hard-commits only after all batches succeed. Global container/location
+  profiles are built once per URI in this full-rebuild candidate. The `--job-locale-file` and `--job-time-zone`
+  inputs are required when jobs exist; job titles, timestamps, output files and job data use the API plus a
+  small bundled Ruby compatibility projection. Accession years use Ruby `Date.parse` to preserve the native
+  parser's broader accepted syntax. This is not yet a pure-Rust implementation or a production switch.
+  `run_gate3_combined_candidate.py --full --fresh-native --require-mixed-types --concurrency 8` compares every
+  stored field and embedded JSON string against a fresh native STAFF core on the same disposable stack, and
+  requires all 19 types plus collection-management children for all three parent kinds. The fixture creator
+  `seed_gate3_mixed_records.py` requires stack identity verification and records each created URI in a private
+  mode-0600 manifest. The harness retains every core and does not promote a candidate. Incremental updates,
+  arbitrary plugin hooks, alternate locales/timezones, and release deployment remain outside this gate.
 - `staff-ao-builder` (`aspace-cli` subcommand): Targeted STAFF archival-object builder for single or
   batch document inspection and stage core testing.
   - Preview mode (default, no `--solr-url` / `--candidate-core`): outputs documents to stdout or `--output`,

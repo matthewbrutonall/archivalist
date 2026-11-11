@@ -50,6 +50,28 @@ EXPECTED_STACK_ID = "e62875f1"
 EXPECTED_BRANCH = "codex/gate3-full-staff"
 EXPECTED_TOTAL_NATIVE_DOCS = 28201
 MIN_MEMORY_HEADROOM_GIB = 24.0
+EXPECTED_STAFF_TYPES = {
+    "resource", "digital_object", "accession", "agent_person", "agent_software",
+    "agent_family", "agent_corporate_entity", "subject", "location", "event",
+    "top_container", "classification", "container_profile", "location_profile",
+    "archival_object", "digital_object_component", "classification_term",
+    "assessment", "job",
+}
+EXPECTED_CHILD_PARENTS = {"resource", "digital_object", "accession"}
+
+
+def mixed_type_counts(documents):
+    types = Counter(doc.get("primary_type") or "<missing>" for doc in documents.values())
+    parents = Counter(doc.get("parent_type") or "<missing>" for doc in documents.values()
+                      if doc.get("primary_type") == "collection_management")
+    return types, parents
+
+
+def require_mixed_type_coverage(label, types, parents):
+    missing_types = EXPECTED_STAFF_TYPES - {kind for kind, count in types.items() if count > 0}
+    missing_parents = EXPECTED_CHILD_PARENTS - {kind for kind, count in parents.items() if count > 0}
+    if missing_types or missing_parents:
+        raise RuntimeError(f"{label} core lacks required mixed coverage: types={sorted(missing_types)}, child parents={sorted(missing_parents)}")
 
 SOLR_CONTAINER = f"archivalist-profiling-solr-{EXPECTED_STACK_ID}"
 BACKEND_CONTAINER = f"archivalist-profiling-backend-{EXPECTED_STACK_ID}"
@@ -456,6 +478,11 @@ def verify_binary_provenance(cli_bin: str) -> Dict[str, Any]:
                     if fmtime > newest_src_mtime:
                         newest_src_mtime = fmtime
                         newest_src_file = fpath
+    helper = os.path.join(REPO_ROOT, "rust-tools", "scripts", "staff_job_projection.rb")
+    helper_mtime = os.path.getmtime(helper)
+    if helper_mtime > newest_src_mtime:
+        newest_src_mtime = helper_mtime
+        newest_src_file = helper
 
     if bin_mtime < newest_src_mtime:
         raise RuntimeError(
@@ -664,6 +691,11 @@ def parse_args():
         help="After a full candidate pass, run a same-state native STAFF round in a fresh isolated core",
     )
     parser.add_argument(
+        "--require-mixed-types",
+        action="store_true",
+        help="Require all 19 STAFF types and all collection-management parent kinds in both cores",
+    )
+    parser.add_argument(
         "--concurrency",
         type=int,
         default=4,
@@ -683,6 +715,8 @@ def run_harness() -> int:
     args = parse_args()
     if args.fresh_native and not args.full:
         raise ValueError("--fresh-native requires --full")
+    if args.require_mixed_types and not (args.full and args.fresh_native):
+        raise ValueError("--require-mixed-types requires --full --fresh-native")
     if args.inject_failure_after is not None and (
         not args.full or not args.fresh_native or args.inject_failure_after < 1
     ):
@@ -813,43 +847,44 @@ def run_harness() -> int:
         )
     print("Isolated profiling Solr is ready.", flush=True)
 
-    # 9. Verify native reference core exists and has exactly EXPECTED_TOTAL_NATIVE_DOCS (28,201) documents
+    # 9. Fixed-reference mode requires the saved native core; fresh-native mode creates its own.
     native_core = args.native_core
-    status_req = urllib.request.urlopen(
+    if not args.fresh_native:
+        status_req = urllib.request.urlopen(
         f"{solr_host_url}/admin/cores?action=STATUS&core={native_core}&wt=json",
         timeout=10,
-    )
-    status_data = json.loads(status_req.read().decode())
-    native_core_info = status_data.get("status", {}).get(native_core)
-    if not native_core_info:
-        raise RuntimeError(
-            f"Native reference core '{native_core}' does not exist in isolated Solr {solr_host_url}"
         )
+        status_data = json.loads(status_req.read().decode())
+        native_core_info = status_data.get("status", {}).get(native_core)
+        if not native_core_info:
+            raise RuntimeError(
+                f"Native reference core '{native_core}' does not exist in isolated Solr {solr_host_url}"
+            )
 
-    native_select_url = f"{solr_host_url}/{native_core}/select?q=*:*&rows=0&wt=json"
-    native_num_found = -1
-    for attempt in range(60):
-        try:
-            with urllib.request.urlopen(native_select_url, timeout=5) as resp:
-                data = json.loads(resp.read().decode())
-                native_num_found = data.get("response", {}).get("numFound", -1)
-                if native_num_found >= 0:
-                    break
-        except urllib.error.HTTPError as e:
-            if e.code == 503:
+        native_select_url = f"{solr_host_url}/{native_core}/select?q=*:*&rows=0&wt=json"
+        native_num_found = -1
+        for attempt in range(60):
+            try:
+                with urllib.request.urlopen(native_select_url, timeout=5) as resp:
+                    data = json.loads(resp.read().decode())
+                    native_num_found = data.get("response", {}).get("numFound", -1)
+                    if native_num_found >= 0:
+                        break
+            except urllib.error.HTTPError as e:
+                if e.code == 503:
+                    time.sleep(1)
+                    continue
+                raise
+            except Exception:
                 time.sleep(1)
-                continue
-            raise
-        except Exception:
-            time.sleep(1)
 
-    if native_num_found != EXPECTED_TOTAL_NATIVE_DOCS:
-        raise RuntimeError(
-            f"Native reference core '{native_core}' contains {native_num_found} docs; expected exactly {EXPECTED_TOTAL_NATIVE_DOCS}"
+        if native_num_found != EXPECTED_TOTAL_NATIVE_DOCS:
+            raise RuntimeError(
+                f"Native reference core '{native_core}' contains {native_num_found} docs; expected exactly {EXPECTED_TOTAL_NATIVE_DOCS}"
+            )
+        print(
+            f"Native reference core '{native_core}' verified present with exactly {native_num_found} documents."
         )
-    print(
-        f"Native reference core '{native_core}' verified present with exactly {native_num_found} documents."
-    )
 
     # 10. Start profiling backend if stopped (track for cleanup)
     backend_host_url = state["backend_host_url"].rstrip("/")
@@ -905,55 +940,41 @@ def run_harness() -> int:
             "Failed to extract arks_enabled boolean from live /system/info"
         )
     print(f"Live active backend verified: arks_enabled={active_arks} (mode: {v_mode})")
+    job_time_zone = None
+    if args.full:
+        zone_result = subprocess.run(
+            ["docker", "exec", state["app_container"], "date", "+%Z"],
+            capture_output=True, text=True, check=True,
+        )
+        job_time_zone = zone_result.stdout.strip()
+        if job_time_zone != "UTC":
+            raise RuntimeError("full STAFF job parity currently requires the JRuby runner timezone to be UTC")
 
-    # 13. Pre-fetch native reference documents for Repo 4 combined slice
+    # 13. Pre-fetch only when comparing with the fixed native reference.
     repo_scope = f"/repositories/{args.repo}"
     native_fq = None if args.full else f'repository:"{repo_scope}" AND (primary_type:archival_object OR primary_type:resource OR primary_type:digital_object OR primary_type:top_container OR (primary_type:collection_management AND (parent_type:resource OR parent_type:digital_object)))'
-    print(
+    native_slice_docs_by_id = {}
+    native_marker_leaks = []
+    if not args.fresh_native:
+        print(
         f"\nStreaming native reference combined slice docs from '{native_core}' (fq: {native_fq})...",
         flush=True,
-    )
-    t_native_fetch_start = time.perf_counter()
-    native_slice_docs_by_id, native_marker_leaks = stream_fetch_solr_core_documents(
-        solr_host_url,
-        native_core,
-        fq=native_fq,
-        batch_size=1000,
-    )
-    t_native_fetch_elapsed = time.perf_counter() - t_native_fetch_start
-    print(
+        )
+        t_native_fetch_start = time.perf_counter()
+        native_slice_docs_by_id, native_marker_leaks = stream_fetch_solr_core_documents(
+            solr_host_url,
+            native_core,
+            fq=native_fq,
+            batch_size=1000,
+        )
+        t_native_fetch_elapsed = time.perf_counter() - t_native_fetch_start
+        print(
         f"Fetched {len(native_slice_docs_by_id)} native combined slice documents in {t_native_fetch_elapsed:.2f}s "
         f"(native marker leaks: {len(native_marker_leaks)})."
-    )
+        )
 
-    ao_native_ids = [
-        k
-        for k, v in native_slice_docs_by_id.items()
-        if v.get("primary_type") == "archival_object"
-    ]
-    resource_native_ids = [
-        k
-        for k, v in native_slice_docs_by_id.items()
-        if v.get("primary_type") == "resource"
-    ]
-    do_native_ids = [
-        k
-        for k, v in native_slice_docs_by_id.items()
-        if v.get("primary_type") == "digital_object"
-    ]
-    tc_native_ids = [
-        k
-        for k, v in native_slice_docs_by_id.items()
-        if v.get("primary_type") == "top_container"
-    ]
-    cm_native_ids = [
-        k
-        for k, v in native_slice_docs_by_id.items()
-        if v.get("primary_type") == "collection_management"
-    ]
-    print(
-        f"Native breakdown: {len(ao_native_ids)} archival objects, {len(resource_native_ids)} resources, {len(do_native_ids)} digital objects, {len(tc_native_ids)} top containers, {len(cm_native_ids)} collection_management children."
-    )
+    if not args.fresh_native:
+        print(f"Native type counts: {dict(sorted(mixed_type_counts(native_slice_docs_by_id)[0].items()))}")
 
     # 14. Create empty candidate core
     run_nonce = f"{time.strftime('%Y%m%d_%H%M%S', time.gmtime())}_{os.getpid()}_{secrets.token_hex(4)}"
@@ -997,12 +1018,16 @@ def run_harness() -> int:
 
     # 15. Execute aspace-cli staff-combined-candidate
     if args.full:
+        job_locale_file = os.path.join(REPO_ROOT, "common", "locales", "en.yml")
+        with open(job_locale_file, "rb") as locale_source:
+            job_locale_sha256 = hashlib.sha256(locale_source.read()).hexdigest()
         cli_cmd = [
             cli_bin, "--url", backend_host_url, "--user", state["admin_user"],
             "staff-full-candidate", "--state", args.state, "--batch-size", "25",
             "--concurrency", str(args.concurrency), "--solr-url", solr_host_url,
             "--candidate-core", cand_core, "--arks-enabled", str(bool(active_arks)).lower(),
-            "--strip-markers", "true", "--json",
+            "--strip-markers", "true", "--job-locale-file", job_locale_file,
+            "--job-time-zone", job_time_zone, "--json",
         ]
         if args.inject_failure_after is not None:
             cli_cmd.extend(["--fail-after-batches", str(args.inject_failure_after)])
@@ -1094,15 +1119,16 @@ def run_harness() -> int:
         with open(report_path) as report_file:
             fresh_native_report = json.load(report_file)
         results = fresh_native_report.get("results", [])
-        if len(results) != 1 or results[0].get("mode") != "staff" or results[0].get("solr_doc_count") != EXPECTED_TOTAL_NATIVE_DOCS:
+        if len(results) != 1 or results[0].get("mode") != "staff" or not isinstance(results[0].get("solr_doc_count"), int) or results[0]["solr_doc_count"] < 1:
             raise RuntimeError("native STAFF report has unexpected mode or document count")
         native_core = results[0]["core"]
         print(f"Same-state native core: {native_core}; wall {results[0]['wall_ms']} ms", flush=True)
         native_slice_docs_by_id, native_marker_leaks = stream_fetch_solr_core_documents(
             solr_host_url, native_core, fq=None, batch_size=1000,
         )
-        if len(native_slice_docs_by_id) != EXPECTED_TOTAL_NATIVE_DOCS or native_marker_leaks:
+        if len(native_slice_docs_by_id) != results[0]["solr_doc_count"] or native_marker_leaks:
             raise RuntimeError("fresh native core has incorrect count or marker leaks")
+        print(f"Fresh native type counts: {dict(sorted(mixed_type_counts(native_slice_docs_by_id)[0].items()))}")
 
     # 16. Verify candidate core document count directly from Solr
     cand_select_url = f"{solr_host_url}/{cand_core}/select?q=*:*&rows=0&wt=json"
@@ -1112,7 +1138,7 @@ def run_harness() -> int:
     print(f"Solr candidate core numFound: {solr_num_found}")
 
     if injected_failure:
-        if solr_num_found >= EXPECTED_TOTAL_NATIVE_DOCS:
+        if solr_num_found >= len(native_slice_docs_by_id):
             raise RuntimeError("failed candidate unexpectedly reached full native document count")
         report = {
             "git_head": git_head,
@@ -1145,6 +1171,14 @@ def run_harness() -> int:
     print(
         f"Fetched {len(cand_docs_by_id)} candidate documents (marker leaks: {len(cand_marker_leaks)})."
     )
+    native_type_counts, native_child_parents = mixed_type_counts(native_slice_docs_by_id)
+    candidate_type_counts, candidate_child_parents = mixed_type_counts(cand_docs_by_id)
+    if args.require_mixed_types:
+        for label, types, parents in [
+            ("native", native_type_counts, native_child_parents),
+            ("candidate", candidate_type_counts, candidate_child_parents),
+        ]:
+            require_mixed_type_coverage(label, types, parents)
 
     # 18. Parity comparison against native reference documents
     print(
@@ -1190,6 +1224,8 @@ def run_harness() -> int:
         "git_head": git_head,
         "git_dirty": is_dirty,
         "binary_provenance": provenance,
+        "job_locale_sha256": job_locale_sha256 if args.full else None,
+        "job_time_zone": job_time_zone,
         "stack_id": EXPECTED_STACK_ID,
         "repo_id": args.repo,
         "native_core": native_core,
@@ -1198,6 +1234,11 @@ def run_harness() -> int:
         "active_arks_enabled": active_arks,
         "cli_summary": cand_summary,
         "solr_verified_docs": solr_num_found,
+        "native_type_counts": dict(sorted(native_type_counts.items())),
+        "candidate_type_counts": dict(sorted(candidate_type_counts.items())),
+        "native_child_parent_counts": dict(sorted(native_child_parents.items())),
+        "candidate_child_parent_counts": dict(sorted(candidate_child_parents.items())),
+        "mixed_type_coverage_required": args.require_mixed_types,
         "parity_result": parity_result,
     }
     report_filename = f"gate3_{'full' if args.full else 'combined_slice'}_parity_{run_nonce}.json"
