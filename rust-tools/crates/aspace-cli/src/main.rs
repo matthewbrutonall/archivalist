@@ -10,6 +10,7 @@ use serde::Serialize;
 use std::{collections::BTreeMap, io};
 
 pub mod profiling_stack;
+pub mod pui_tree_spike;
 pub mod shadow;
 pub mod staff_ao_builder;
 pub mod staff_ao_candidate;
@@ -323,6 +324,8 @@ enum Commands {
     StaffCombinedCandidate(staff_combined_candidate::StaffCombinedCandidateArgs),
     #[command(name = "staff-full-candidate")]
     StaffFullCandidate(staff_full_candidate::StaffFullCandidateArgs),
+    #[command(name = "pui-tree-spike")]
+    PuiTreeSpike(pui_tree_spike::PuiTreeSpikeArgs),
     #[command(name = "staff-ao-builder")]
     StaffAoBuilder(staff_ao_builder::StaffAoBuilderArgs),
     #[command(name = "build-index-document")]
@@ -1172,6 +1175,9 @@ async fn main() -> Result<()> {
         }
         Commands::StaffFullCandidate(args) => {
             staff_full_candidate::run_staff_full_candidate(&client, args).await?;
+        }
+        Commands::PuiTreeSpike(args) => {
+            pui_tree_spike::run_pui_tree_spike(&client, args).await?;
         }
         Commands::BuildIndexDocument(_) => {
             unreachable!("build-index-document returns before API login")
