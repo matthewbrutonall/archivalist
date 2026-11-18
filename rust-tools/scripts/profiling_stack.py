@@ -205,7 +205,7 @@ def load_state(path):
 
 
 def setup(args):
-    if existing_stacks():
+    if existing_stacks() and not args.parallel:
         raise StackError(f"profiling stack containers already exist: {existing_stacks()}; tear it down first")
     for port in (args.backend_port, args.solr_port):
         if not port_free(port):
@@ -213,6 +213,8 @@ def setup(args):
     app = app_container_details(args.app_container)
     stack_id = secrets.token_hex(4)
     names = {role: f"{alias}-{stack_id}" for role, alias in ALIASES.items()}
+    aliases = {role: (f"{alias}-{stack_id}" if args.parallel else alias)
+               for role, alias in ALIASES.items()}
     volumes = {role: f"archivalist-profiling-{role}-{stack_id}" for role in ("db", "build", "data")}
     volume = volumes["db"]
     db_root_password = secrets.token_hex(16)
@@ -222,23 +224,23 @@ def setup(args):
 
     docker("volume", "create", "--label", f"{LABEL}={stack_id}", volume)
     docker("run", "-d", "--name", names["db"], *labels, "--label", f"{ROLE_LABEL}=db",
-           "--network", app["network"], "--network-alias", ALIASES["db"],
+           "--network", app["network"], "--network-alias", aliases["db"],
            "-e", f"MYSQL_ROOT_PASSWORD={db_root_password}", "-e", "MYSQL_DATABASE=archivesspace",
            "-e", "MYSQL_USER=as", "-e", f"MYSQL_PASSWORD={db_password}",
            "--mount", f"type=volume,src={volume},dst=/var/lib/mysql",
            args.mysql_image, "--log-bin-trust-function-creators=1",
            "--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci")
     docker("run", "-d", "--name", names["solr"], *labels, "--label", f"{ROLE_LABEL}=solr",
-           "--network", app["network"], "--network-alias", ALIASES["solr"],
+           "--network", app["network"], "--network-alias", aliases["solr"],
            "-p", f"127.0.0.1:{args.solr_port}:8983", "-e", "SOLR_MODULES=analysis-extras", args.solr_image)
 
     state = {"stack_id": stack_id, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
              "app_container": args.app_container, "network": app["network"], "image": app["image"],
-             "containers": names, "db_volume": volume, "volumes": volumes, "db_root_password": db_root_password,
+             "containers": names, "aliases": aliases, "db_volume": volume, "volumes": volumes, "db_root_password": db_root_password,
              "backend_host_url": f"http://127.0.0.1:{args.backend_port}",
-             "backend_network_url": f"http://{ALIASES['backend']}:4567",
+             "backend_network_url": f"http://{aliases['backend']}:4567",
              "solr_host_url": f"http://127.0.0.1:{args.solr_port}/solr",
-             "solr_network_url": f"http://{ALIASES['solr']}:8983/solr",
+             "solr_network_url": f"http://{aliases['solr']}:8983/solr",
              "identity_core": f"archivalist_profiling_identity_{stack_id}",
              "admin_user": "admin", "admin_password": "admin"}
 
@@ -276,10 +278,10 @@ def setup(args):
         docker("rm", "-f", seed, check=False)
     print(f"Seeded build volume {volumes['build']} from the app's build directory (read-only)", flush=True)
 
-    db_url = (f"jdbc:mysql://{ALIASES['db']}:3306/archivesspace?useUnicode=true&characterEncoding=UTF-8"
+    db_url = (f"jdbc:mysql://{aliases['db']}:3306/archivesspace?useUnicode=true&characterEncoding=UTF-8"
               f"&user=as&password={db_password}&useSSL=false&allowPublicKeyRetrieval=true")
     docker("create", "--name", names["backend"], *labels, "--label", f"{ROLE_LABEL}=backend",
-           "--network", app["network"], "--network-alias", ALIASES["backend"],
+           "--network", app["network"], "--network-alias", aliases["backend"],
            "-p", f"127.0.0.1:{args.backend_port}:4567",
            "--mount", mount_spec(app["source_mount"], "/archivesspace", readonly=True),
            "--mount", f"type=volume,src={volumes['build']},dst=/archivesspace/build",
@@ -416,6 +418,7 @@ def main(argv=None):
     p.add_argument("--app-container", default="archivesspaceai-app-1")
     p.add_argument("--backend-port", type=int, default=14567)
     p.add_argument("--solr-port", type=int, default=18983)
+    p.add_argument("--parallel", action="store_true", help="create a second stack with unique network aliases")
     p.add_argument("--mysql-image", default="mysql:8")
     p.add_argument("--solr-image", default="solr:9.4.1")
     p.add_argument("--backend-timeout", type=int, default=1200)

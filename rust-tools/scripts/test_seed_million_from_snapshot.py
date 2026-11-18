@@ -31,6 +31,35 @@ class MillionSeedTest(unittest.TestCase):
         self.assertLess(result["sample_batch_records"], seed.MAX_BATCH_RECORDS)
         self.assertLess(result["sample_batch_bytes"], seed.MAX_BATCH_BYTES)
 
+    def test_fictional_trees_keep_equal_counts_but_vary_shape_and_publication(self):
+        self.assertEqual({seed.items_total(cfg) for cfg in seed.FICTIONAL_TREES}, {2010})
+        subjects = [f"/subjects/{i}" for i in range(1, 151)]
+        agents = [f"/agents/people/{i}" for i in range(1, 151)]
+        batches = [seed.fictional_batch(i, "/repositories/9", 20261118, subjects, agents)
+                   for i in range(4)]
+        for batch in batches:
+            self.assertEqual(sum(row["jsonmodel_type"] == "archival_object" for row in batch), 2010)
+            self.assertTrue(any(row.get("publish") is False for row in batch))
+            self.assertTrue(any(row.get("level") == "item" and row.get("dates") for row in batch))
+        self.assertEqual([sum(row.get("level") == "series" for row in batch) for batch in batches],
+                         [10, 10, 10, 30])
+
+    def test_fictional_bootstrap_summary_must_match_real_seed_counts(self):
+        directory = tempfile.mkdtemp(prefix="fictional-seed-summary-")
+        path = os.path.join(directory, "summary.json")
+        config = dict(seed.TREE)
+        summary = {"repo_code": "SEED-123456", "repo_id": 8, "repository_uri": "/repositories/8",
+                   "config": config, "totals": {"archival_objects": 2010},
+                   "subjects": 150, "agents": 150}
+        with open(path, "w") as out:
+            json.dump(summary, out)
+        self.assertEqual(seed.load_fictional_bootstrap(path)["baseline_ao_count"], 2010)
+        summary["totals"]["archival_objects"] = 2009
+        with open(path, "w") as out:
+            json.dump(summary, out)
+        with self.assertRaisesRegex(ValueError, "AO count mismatch"):
+            seed.load_fictional_bootstrap(path)
+
     def test_plan_only_does_not_access_stack_or_database(self):
         output = io.StringIO()
         with patch.object(seed, "load_profiling_stack", side_effect=AssertionError("network used")):
