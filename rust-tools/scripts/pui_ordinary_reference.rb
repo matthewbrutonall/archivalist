@@ -25,7 +25,7 @@ raise 'output must be under benchmarks' unless File.dirname(output) == benchmark
 raise 'invalid output file name' unless File.basename(output).match?(/\Apui_(?:ordinary|full)_reference_[A-Za-z0-9_]+\.json\z/)
 raise 'output exists' if File.exist?(output)
 mode = ENV.fetch('AUXILIARY_MODE', 'none')
-raise 'invalid auxiliary mode' unless %w[none native candidate].include?(mode)
+raise 'invalid auxiliary mode' unless %w[none native candidate candidate_parallel].include?(mode)
 
 $LOAD_PATH.unshift('/archivesspace/common')
 $LOAD_PATH.unshift('/archivesspace/indexer')
@@ -77,7 +77,47 @@ indexer.define_singleton_method(:index_batch) do |batch, _timing = nil, _opts = 
   batch.destroy
 end
 
+def add_native_auxiliary(indexer, resource_uri, documents)
+  indexer.send(:add_infscroll_docs, [resource_uri], documents)
+  tree = LargeTreeDocIndexer.new(documents)
+  tree.add_largetree_docs([resource_uri])
+  tree.deletes
+end
+
 started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+rust_job = nil
+rust_started = nil
+rust_process_elapsed = nil
+rust_internal_seconds = nil
+fallback_used = false
+fallback_reason = nil
+if %w[candidate candidate_parallel].include?(mode)
+  rust_output = File.expand_path(ENV.fetch('RUST_AUXILIARY_OUTPUT_FILE'))
+  raise 'Rust output must be under benchmarks' unless File.dirname(rust_output) == benchmarks
+  raise 'invalid Rust output name' unless File.basename(rust_output).match?(/\Apui_tree_rust_[A-Za-z0-9_]+\.json\z/)
+  raise 'Rust output exists' if File.exist?(rust_output)
+  rust_env = {
+    'ASPACE_URL' => backend,
+    'ASPACE_USER' => ENV.fetch('ASPACE_ADMIN_USER'),
+    'ASPACE_PASSWORD' => ENV.fetch('ASPACE_ADMIN_PASSWORD')
+  }
+  rust_args = ['/archivesspace/rust-tools/target/release/aspace-cli', 'pui-tree-spike',
+               '--resource-uri', resource_uri, '--output', rust_output]
+  rust_args = ['/bin/false'] if mode == 'candidate_parallel' && ENV['RUST_SPIKE_INJECT_FAILURE'] == '1'
+  if mode == 'candidate_parallel'
+    rust_started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    rust_job = Open3.popen3(rust_env, *rust_args)
+    rust_job[0].close
+    at_exit do
+      next unless rust_job[3].alive?
+      begin
+        Process.kill('TERM', rust_job[3].pid)
+      rescue Errno::ESRCH
+      end
+      rust_job[3].join(2)
+    end
+  end
+end
 resource_id = resource_uri.split('/').last.to_i
 resource_diagnostic = {}
 ([[:resource, [resource_id]]] + ao_ids.each_slice(100).map { |slice| [:archival_object, slice] }).each do |type, ids|
@@ -105,37 +145,52 @@ ordinary_done = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 ordinary_count = documents.length
 delete_candidates = []
 if mode == 'native'
-  indexer.send(:add_infscroll_docs, [resource_uri], documents)
-  tree = LargeTreeDocIndexer.new(documents)
-  tree.add_largetree_docs([resource_uri])
-  delete_candidates = tree.deletes
-elsif mode == 'candidate'
-  rust_output = File.expand_path(ENV.fetch('RUST_AUXILIARY_OUTPUT_FILE'))
-  raise 'Rust output must be under benchmarks' unless File.dirname(rust_output) == benchmarks
-  raise 'invalid Rust output name' unless File.basename(rust_output).match?(/\Apui_tree_rust_[A-Za-z0-9_]+\.json\z/)
-  raise 'Rust output exists' if File.exist?(rust_output)
-  rust_env = {
-    'ASPACE_URL' => backend,
-    'ASPACE_USER' => ENV.fetch('ASPACE_ADMIN_USER'),
-    'ASPACE_PASSWORD' => ENV.fetch('ASPACE_ADMIN_PASSWORD')
-  }
-  binary = '/archivesspace/rust-tools/target/release/aspace-cli'
-  stdout, stderr, status = Open3.capture3(rust_env, binary, 'pui-tree-spike',
-                                           '--resource-uri', resource_uri, '--output', rust_output)
-  raise "Rust auxiliary candidate failed: #{stderr.lines.last}" unless status.success?
-  raise 'Rust auxiliary candidate output missing' unless File.file?(rust_output)
-  rust_report = JSON.parse(File.read(rust_output))
-  raise 'Rust candidate resource URI mismatch' unless rust_report.fetch('resource_uri') == resource_uri
-  raise 'Rust candidate count mismatch' unless rust_report.fetch('document_count') == rust_report.fetch('documents').length
-  documents.concat(rust_report.fetch('documents'))
-  delete_candidates = rust_report.fetch('delete_candidates')
+  delete_candidates = add_native_auxiliary(indexer, resource_uri, documents)
+elsif %w[candidate candidate_parallel].include?(mode)
+  if mode == 'candidate_parallel'
+    _stdout = rust_job[1].read
+    stderr = rust_job[2].read
+    status = rust_job[3].value
+  else
+    rust_started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    _stdout, stderr, status = Open3.capture3(rust_env, *rust_args)
+  end
+  rust_process_elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - rust_started
+  begin
+    raise "Rust auxiliary candidate failed: #{stderr.lines.last}" unless status.success?
+    raise 'Rust auxiliary candidate output missing' unless File.file?(rust_output)
+    rust_report = JSON.parse(File.read(rust_output))
+    raise 'Rust candidate resource URI mismatch' unless rust_report.fetch('resource_uri') == resource_uri
+    aux_documents = rust_report.fetch('documents')
+    aux_deletes = rust_report.fetch('delete_candidates')
+    raise 'Rust candidate count mismatch' unless aux_documents.is_a?(Array) &&
+      rust_report.fetch('document_count') == aux_documents.length
+    raise 'malformed Rust auxiliary document' unless aux_documents.all? { |doc| doc.is_a?(Hash) && doc['id'].is_a?(String) &&
+      doc.keys.none? { |key| key.start_with?('_archivalist_') } }
+    raise 'malformed Rust delete candidates' unless aux_deletes.is_a?(Array) && aux_deletes.all? { |uri| uri.is_a?(String) }
+    rust_internal_seconds = rust_report.fetch('elapsed_seconds')
+    raise 'malformed Rust elapsed time' unless rust_internal_seconds.is_a?(Numeric) && rust_internal_seconds.finite?
+    existing_ids = documents.map { |doc| doc.fetch('id') }
+    auxiliary_ids = aux_documents.map { |doc| doc.fetch('id') }
+    raise 'duplicate Rust auxiliary document ID' unless (existing_ids + auxiliary_ids).uniq.length == existing_ids.length + auxiliary_ids.length
+    documents.concat(aux_documents)
+    delete_candidates = aux_deletes
+  rescue StandardError => error
+    raise unless mode == 'candidate_parallel'
+    fallback_used = true
+    fallback_reason = error.class.to_s
+    delete_candidates = add_native_auxiliary(indexer, resource_uri, documents)
+  end
 end
 elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
 raise 'duplicate ordinary document IDs' unless documents.map { |doc| doc.fetch('id') }.uniq.length == documents.length
 raise 'unexpected private marker' if documents.any? { |doc| doc.keys.any? { |key| key.start_with?('_archivalist_') } }
 report = { resource_uri: resource_uri, mode: mode, resource_diagnostic: resource_diagnostic,
            ordered_uri_count: uris.length, elapsed_seconds: elapsed,
+           fallback_used: fallback_used, fallback_reason: fallback_reason,
            ordinary_seconds: ordinary_done - started, auxiliary_seconds: elapsed - (ordinary_done - started),
+           rust_observed_until_collection_seconds: rust_process_elapsed,
+           rust_internal_seconds: rust_internal_seconds,
            ordinary_document_count: ordinary_count, auxiliary_document_count: documents.length - ordinary_count,
            document_count: documents.length, delete_candidates: delete_candidates, documents: documents }
 File.open(output, File::WRONLY | File::CREAT | File::EXCL, 0600) do |file|

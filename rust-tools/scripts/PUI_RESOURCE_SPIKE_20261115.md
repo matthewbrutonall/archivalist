@@ -1,31 +1,48 @@
-# One-resource PUI indexing spike (closed)
+# One-resource PUI indexing spike (bounded close-out)
 
-This local, read-only experiment compares native PUI work on
-`/repositories/4/resources/6` with a hybrid that keeps ordinary archival-object
-preparation in Ruby and builds ordered/tree auxiliary documents in Rust. It
-does not write to Solr, exercise fallback, or alter PUI feature flags.
+This local experiment used `/repositories/4/resources/6` in the disposable
+profiling stack. Ruby prepared ordinary archival-object PUI documents while a
+separate Rust CLI fetched and built ordered-record and tree auxiliary documents
+through the authoritative API. The two independent jobs ran concurrently.
+The Rust result crossed back to Ruby as auxiliary documents only; ordinary
+full-record JSON did not cross the boundary. No production PUI flag changed.
 
-Five alternating pairs on the isolated profiling backend each matched 2,843
-pre-Solr documents type-strictly, including embedded JSON, and the same 1,000
-delete candidates. The final release binary's SHA-256 was
-`8eb53cba7081e77e212d0988b2de9778143a86aad66b9b94ea971752460f869a`.
-The native wall median was 13.384 seconds; the hybrid median was 10.153
-seconds, a 24.1% reduction. The fifth pair was contended. The result is below
-the spike's 30% complete-slice target, so this hybrid is **not the chosen Gate 5
-speed design**. Native ordinary AO preparation still takes about 8.5 seconds
-of the candidate pass. There is no full PUI reindex or production speed claim.
+Five alternating read-only pairs each matched **2,843 pre-Solr documents**
+type-strictly, including embedded JSON, plus **1,000 delete candidates**. The
+native median was **13.380 s**; the parallel hybrid median was **8.875 s**, a
+**33.7% reduction** for fetch and preparation. The sequential version reached
+only 24.1%; concurrency is essential to the result. Raw pair reports are in
+ignored `rust-tools/benchmarks/pui_spike_pairs_20261115_195316.json`. The
+timed release binary SHA-256 was
+`52d01ee4d4c61114cdb02a2b8111966c458bc9b325d9e600d36cac73c33afedf`.
+The timed pairs exclude Solr writes, commits and report serialization.
 
-Raw private reports are retained in ignored `rust-tools/benchmarks/`, with the
-pair index at `pui_spike_pairs_20261115_194109.json`. The earlier bounded
-fan-out version is at `pui_spike_pairs_20261115_193557.json`. The release
-binary was built from a dirty local branch; no clean-commit acceptance run was
-attempted because the spike failed its threshold. Isolated profiling Solr was
-stopped throughout. No stage core was created or promoted.
+One saved native/candidate pair was written to two fresh isolated Solr cores.
+Both contained **2,843 stored documents with exact parity**. The report is
+`rust-tools/benchmarks/pui_spike_solr_20261115_195954_2912879_06df47bc.json`.
+Its individual write/commit times are descriptive; core creation order and
+warm-up differ, so they are not a paired full-index speed benchmark. The
+profiling Solr container was stopped after the check at about 4.5/6 GiB
+memory use. Existing cores and both new stage cores were retained.
 
-The spike tools are `pui_resource_tree_reference.rb`,
-`pui_ordinary_reference.rb`, `run_pui_resource_spike_pairs.py`, and the
-`aspace-cli pui-tree-spike` command. The pair runner is deliberately pinned to
-the existing isolated stack and saved reference. It is experimental tooling,
-not an indexer replacement. A new PUI design must own ordinary AO fetch,
-inheritance, publication/privacy, and output without sending full records back
-through Ruby; it needs its own parity, fallback, Solr and performance gate.
+A forced Rust process failure produced a native auxiliary fallback with exact
+pre-Solr parity for all 2,843 documents and 1,000 delete candidates. The
+private report is `pui_full_reference_20261115_2008_fallback.json`. This tests
+one failure path before Solr writes. The tree used here had 1,210 published,
+unsuppressed ordinary AO documents; no unpublished child was available to
+exercise suppression. A local scan found no nonempty embedded ancestors,
+resolved top-container internal notes, resolved container-profile notes, or
+`_archivalist_` markers in those documents. Broader privacy and plugin
+coverage remains open.
+
+**Decision:** the 30% read-only speed kill condition did not fire, so retain
+the parallel design as a Gate 5 candidate. This is not a Gate 5 pass or a
+production speed claim. A complete integrated pass with Solr writes,
+publication edge cases, robust fallback, and larger trees is still required.
+The spike ended within its four-active-hour limit. Gate 4 remains paused.
+
+The tools are `pui_resource_tree_reference.rb`,
+`pui_ordinary_reference.rb`, `run_pui_resource_spike_pairs.py`,
+`run_pui_spike_solr_parity.py`, and `aspace-cli pui-tree-spike`. The pair runner
+is pinned to the existing isolated stack and saved reference. These are
+experimental tools, not a replacement indexer.
