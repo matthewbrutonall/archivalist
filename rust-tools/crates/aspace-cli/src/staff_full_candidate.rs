@@ -13,7 +13,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::staff_ao_candidate::fetch_and_build_ao_candidate_batch;
 use crate::staff_candidate_runner::{partition_ids_into_batches, CandidateBatchOutput};
@@ -223,6 +223,7 @@ pub struct FullStageSummary {
 
 #[derive(Serialize)]
 pub struct StaffFullCandidateSummary {
+    pub full_reindex_started_at_epoch_sec: u64,
     pub repository_ids: Vec<u32>,
     pub stages: Vec<FullStageSummary>,
     pub total_ids: usize,
@@ -702,6 +703,10 @@ pub async fn execute_staff_full_candidate(
     crate::profiling_stack::verify_profiling_stack(&args.state, client.base_url(), &args.solr_url)?;
     let mut writer = IsolatedSolrStaffAoWriter::new(&args.solr_url, &args.candidate_core)?;
     writer.verify_target_core_ready().await?;
+    let full_reindex_started_at_epoch_sec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs();
     let dynamic_enums = Arc::new(client.dynamic_enum_fields_from_schemas().await?);
     let mut repositories = client.staff_repositories_raw().await?;
     repositories.sort_by_key(|repo| repo_id_from_record(repo).unwrap_or(u32::MAX));
@@ -842,6 +847,7 @@ pub async fn execute_staff_full_candidate(
     }
     writer.commit().await?;
     Ok(StaffFullCandidateSummary {
+        full_reindex_started_at_epoch_sec,
         repository_ids: repo_ids,
         stages,
         total_ids,
