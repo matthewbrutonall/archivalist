@@ -17,6 +17,8 @@ Executes end-to-end Rust STAFF combined candidate indexing for isolated stack e6
   - Compares embedded json string byte-for-byte, verifying zero private _archivalist_* markers.
   - All candidate cores are retained; no deletion or unloading.
   - Mode 0600 report retained in rust-tools/benchmarks/; summary only to stdout.
+  - Records the candidate CLI's own peak RSS (os.wait4) and, with --fresh-native,
+    compares it with the fresh single-pass native JRuby VmHWM (see peak_rss.py).
   - Stops ONLY profiling backend/Solr that were started during this run in cleanup; DB stays.
 """
 
@@ -40,6 +42,9 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import urllib.error
 import urllib.parse
 import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from peak_rss import compare_peak_memory, run_with_peak_rss  # noqa: E402
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 BENCHMARKS_DIR = os.path.join(REPO_ROOT, "rust-tools", "benchmarks")
@@ -1048,11 +1053,13 @@ def run_harness() -> int:
     rendered_cmd = " ".join(cli_cmd)
     print(f"Running CLI command: {redact_secrets(rendered_cmd)}", flush=True)
     t_cli_start = time.perf_counter()
-    cli_proc = subprocess.run(cli_cmd, capture_output=True, text=True, env=cli_env)
+    cli_proc = run_with_peak_rss(cli_cmd, env=cli_env)
     t_cli_elapsed = time.perf_counter() - t_cli_start
+    candidate_peak_rss_kib = cli_proc.peak_rss_kib
 
     print(
-        f"CLI process finished with exit code {cli_proc.returncode} in {t_cli_elapsed:.3f}s"
+        f"CLI process finished with exit code {cli_proc.returncode} in {t_cli_elapsed:.3f}s; "
+        f"peak RSS {candidate_peak_rss_kib / 1048576:.2f} GiB"
     )
     injected_failure = args.inject_failure_after is not None
     if injected_failure and cli_proc.returncode == 0:
@@ -1079,6 +1086,7 @@ def run_harness() -> int:
             raise RuntimeError(f"Candidate CLI reported success=false: {err_msg}")
 
     fresh_native_report = None
+    java_opts = None
     if args.fresh_native:
         identity_url = f"{backend_host_url}/repositories/{state['identity_repo_id']}"
         with urllib.request.urlopen(identity_url, timeout=10) as response:
@@ -1147,6 +1155,8 @@ def run_harness() -> int:
             "stack_id": EXPECTED_STACK_ID,
             "candidate_core": cand_core,
             "candidate_cli_exit": cli_proc.returncode,
+            "candidate_cli_wall_sec": round(t_cli_elapsed, 3),
+            "candidate_peak_rss_kib": candidate_peak_rss_kib,
             "candidate_cli_error": redact_secrets(cli_proc.stderr[-2000:]),
             "failure_after_batches": args.inject_failure_after,
             "candidate_visible_documents": solr_num_found,
@@ -1233,6 +1243,12 @@ def run_harness() -> int:
         "candidate_core": cand_core,
         "active_arks_enabled": active_arks,
         "cli_summary": cand_summary,
+        "candidate_cli_wall_sec": round(t_cli_elapsed, 3),
+        "memory": compare_peak_memory(
+            candidate_peak_rss_kib,
+            fresh_native_report,
+            f"{java_opts} -Xss16m" if java_opts is not None else None,
+        ),
         "solr_verified_docs": solr_num_found,
         "native_type_counts": dict(sorted(native_type_counts.items())),
         "candidate_type_counts": dict(sorted(candidate_type_counts.items())),
