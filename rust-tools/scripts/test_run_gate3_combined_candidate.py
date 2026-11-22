@@ -16,6 +16,26 @@ import run_gate3_combined_candidate as harness
 
 
 class TestRunGate3CombinedCandidate(unittest.TestCase):
+    def test_native_command_matches_staff_threads_and_records_effective_java_opts(self):
+        state = {
+            "backend_network_url": "http://archivalist-profiling-backend-844ef09c:4567",
+            "solr_network_url": "http://archivalist-profiling-solr-844ef09c:8983/solr",
+            "stack_id": "844ef09c",
+            "identity_repo_id": 2,
+            "identity_core": "archivalist_profiling_identity_844ef09c",
+            "app_container": "archivesspaceai-app-1",
+        }
+        command = harness.build_native_profile_command(state, "a" * 32, "-Xmx8g", 12)
+        self.assertIn("STAFF_THREADS=12", command)
+        self.assertIn("JAVA_OPTS=-Xmx8g -Xss16m", command)
+        self.assertIn("MODES=staff", command)
+        self.assertIn("TIMERS=0", command)
+
+    def test_native_staff_threads_argument_rejects_out_of_range_value(self):
+        with patch.object(sys, "argv", ["harness", "--native-staff-threads", "33"]):
+            with self.assertRaises(SystemExit):
+                harness.parse_args()
+
     def test_mixed_type_coverage_requires_every_type_and_child_parent(self):
         docs = {kind: {"primary_type": kind} for kind in harness.EXPECTED_STAFF_TYPES}
         for parent in harness.EXPECTED_CHILD_PARENTS:
