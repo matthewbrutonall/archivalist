@@ -655,6 +655,25 @@ def run_slice_parity_comparison(
     }
 
 
+def build_native_profile_command(state, nonce, java_opts, staff_threads):
+    effective_java_opts = f"{java_opts} -Xss16m".strip()
+    return [
+        "docker", "exec",
+        "-e", f"BACKEND_URL={state['backend_network_url']}",
+        "-e", f"SOLR_BASE_URL={state['solr_network_url']}",
+        "-e", f"ARCHIVALIST_PROFILING_STACK_ID={state['stack_id']}",
+        "-e", f"ARCHIVALIST_PROFILING_STACK_NONCE={nonce}",
+        "-e", f"ARCHIVALIST_PROFILING_STACK_IDENTITY_REPO_ID={state['identity_repo_id']}",
+        "-e", f"ARCHIVALIST_PROFILING_STACK_IDENTITY_CORE={state['identity_core']}",
+        "-e", "MODES=staff", "-e", "REPEATS=1", "-e", "TIMERS=0",
+        "-e", f"STAFF_THREADS={staff_threads}",
+        "-e", f"JAVA_OPTS={effective_java_opts}",
+        "-w", "/archivesspace", state["app_container"],
+        "/archivesspace/scripts/jruby",
+        "/archivesspace/rust-tools/scripts/native_indexing_profile.rb",
+    ]
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Gate 3 STAFF Combined Slice Live Parity Harness"
@@ -706,6 +725,13 @@ def parse_args():
         default=4,
         choices=range(1, 33),
         help="Concurrent Rust fetch/build batches in full mode (default: 4)",
+    )
+    parser.add_argument(
+        "--native-staff-threads",
+        type=int,
+        default=4,
+        choices=range(1, 33),
+        help="STAFF_THREADS for the fresh native baseline (default: 4)",
     )
     parser.add_argument(
         "--inject-failure-after",
@@ -1087,6 +1113,7 @@ def run_harness() -> int:
 
     fresh_native_report = None
     java_opts = None
+    native_java_opts = None
     if args.fresh_native:
         identity_url = f"{backend_host_url}/repositories/{state['identity_repo_id']}"
         with urllib.request.urlopen(identity_url, timeout=10) as response:
@@ -1102,20 +1129,10 @@ def run_harness() -> int:
             ["docker", "exec", state["app_container"], "printenv", "JAVA_OPTS"],
             capture_output=True, text=True, check=True,
         ).stdout.strip()
-        native_cmd = [
-            "docker", "exec",
-            "-e", f"BACKEND_URL={state['backend_network_url']}",
-            "-e", f"SOLR_BASE_URL={state['solr_network_url']}",
-            "-e", f"ARCHIVALIST_PROFILING_STACK_ID={state['stack_id']}",
-            "-e", f"ARCHIVALIST_PROFILING_STACK_NONCE={nonce}",
-            "-e", f"ARCHIVALIST_PROFILING_STACK_IDENTITY_REPO_ID={state['identity_repo_id']}",
-            "-e", f"ARCHIVALIST_PROFILING_STACK_IDENTITY_CORE={state['identity_core']}",
-            "-e", "MODES=staff", "-e", "REPEATS=1", "-e", "TIMERS=0",
-            "-e", f"JAVA_OPTS={java_opts} -Xss16m",
-            "-w", "/archivesspace", state["app_container"],
-            "/archivesspace/scripts/jruby",
-            "/archivesspace/rust-tools/scripts/native_indexing_profile.rb",
-        ]
+        native_java_opts = f"{java_opts} -Xss16m".strip()
+        native_cmd = build_native_profile_command(
+            state, nonce, java_opts, args.native_staff_threads,
+        )
         print("Running same-state native STAFF round in a fresh isolated core...", flush=True)
         native_proc = subprocess.run(native_cmd, capture_output=True, text=True)
         if native_proc.returncode != 0:
@@ -1157,6 +1174,8 @@ def run_harness() -> int:
             "candidate_cli_exit": cli_proc.returncode,
             "candidate_cli_wall_sec": round(t_cli_elapsed, 3),
             "candidate_peak_rss_kib": candidate_peak_rss_kib,
+            "native_staff_threads": args.native_staff_threads,
+            "native_java_opts": native_java_opts,
             "candidate_cli_error": redact_secrets(cli_proc.stderr[-2000:]),
             "failure_after_batches": args.inject_failure_after,
             "candidate_visible_documents": solr_num_found,
@@ -1244,10 +1263,12 @@ def run_harness() -> int:
         "active_arks_enabled": active_arks,
         "cli_summary": cand_summary,
         "candidate_cli_wall_sec": round(t_cli_elapsed, 3),
+        "native_staff_threads": args.native_staff_threads if fresh_native_report else None,
+        "native_java_opts": native_java_opts,
         "memory": compare_peak_memory(
             candidate_peak_rss_kib,
             fresh_native_report,
-            f"{java_opts} -Xss16m" if java_opts is not None else None,
+            native_java_opts,
         ),
         "solr_verified_docs": solr_num_found,
         "native_type_counts": dict(sorted(native_type_counts.items())),

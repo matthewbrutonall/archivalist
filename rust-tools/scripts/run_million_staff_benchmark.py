@@ -24,6 +24,8 @@ sys.argv = [
     "--fresh-native",
     "--concurrency",
     "12",
+    "--native-staff-threads",
+    "12",
 ]
 
 raise SystemExit(harness.run_harness())
