@@ -2,6 +2,19 @@ require 'spec_helper'
 require 'rails_helper'
 
 describe 'Resources', js: true do
+  # Downloads finish asynchronously (Chrome returns from the click before the file is written),
+  # so poll until the condition holds and no partial download remains, or the timeout passes.
+  def wait_for_pdf_downloads(timeout: 30, &condition)
+    condition ||= ->(pdfs) { !pdfs.empty? }
+    deadline = Time.now + timeout
+    loop do
+      pdfs = Dir.glob(File.join(Dir.tmpdir, '*.pdf'))
+      partial = Dir.glob(File.join(Dir.tmpdir, '*.{crdownload,part}'))
+      return pdfs if (condition.call(pdfs) && partial.empty?) || Time.now > deadline
+      sleep 0.2
+    end
+  end
+
   it 'should be able to see all published resources in a repository' do
     visit('/')
     click_link 'Collections'
@@ -159,8 +172,9 @@ describe 'Resources', js: true do
 
     click_on 'Download PDF'
 
-    pdf_files = Dir.glob(File.join(Dir.tmpdir, '*.pdf'))
-    expect(pdf_files).to include "#{Dir.tmpdir}/text_us_paav_b_jd99_blake_carver_papers_es_carver_xml.pdf"
+    expected_file = "#{Dir.tmpdir}/text_us_paav_b_jd99_blake_carver_papers_es_carver_xml.pdf"
+    pdf_files = wait_for_pdf_downloads { |pdfs| pdfs.include?(expected_file) }
+    expect(pdf_files).to include expected_file
   end
 
   it 'downloads PDF from archival object view' do
@@ -187,7 +201,7 @@ describe 'Resources', js: true do
 
     click_on 'Download PDF'
 
-    pdf_files = Dir.glob(File.join(Dir.tmpdir, '*.pdf'))
+    pdf_files = wait_for_pdf_downloads
     expect(pdf_files.length).to eq(1)
   end
 

@@ -1,30 +1,38 @@
 class IndexerTiming
   def initialize
     @metrics = {}
+    @mutex = Mutex.new
   end
 
   def add(metric, val)
-    @metrics[metric] ||= 0
-    @metrics[metric] += val.to_i
+    @mutex.synchronize do
+      @metrics[metric] ||= 0
+      @metrics[metric] += val.to_i
+    end
   end
 
   def to_s
-    subtotal = @metrics.values.inject(0) {|a, b| a + b}
+    @mutex.synchronize do
+      subtotal = @metrics.values.inject(0) {|a, b| a + b}
 
-    if @total
-      # If we have a total, report any difference between the total and the
-      # numbers we have.
-      add(:other, @total - subtotal)
-    else
-      # Otherwise, just tally up our numbers to determine the total.
-      @total = subtotal
+      if @total
+        # If we have a total, report any difference between the total and the
+        # numbers we have.
+        @metrics[:other] ||= 0
+        @metrics[:other] += (@total - subtotal).to_i
+      else
+        # Otherwise, just tally up our numbers to determine the total.
+        @total = subtotal
+      end
+
+      "#{@total.to_i} ms (#{@metrics.map {|k, v| "#{k}: #{v}"}.join('; ')})"
     end
-
-    "#{@total.to_i} ms (#{@metrics.map {|k, v| "#{k}: #{v}"}.join('; ')})"
   end
 
   def total=(ms)
-    @total = ms
+    @mutex.synchronize do
+      @total = ms
+    end
   end
 
   def time_block(metric)

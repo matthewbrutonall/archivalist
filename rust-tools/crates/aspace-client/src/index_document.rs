@@ -411,6 +411,9 @@ fn add_dates(
     let Some(dates) = record.get("dates") else {
         return Ok(());
     };
+    if dates.is_null() || dates == &Value::Bool(false) {
+        return Ok(());
+    }
     let dates = dates
         .as_array()
         .ok_or_else(|| error("field 'dates' must be an array"))?;
@@ -440,6 +443,8 @@ fn add_dates(
             "year_sort".to_string(),
             Value::String(format!("{first}{last}")),
         );
+    } else {
+        document.insert("years".to_string(), Value::Array(Vec::new()));
     }
 
     let mut display_dates: Vec<&Value> = dates
@@ -596,7 +601,15 @@ fn add_instance_fields(
     document: &mut Map<String, Value>,
     record: &Map<String, Value>,
 ) -> Result<(), IndexDocumentError> {
-    let instances = wrapped_values(record.get("instances"));
+    let instances = match record.get("instances") {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => return Ok(()),
+        Some(Value::Array(items)) => items,
+        Some(_) => return Err(error("field 'instances' must be an array")),
+    };
+    if instances.is_empty() {
+        return Ok(());
+    }
+
     let mut digital_objects = Vec::new();
     let mut top_containers = Vec::new();
     let mut child_containers = Vec::new();
@@ -633,31 +646,31 @@ fn add_instance_fields(
             .get("type_2")
             .is_some_and(|value| !value.is_null())
         {
-            child_containers.push(Value::String(format!(
+            let raw_str = format!(
                 "{} {} {}",
                 ruby_string(sub_container.get("type_2")),
                 ruby_string(sub_container.get("indicator_2")),
                 ruby_string(sub_container.get("barcode_2"))
-            )));
+            );
+            child_containers.push(Value::String(ruby_strip(&raw_str).to_string()));
         }
         if sub_container
             .get("type_3")
             .is_some_and(|value| !value.is_null())
         {
-            grandchild_containers.push(Value::String(format!(
+            let raw_str = format!(
                 "{} {}",
                 ruby_string(sub_container.get("type_3")),
                 ruby_string(sub_container.get("indicator_3"))
-            )));
+            );
+            grandchild_containers.push(Value::String(ruby_strip(&raw_str).to_string()));
         }
     }
 
-    if !digital_objects.is_empty() {
-        document.insert(
-            "digital_object_uris".to_string(),
-            Value::Array(digital_objects),
-        );
-    }
+    document.insert(
+        "digital_object_uris".to_string(),
+        Value::Array(digital_objects),
+    );
     if !top_containers.is_empty() {
         document.insert(
             "top_container_uri_u_sstr".to_string(),
@@ -1175,18 +1188,32 @@ fn strip_angle_tags(value: &str) -> String {
 }
 
 fn clean_for_sort(value: &str) -> String {
-    let without_tags = strip_angle_tags(value);
-    let filtered: String = without_tags
-        .chars()
-        .map(|character| if character == '-' { ' ' } else { character })
-        .filter(|character| {
-            character.is_alphabetic()
-                || character.is_ascii_digit()
-                || character.is_whitespace()
-                || *character == '_'
-        })
-        .collect();
-    filtered.split_whitespace().collect::<Vec<_>>().join(" ")
+    ruby_clean_for_sort(value)
+}
+
+/// Port of IndexerCommon#index_records post-hook title_sort assignment:
+///   if ( !values["finding_aid_filing_title"].nil? && values["finding_aid_filing_title"].length > 0 )
+///     doc['title_sort'] ||= clean_for_sort(values["finding_aid_filing_title"])
+///   else
+///     doc['title_sort'] ||= clean_for_sort(values['title'])
+///   end
+fn apply_title_sort(document: &mut Map<String, Value>, record: &Map<String, Value>) {
+    if ruby_truthy(document.get("title_sort")) {
+        return;
+    }
+    let filing_title = record.get("finding_aid_filing_title");
+    let candidate = match filing_title {
+        Some(Value::String(s)) if !s.is_empty() => Some(s.as_str()),
+        _ => match record.get("title") {
+            Some(Value::String(s)) => Some(s.as_str()),
+            _ => None,
+        },
+    };
+    let title_sort = match candidate {
+        Some(s) => Value::String(ruby_clean_for_sort(s)),
+        None => Value::Null,
+    };
+    document.insert("title_sort".to_string(), title_sort);
 }
 
 /// Private handoff key carrying synthetic `collection_management` child documents.
@@ -2836,6 +2863,7 @@ fn add_enriched_fields(
         "_archivalist_rust_fields".to_string(),
         Value::Array(rust_fields),
     );
+    apply_title_sort(document, record);
     Ok(())
 }
 
@@ -4431,6 +4459,7 @@ mod tests {
 
         let document = build_index_document(enriched).unwrap();
         assert_eq!(document["title"], "Series I: Correspondence");
+        assert_eq!(document["title_sort"], "Original title");
         assert_eq!(document["resource"], "/repositories/2/resources/7");
         assert_eq!(document["identifier"], "I");
         assert_eq!(document["component_id"], "I");
@@ -4443,6 +4472,480 @@ mod tests {
             json!(["/repositories/2/resources/7"])
         );
         assert_eq!(document["langcode"], json!([]));
+    }
+
+    #[test]
+    fn test_title_sort_semantics_and_precedence() {
+        // 1. Archival object: uses record title, NOT display_string
+        let doc = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/1".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/1",
+                "title": "Series 1: ledgers",
+                "display_string": "Series 1: ledgers, 1899-1926",
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(doc["title"], "Series 1: ledgers, 1899-1926");
+        assert_eq!(doc["title_sort"], "Series 1 ledgers");
+
+        // 2. finding_aid_filing_title override when non-nil and non-empty
+        let doc_filing = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/resources/1".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/1",
+                "title": "Personal Papers",
+                "finding_aid_filing_title": "Smith, John: Personal Papers",
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(doc_filing["title_sort"], "Smith John Personal Papers");
+
+        // 3. finding_aid_filing_title empty fallback to title
+        let doc_empty_filing = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/resources/2".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/2",
+                "title": "Personal Papers",
+                "finding_aid_filing_title": "",
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(doc_empty_filing["title_sort"], "Personal Papers");
+
+        // 4. finding_aid_filing_title null fallback to title
+        let doc_null_filing = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/resources/3".to_string(),
+            record_type: "resource".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/resources/3",
+                "title": "Personal Papers",
+                "finding_aid_filing_title": Value::Null,
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(doc_null_filing["title_sort"], "Personal Papers");
+
+        // 5. Null title when no filing title -> null title_sort
+        let doc_null_title = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/2".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/2",
+                "title": Value::Null,
+                "display_string": "Undated item",
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(doc_null_title["title_sort"], Value::Null);
+
+        // 6. Absent title when no filing title -> null title_sort
+        let doc_absent_title = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/3".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/3",
+                "display_string": "Undated item",
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(doc_absent_title["title_sort"], Value::Null);
+
+        // 7. Empty title -> empty title_sort
+        let doc_empty_title = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/4".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/4",
+                "title": "",
+                "display_string": "",
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(doc_empty_title["title_sort"], "");
+
+        // 8. HTML tag stripping, hyphen replacement, Unicode and whitespace
+        let doc_complex = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/5".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/5",
+                "title": "  <b>Section 1</b>: post-war & <i>café naïve</i>_notes...  ",
+                "display_string": "Section 1",
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            doc_complex["title_sort"],
+            "Section 1 post war café naïve_notes"
+        );
+
+        // 9. Precedence preservation: existing truthy title_sort is not overwritten
+        let mut doc_map = Map::new();
+        doc_map.insert(
+            "title_sort".to_string(),
+            Value::String("Explicitly Preserved Sort".to_string()),
+        );
+        let mut rec_map = Map::new();
+        rec_map.insert(
+            "title".to_string(),
+            Value::String("Ignored Title".to_string()),
+        );
+        apply_title_sort(&mut doc_map, &rec_map);
+        assert_eq!(doc_map["title_sort"], "Explicitly Preserved Sort");
+    }
+
+    #[test]
+    fn test_add_dates_and_years_semantics() {
+        // 1. dates: [] (empty array) -> years: [], dates: [], no year_sort
+        let doc_empty_dates = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/10".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/10",
+                "title": "Item with empty dates",
+                "dates": [],
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(doc_empty_dates["years"], json!([]));
+        assert_eq!(doc_empty_dates["dates"], json!([]));
+        assert!(doc_empty_dates.get("year_sort").is_none());
+
+        // 2. dates absent -> no years, no dates, no year_sort
+        let doc_no_dates = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/11".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/11",
+                "title": "Item with absent dates",
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(doc_no_dates.get("years").is_none());
+        assert!(doc_no_dates.get("dates").is_none());
+        assert!(doc_no_dates.get("year_sort").is_none());
+
+        // 3. dates: null -> no years, no dates, no year_sort
+        let doc_null_dates = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/12".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/12",
+                "title": "Item with null dates",
+                "dates": Value::Null,
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(doc_null_dates.get("years").is_none());
+        assert!(doc_null_dates.get("dates").is_none());
+        assert!(doc_null_dates.get("year_sort").is_none());
+
+        // 4. dates: false -> no years, no dates, no year_sort
+        let doc_false_dates = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/13".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/13",
+                "title": "Item with false dates",
+                "dates": false,
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(doc_false_dates.get("years").is_none());
+        assert!(doc_false_dates.get("dates").is_none());
+        assert!(doc_false_dates.get("year_sort").is_none());
+
+        // 5. Strict type checks: non-null, non-false, non-array dates rejects with error
+        let err_bool = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/14".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/14",
+                "dates": true,
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(err_bool.to_string(), "field 'dates' must be an array");
+
+        let err_str = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/15".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/15",
+                "dates": "1999",
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(err_str.to_string(), "field 'dates' must be an array");
+
+        let err_entry = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/16".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/16",
+                "dates": [123],
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(err_entry.to_string(), "dates entries must be objects");
+
+        // 6. dates with unparseable year -> years: [], expression in dates, no year_sort
+        let doc_unparseable = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/17".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/17",
+                "title": "Undated",
+                "dates": [{
+                    "date_type": "inclusive",
+                    "expression": "circa unknown"
+                }],
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(doc_unparseable["years"], json!([]));
+        assert_eq!(doc_unparseable["dates"], json!(["circa unknown"]));
+        assert!(doc_unparseable.get("year_sort").is_none());
+
+        // 7. dates with parseable range -> years populated, year_sort populated
+        let doc_ranged = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/18".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/18",
+                "title": "Ranged dates",
+                "dates": [{
+                    "date_type": "inclusive",
+                    "begin": "1912",
+                    "end": "1914"
+                }],
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(doc_ranged["years"], json!(["1912", "1913", "1914"]));
+        assert_eq!(doc_ranged["year_sort"], "19121914");
+        assert_eq!(doc_ranged["dates"], json!(["1912 - 1914"]));
+    }
+
+    #[test]
+    fn test_add_instances_and_digital_object_uris_semantics() {
+        // 1. instances absent -> no digital_object_uris, no container fields
+        let doc_no_inst = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/20".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/20",
+                "title": "No instances",
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(doc_no_inst.get("digital_object_uris").is_none());
+        assert!(doc_no_inst.get("top_container_uri_u_sstr").is_none());
+
+        // 2. instances null -> no digital_object_uris
+        let doc_null_inst = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/21".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/21",
+                "title": "Null instances",
+                "instances": Value::Null,
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(doc_null_inst.get("digital_object_uris").is_none());
+
+        // 3. instances false -> no digital_object_uris
+        let doc_false_inst = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/22".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/22",
+                "title": "False instances",
+                "instances": false,
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(doc_false_inst.get("digital_object_uris").is_none());
+
+        // 4. instances: [] (empty array) -> no digital_object_uris
+        let doc_empty_inst = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/23".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/23",
+                "title": "Empty instances",
+                "instances": [],
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(doc_empty_inst.get("digital_object_uris").is_none());
+
+        // 5. instances with containers but no digital objects -> digital_object_uris: []
+        let doc_container_only = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/24".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/24",
+                "title": "Container only",
+                "instances": [{
+                    "sub_container": {
+                        "top_container": {"ref": "/repositories/2/top_containers/9"}
+                    }
+                }],
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(doc_container_only["digital_object_uris"], json!([]));
+        assert_eq!(
+            doc_container_only["top_container_uri_u_sstr"],
+            json!(["/repositories/2/top_containers/9"])
+        );
+
+        // 6. instances with digital objects -> digital_object_uris: [ref]
+        let doc_with_do = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/25".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/25",
+                "title": "With DO",
+                "instances": [{
+                    "digital_object": {"ref": "/repositories/2/digital_objects/42"}
+                }],
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            doc_with_do["digital_object_uris"],
+            json!(["/repositories/2/digital_objects/42"])
+        );
+
+        // 7. invalid instances type -> error
+        let err_inst = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/26".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/26",
+                "instances": "bad",
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(err_inst.to_string(), "field 'instances' must be an array");
+
+        let err_entry = build_index_document(IndexDocumentInput {
+            uri: "/repositories/2/archival_objects/27".to_string(),
+            record_type: "archival_object".to_string(),
+            repository: json!(2),
+            record: json!({
+                "uri": "/repositories/2/archival_objects/27",
+                "instances": [123],
+                "publish": true,
+            }),
+            enrich: true,
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert_eq!(err_entry.to_string(), "instances entries must be objects");
     }
 
     #[test]
