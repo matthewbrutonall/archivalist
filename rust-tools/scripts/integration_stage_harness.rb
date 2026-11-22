@@ -134,11 +134,17 @@ module ArchivalistHarnessSafety
     "#{Time.now.utc.strftime('%Y%m%d_%H%M%S')}_#{Process.pid}_#{SecureRandom.hex(4)}"
   end
 
+  def self.valid_profiling_stack_hostname?(hostname, service)
+    stack_id = ENV['ARCHIVALIST_PROFILING_STACK_ID'].to_s
+    stack_id.match?(/\A[0-9a-f]{8}\z/) &&
+      hostname == "archivalist-profiling-#{service}-#{stack_id}"
+  end
+
   def self.valid_backend_url?(url_str)
     return false unless url_str.is_a?(String)
     uri = URI.parse(url_str)
     return false unless uri.is_a?(URI::HTTP) || uri.is_a?(URI::HTTPS)
-    return false unless ALLOWED_BACKEND_HOSTS.include?(uri.hostname)
+    return false unless ALLOWED_BACKEND_HOSTS.include?(uri.hostname) || valid_profiling_stack_hostname?(uri.hostname, 'backend')
     return false unless ALLOWED_BACKEND_PORTS.include?(uri.port)
     return false unless uri.user.nil? && uri.password.nil?
     true
@@ -159,7 +165,7 @@ module ArchivalistHarnessSafety
   def self.valid_solr_url?(url_str)
     uri = URI.parse(url_str)
     return false unless uri.is_a?(URI::HTTP) || uri.is_a?(URI::HTTPS)
-    return false unless ALLOWED_HOSTS.include?(uri.hostname)
+    return false unless ALLOWED_HOSTS.include?(uri.hostname) || valid_profiling_stack_hostname?(uri.hostname, 'solr')
     return false unless ALLOWED_PORTS.include?(uri.port)
     return false unless uri.user.nil? && uri.password.nil?
     return false unless uri.query.nil? || uri.query.empty?

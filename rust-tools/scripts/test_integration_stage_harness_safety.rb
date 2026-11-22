@@ -472,6 +472,17 @@ class TestIntegrationStageHarnessSafety < Minitest::Test
     assert ArchivalistHarnessSafety.valid_backend_url?('http://app:3000')
   end
 
+  def test_unique_profiling_stack_hosts_require_the_matching_stack_id
+    old_stack_id = ENV['ARCHIVALIST_PROFILING_STACK_ID']
+    ENV['ARCHIVALIST_PROFILING_STACK_ID'] = '844ef09c'
+    assert ArchivalistHarnessSafety.valid_backend_url?('http://archivalist-profiling-backend-844ef09c:4567')
+    assert ArchivalistHarnessSafety.valid_solr_url?('http://archivalist-profiling-solr-844ef09c:8983/solr')
+    refute ArchivalistHarnessSafety.valid_backend_url?('http://archivalist-profiling-backend-evil:4567')
+    refute ArchivalistHarnessSafety.valid_solr_url?('http://archivalist-profiling-solr-evil:8983/solr')
+  ensure
+    old_stack_id.nil? ? ENV.delete('ARCHIVALIST_PROFILING_STACK_ID') : ENV['ARCHIVALIST_PROFILING_STACK_ID'] = old_stack_id
+  end
+
   def test_backend_url_validation_rejects_external_hosts_and_credentials
     refute ArchivalistHarnessSafety.valid_backend_url?('http://evil.com:4567')
     refute ArchivalistHarnessSafety.valid_backend_url?('http://192.168.1.50:4567')
