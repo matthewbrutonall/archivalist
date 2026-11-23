@@ -330,19 +330,6 @@ if __FILE__ == $PROGRAM_NAME
 
   include JSONModel
 
-  selected_repo_id = ENV['STAFF_REPOSITORY_ID']
-  if selected_repo_id
-    selected_repo_id = Integer(selected_repo_id, 10)
-    raise 'STAFF_REPOSITORY_ID must be positive' unless selected_repo_id.positive?
-
-    repository_model = JSONModel(:repository)
-    original_all = repository_model.method(:all)
-    repository_model.define_singleton_method(:all) do |*args|
-      NativeIndexingProfile.select_profile_repositories(original_all.call(*args), selected_repo_id)
-    end
-    puts "Bounded smoke scope: repository #{selected_repo_id} only"
-  end
-
   effective_pui_tree_batch_size = PUIIndexer.resolve_tree_discovery_batch_size(
     AppConfig.has_key?(:pui_tree_discovery_batch_size) ? AppConfig[:pui_tree_discovery_batch_size] : nil,
     AppConfig[:pui_indexer_records_per_thread]
@@ -387,6 +374,18 @@ if __FILE__ == $PROGRAM_NAME
   # Inventory: what a full round will index (counts only).
   inventory_indexer = PeriodicIndexer.new(BACKEND_BASE, nil, 'Native Profile Inventory', false)
   inventory_indexer.login
+  selected_repo_id = ENV['STAFF_REPOSITORY_ID']
+  if selected_repo_id
+    selected_repo_id = Integer(selected_repo_id, 10)
+    raise 'STAFF_REPOSITORY_ID must be positive' unless selected_repo_id.positive?
+
+    repository_model = JSONModel(:repository)
+    original_all = repository_model.method(:all)
+    repository_model.define_singleton_method(:all) do |*args|
+      NativeIndexingProfile.select_profile_repositories(original_all.call(*args), selected_repo_id)
+    end
+    puts "Bounded smoke scope: repository #{selected_repo_id} only"
+  end
   inventory = JSONModel(:repository).all.map do |repo|
     JSONModel.set_repository(repo.id)
     counts = inventory_indexer.record_types.each_with_object({}) do |type, out|
