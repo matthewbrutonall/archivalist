@@ -25,11 +25,13 @@ class TestRunGate3CombinedCandidate(unittest.TestCase):
             "identity_core": "archivalist_profiling_identity_844ef09c",
             "app_container": "archivesspaceai-app-1",
         }
-        command = harness.build_native_profile_command(state, "a" * 32, "-Xmx8g", 12)
+        command = harness.build_native_profile_command(state, "a" * 32, "-Xmx8g", 12, "b" * 40, False)
         self.assertIn("STAFF_THREADS=12", command)
         self.assertIn("JAVA_OPTS=-Xmx8g -Xss16m", command)
         self.assertIn("MODES=staff", command)
         self.assertIn("TIMERS=0", command)
+        self.assertIn(f"ARCHIVALIST_GIT_COMMIT={'b' * 40}", command)
+        self.assertIn("ARCHIVALIST_GIT_DIRTY=false", command)
 
     def test_native_staff_threads_argument_rejects_out_of_range_value(self):
         with patch.object(sys, "argv", ["harness", "--native-staff-threads", "33"]):
