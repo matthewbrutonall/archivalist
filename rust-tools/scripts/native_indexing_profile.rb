@@ -72,6 +72,15 @@ module NativeIndexingProfile
     sorted.length.odd? ? sorted[mid] : ((sorted[mid - 1] + sorted[mid]) / 2.0).round(3)
   end
 
+  def self.select_profile_repositories(repositories, repo_id)
+    return repositories if repo_id.nil?
+
+    selected = repositories.select { |repository| repository.id.to_i == repo_id }
+    raise "STAFF_REPOSITORY_ID #{repo_id} did not resolve to exactly one repository" unless selected.length == 1
+
+    selected
+  end
+
   def self.compute_cpu_delta(t_start, t_end)
     return { 'cpu_user_ms' => nil, 'cpu_system_ms' => nil } if t_start.nil? || t_end.nil?
 
@@ -320,6 +329,19 @@ if __FILE__ == $PROGRAM_NAME
   require 'index_batch'
 
   include JSONModel
+
+  selected_repo_id = ENV['STAFF_REPOSITORY_ID']
+  if selected_repo_id
+    selected_repo_id = Integer(selected_repo_id, 10)
+    raise 'STAFF_REPOSITORY_ID must be positive' unless selected_repo_id.positive?
+
+    repository_model = JSONModel(:repository)
+    original_all = repository_model.method(:all)
+    repository_model.define_singleton_method(:all) do |*args|
+      NativeIndexingProfile.select_profile_repositories(original_all.call(*args), selected_repo_id)
+    end
+    puts "Bounded smoke scope: repository #{selected_repo_id} only"
+  end
 
   effective_pui_tree_batch_size = PUIIndexer.resolve_tree_discovery_batch_size(
     AppConfig.has_key?(:pui_tree_discovery_batch_size) ? AppConfig[:pui_tree_discovery_batch_size] : nil,

@@ -274,6 +274,7 @@ class TestRunGate3CombinedCandidate(unittest.TestCase):
             solr_host_url="http://127.0.0.1:8983/solr",
             cand_core="cand_core_1",
             active_arks=True,
+            concurrency=12,
         )
         self.assertNotIn("--password", cmd)
         self.assertNotIn("-P", cmd)
@@ -281,6 +282,7 @@ class TestRunGate3CombinedCandidate(unittest.TestCase):
         self.assertNotIn(sentinel, " ".join(cmd))
         self.assertNotIn(sentinel, str(cmd))
         self.assertIn("staff-combined-candidate", cmd)
+        self.assertEqual(cmd[cmd.index("--concurrency") + 1], "12")
 
     def test_build_candidate_cli_env_sets_aspace_password_without_modifying_base(self):
         sentinel = "SUPER_SECRET_SENTINEL_XYZ_98765"
