@@ -656,7 +656,7 @@ def run_slice_parity_comparison(
     }
 
 
-def build_native_profile_command(state, nonce, java_opts, staff_threads):
+def build_native_profile_command(state, nonce, java_opts, staff_threads, git_commit, git_dirty):
     effective_java_opts = f"{java_opts} -Xss16m".strip()
     return [
         "docker", "exec",
@@ -669,6 +669,8 @@ def build_native_profile_command(state, nonce, java_opts, staff_threads):
         "-e", "MODES=staff", "-e", "REPEATS=1", "-e", "TIMERS=0",
         "-e", f"STAFF_THREADS={staff_threads}",
         "-e", f"JAVA_OPTS={effective_java_opts}",
+        "-e", f"ARCHIVALIST_GIT_COMMIT={git_commit}",
+        "-e", f"ARCHIVALIST_GIT_DIRTY={str(git_dirty).lower()}",
         "-w", "/archivesspace", state["app_container"],
         "/archivesspace/scripts/jruby",
         "/archivesspace/rust-tools/scripts/native_indexing_profile.rb",
@@ -1133,7 +1135,7 @@ def run_harness() -> int:
         ).stdout.strip()
         native_java_opts = f"{java_opts} -Xss16m".strip()
         native_cmd = build_native_profile_command(
-            state, nonce, java_opts, args.native_staff_threads,
+            state, nonce, java_opts, args.native_staff_threads, git_head, is_dirty,
         )
         print("Running same-state native STAFF round in a fresh isolated core...", flush=True)
         native_proc = subprocess.run(native_cmd, capture_output=True, text=True)
