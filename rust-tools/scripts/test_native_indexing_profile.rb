@@ -25,6 +25,14 @@ require_relative 'native_indexing_profile'
 class TestNativeIndexingProfileInstrumentation < Minitest::Test
   CpuTimesMock = Struct.new(:utime, :stime)
 
+  def test_profile_repository_filter_is_exact_and_fail_closed
+    repository = Struct.new(:id).new(3)
+    other = Struct.new(:id).new(4)
+    assert_equal [repository], NativeIndexingProfile.select_profile_repositories([repository, other], 3)
+    assert_raises(RuntimeError) { NativeIndexingProfile.select_profile_repositories([repository, other], 5) }
+    assert_raises(RuntimeError) { NativeIndexingProfile.select_profile_repositories([repository, repository], 3) }
+  end
+
   # --- CPU Delta Tests ---
 
   def test_compute_cpu_delta_positive

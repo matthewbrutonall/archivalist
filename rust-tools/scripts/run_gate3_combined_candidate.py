@@ -421,6 +421,7 @@ def build_candidate_cli_command(
     solr_host_url: str,
     cand_core: str,
     active_arks: bool,
+    concurrency: int = 4,
 ) -> List[str]:
     arks_flag = "true" if active_arks else "false"
     return [
@@ -437,7 +438,7 @@ def build_candidate_cli_command(
         "--batch-size",
         "25",
         "--concurrency",
-        "4",
+        str(concurrency),
         "--solr-url",
         solr_host_url,
         "--candidate-core",
@@ -1072,6 +1073,7 @@ def run_harness() -> int:
             solr_host_url=solr_host_url,
             cand_core=cand_core,
             active_arks=bool(active_arks),
+            concurrency=args.concurrency,
         )
     cli_env = build_candidate_cli_env(admin_password=state.get("admin_password"))
 
