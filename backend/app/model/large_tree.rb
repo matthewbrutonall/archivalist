@@ -117,6 +117,7 @@ class LargeTree
 
     if precomputed_waypoint &&
        (!precomputed_waypoint.is_a?(Array) || precomputed_waypoint.length != [child_count, WAYPOINT_SIZE].min)
+
       Log.warn("Shadow resource tree root waypoint count mismatch, falling back to LargeTree")
       precomputed_waypoint = nil
     end
@@ -150,6 +151,7 @@ class LargeTree
     precomputed_waypoint = waypoint_loader.call(candidate_child_count)
     if precomputed_waypoint &&
        (!precomputed_waypoint.is_a?(Array) || precomputed_waypoint.length != [candidate_child_count, WAYPOINT_SIZE].min)
+
       Log.warn("Shadow resource tree node waypoint count mismatch, falling back to LargeTree")
       precomputed_waypoint = nil
     end
