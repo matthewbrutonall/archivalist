@@ -405,10 +405,196 @@ class TestGate4MutationDuringPassHandoff(unittest.TestCase):
         with self.assertRaises(harness.Gate4MutationHandoffError):
             harness.verify_repo3_mutation_targets_read_only(bad_api2)
 
+    def test_select_repo4_ao_sentinel_uri_numeric_order_and_filtering(self) -> None:
+        # Must use numeric ordering (10000 < 20000 < 100000) and ignore other repos, types, and malformed URIs
+        native_docs = {
+            "/repositories/2": {"id": "/repositories/2", "primary_type": "repository"},
+            "/repositories/3/archival_objects/1": {
+                "id": "/repositories/3/archival_objects/1",
+                "primary_type": "archival_object",
+                "repository": "/repositories/3",
+            },
+            "/repositories/3/archival_objects/2010": {
+                "id": "/repositories/3/archival_objects/2010",
+                "primary_type": "archival_object",
+                "repository": "/repositories/3",
+            },
+            "/repositories/4/resources/1": {
+                "id": "/repositories/4/resources/1",
+                "primary_type": "resource",
+                "repository": "/repositories/4",
+            },
+            "/repositories/4/top_containers/1": {
+                "id": "/repositories/4/top_containers/1",
+                "primary_type": "top_container",
+                "repository": "/repositories/4",
+            },
+            "/repositories/4/archival_objects/0": {"id": "/repositories/4/archival_objects/0"},
+            "/repositories/4/archival_objects/01": {"id": "/repositories/4/archival_objects/01"},
+            "/repositories/4/archival_objects/-5": {"id": "/repositories/4/archival_objects/-5"},
+            "/repositories/4/archival_objects/abc": {"id": "/repositories/4/archival_objects/abc"},
+            "/repositories/4/archival_objects/1/children": {"id": "/repositories/4/archival_objects/1/children"},
+            "/repositories/4/archival_objects/": {"id": "/repositories/4/archival_objects/"},
+            "/repositories/4/archival_objects/2": {
+                "id": "/repositories/4/archival_objects/2",
+                "primary_type": "resource",
+                "repository": "/repositories/4",
+            },
+            "/repositories/4/archival_objects/3": {
+                "id": "/repositories/4/archival_objects/3",
+                "primary_type": "archival_object",
+                "repository": "/repositories/3",
+            },
+            "/repositories/4/archival_objects/100000": {
+                "id": "/repositories/4/archival_objects/100000",
+                "primary_type": "archival_object",
+                "repository": "/repositories/4",
+            },
+            "/repositories/4/archival_objects/20000": {
+                "id": "/repositories/4/archival_objects/20000",
+                "primary_type": "archival_object",
+                "repository": "/repositories/4",
+            },
+            "/repositories/4/archival_objects/10000": {
+                "id": "/repositories/4/archival_objects/10000",
+                "primary_type": "archival_object",
+                "repository": "/repositories/4",
+            },
+            "/repositories/4/archival_objects/10001": {
+                "id": "/repositories/4/archival_objects/10001",
+                "primary_type": "archival_object",
+                "repository": "/repositories/4",
+            },
+        }
+        chosen = harness.select_repo4_ao_sentinel_uri(native_docs)
+        self.assertEqual(chosen, "/repositories/4/archival_objects/10000")
+        self.assertEqual(
+            harness.validate_repo4_ao_sentinel_uri(chosen, native_docs_by_id=native_docs),
+            10000,
+        )
+
+        # Lexicographically "10000" < "9999", but numerically 9999 < 10000
+        with_9999 = dict(native_docs)
+        with_9999["/repositories/4/archival_objects/9999"] = {
+            "id": "/repositories/4/archival_objects/9999",
+            "primary_type": "archival_object",
+            "repository": "/repositories/4",
+        }
+        self.assertEqual(
+            harness.select_repo4_ao_sentinel_uri(with_9999),
+            "/repositories/4/archival_objects/9999",
+        )
+
+    def test_select_repo4_ao_sentinel_uri_refuses_empty_or_missing_repo4_ao_set(self) -> None:
+        only_other_records = {
+            "/repositories/3/archival_objects/1": {
+                "id": "/repositories/3/archival_objects/1",
+                "primary_type": "archival_object",
+                "repository": "/repositories/3",
+            },
+            "/repositories/4/resources/2": {
+                "id": "/repositories/4/resources/2",
+                "primary_type": "resource",
+                "repository": "/repositories/4",
+            },
+            "/repositories/4/archival_objects/0": {"id": "/repositories/4/archival_objects/0"},
+            "/repositories/4/archival_objects/bad": {"id": "/repositories/4/archival_objects/bad"},
+        }
+        with self.assertRaises(harness.Gate4MutationHandoffError):
+            harness.select_repo4_ao_sentinel_uri({})
+        with self.assertRaises(harness.Gate4MutationHandoffError):
+            harness.select_repo4_ao_sentinel_uri(only_other_records)
+        with self.assertRaises(harness.Gate4MutationHandoffError):
+            harness.validate_repo4_ao_sentinel_uri(
+                "/repositories/4/archival_objects/10000",
+                native_docs_by_id=only_other_records,
+            )
+
+    def test_verify_repo4_sentinel_in_fixed_native_core_probes_and_verifies_doc(self) -> None:
+        def fake_http_get_json(url: str) -> dict:
+            if "sort=id+asc" in url:
+                return {
+                    "response": {
+                        "numFound": 998970,
+                        "docs": [
+                            {
+                                "id": "/repositories/4/archival_objects/10000",
+                                "uri": "/repositories/4/archival_objects/10000",
+                                "title": "Repo 4 First AO 10000",
+                                "primary_type": "archival_object",
+                                "repository": "/repositories/4",
+                            },
+                            {
+                                "id": "/repositories/4/archival_objects/100000",
+                                "uri": "/repositories/4/archival_objects/100000",
+                                "title": "Repo 4 AO 100000",
+                                "primary_type": "archival_object",
+                                "repository": "/repositories/4",
+                            },
+                        ],
+                    }
+                }
+            if "id%3A%22%2Frepositories%2F4%2Farchival_objects%2F10000%22" in url:
+                return {
+                    "response": {
+                        "numFound": 1,
+                        "docs": [
+                            {
+                                "id": "/repositories/4/archival_objects/10000",
+                                "uri": "/repositories/4/archival_objects/10000",
+                                "title": "Repo 4 First AO 10000",
+                                "primary_type": "archival_object",
+                                "repository": "/repositories/4",
+                            }
+                        ],
+                    }
+                }
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        info = harness.verify_repo4_sentinel_in_fixed_native_core(
+            "http://127.0.0.1:28983/solr",
+            harness.FIXED_NATIVE_CORE,
+            http_get_json=fake_http_get_json,
+        )
+        self.assertEqual(info["sentinel_uri"], "/repositories/4/archival_objects/10000")
+        self.assertEqual(info["sentinel_ao_id"], 10000)
+        self.assertTrue(info["verified_in_fixed_native_core"])
+
+    def test_extract_identity_nonce_from_repo2_doc_reads_candidate_doc_nonce(self) -> None:
+        rotated_nonce = "852f279a5f0ba2945f5d0f2a3910550b"
+        cand_docs = {
+            "/repositories/2": {
+                "id": "/repositories/2",
+                "json": json.dumps(
+                    {
+                        "uri": "/repositories/2",
+                        "repo_code": "ARCHPROF-844ef09c",
+                        "name": f"archivalist profiling identity {rotated_nonce}",
+                    }
+                ),
+            }
+        }
+        self.assertEqual(
+            harness.extract_identity_nonce_from_repo2_doc(cand_docs, label="candidate"),
+            rotated_nonce,
+        )
+        with self.assertRaises(harness.Gate4MutationHandoffError):
+            harness.extract_identity_nonce_from_repo2_doc({}, label="candidate")
+
     def test_guarded_mutations_wait_for_tlog_and_preserve_net_count(self) -> None:
         api = FakeAspaceRepo3Api()
         cand_core = "stage_staff_20261124_132000_12345_cafebabe_candidate"
+        sentinel_uri = "/repositories/4/archival_objects/10000"
+        native_docs = {
+            sentinel_uri: {
+                "id": sentinel_uri,
+                "primary_type": "archival_object",
+                "repository": "/repositories/4",
+                "title": "Repo 4 First AO 10000",
+            }
+        }
         clock = {"mono": 100.0, "epoch": 1795520000.0, "polls": 0}
+        get_urls: list[str] = []
 
         def monotonic_fn() -> float:
             return clock["mono"]
@@ -428,16 +614,19 @@ class TestGate4MutationDuringPassHandoff(unittest.TestCase):
             if "/select?" in url:
                 return {"response": {"numFound": 0}}
             if "/get?" in url:
+                get_urls.append(url)
+                self.assertNotIn("repositories%2F4%2Farchival_objects%2F1&", url)
+                self.assertNotIn("repositories%2F4%2Farchival_objects%2F1$", url)
                 clock["polls"] += 1
-                # First poll (3 requests): repo 3 is in tlog, but repo 4 AO 1 not yet in tlog
+                # First poll (3 requests): repo 3 is in tlog, but repo 4 sentinel 10000 not yet in tlog
                 if "archival_objects%2F2009" in url:
                     return {"doc": {"id": "/repositories/3/archival_objects/2009", "title": "Fixture Leaf A"}}
                 if "archival_objects%2F2010" in url:
                     return {"doc": {"id": "/repositories/3/archival_objects/2010", "title": "Fixture Leaf B"}}
-                if "repositories%2F4%2Farchival_objects%2F1" in url:
+                if "repositories%2F4%2Farchival_objects%2F10000" in url:
                     if clock["polls"] <= 3:
                         return {"doc": None}
-                    return {"doc": {"id": "/repositories/4/archival_objects/1", "title": "Repo 4 AO 1"}}
+                    return {"doc": {"id": sentinel_uri, "title": "Repo 4 First AO 10000"}}
             raise AssertionError(f"Unexpected URL {url}")
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -449,6 +638,8 @@ class TestGate4MutationDuringPassHandoff(unittest.TestCase):
                 mutation_token="20261124_deadbeef",
                 cli_launch_monotonic=100.0,
                 cli_launch_epoch=1795520000.0,
+                repo4_sentinel_uri=sentinel_uri,
+                native_docs_by_id=native_docs,
                 min_delay_sec=45.0,
                 max_wait_sec=180.0,
                 poll_interval_sec=3.0,
@@ -460,6 +651,15 @@ class TestGate4MutationDuringPassHandoff(unittest.TestCase):
                 mutations_evidence_path=ev_path,
             )
             self.assertEqual(res["status"], "mutations_applied_and_audited")
+            self.assertEqual(res["repo4_sentinel_uri"], sentinel_uri)
+            self.assertEqual(res["repo4_sentinel_ao_id"], 10000)
+            self.assertEqual(res["pre_mutation_guard"]["repo4_sentinel_uri"], sentinel_uri)
+            self.assertTrue(res["pre_mutation_guard"]["repo4_sentinel_in_tlog"])
+            self.assertEqual(
+                res["pre_mutation_guard"]["repo4_sentinel_tlog_title"],
+                "Repo 4 First AO 10000",
+            )
+            self.assertTrue(any("repositories%2F4%2Farchival_objects%2F10000" in u for u in get_urls))
             self.assertGreaterEqual(res["mutation_started_elapsed_since_cli_launch_sec"], 48.0)
             self.assertEqual(res["repo3_ao_count_before"], 2010)
             self.assertEqual(res["repo3_ao_count_after"], 2010)
@@ -470,9 +670,40 @@ class TestGate4MutationDuringPassHandoff(unittest.TestCase):
             self.assertEqual(res["mutations"]["create"]["position_after"], 8)
             self.assertEqual(os.stat(ev_path).st_mode & 0o777, 0o600)
 
-    def test_guarded_mutations_abort_without_changes_if_process_dead_or_core_committed(self) -> None:
+    def test_guarded_mutations_abort_without_changes_if_process_dead_or_core_committed_or_bad_sentinel(self) -> None:
         api = FakeAspaceRepo3Api()
         cand_core = "stage_staff_20261124_132000_12345_cafebabe_candidate"
+        sentinel_uri = "/repositories/4/archival_objects/10000"
+
+        # Case 0: invalid or unverified sentinel URI
+        for bad_sentinel in ("", "/repositories/3/archival_objects/10000", "/repositories/4/archival_objects/0"):
+            with self.assertRaises(harness.Gate4MutationHandoffError):
+                harness.execute_guarded_mutations_during_pass(
+                    api=api,
+                    solr_host_url="http://127.0.0.1:28983/solr",
+                    candidate_core=cand_core,
+                    mutation_token="tok",
+                    cli_launch_monotonic=0.0,
+                    cli_launch_epoch=1795520000.0,
+                    repo4_sentinel_uri=bad_sentinel,
+                    min_delay_sec=0.0,
+                    max_wait_sec=10.0,
+                )
+        with self.assertRaises(harness.Gate4MutationHandoffError):
+            harness.execute_guarded_mutations_during_pass(
+                api=api,
+                solr_host_url="http://127.0.0.1:28983/solr",
+                candidate_core=cand_core,
+                mutation_token="tok",
+                cli_launch_monotonic=0.0,
+                cli_launch_epoch=1795520000.0,
+                repo4_sentinel_uri=sentinel_uri,
+                native_docs_by_id={},
+                min_delay_sec=0.0,
+                max_wait_sec=10.0,
+            )
+        self.assertEqual(api.post_calls, [])
+        self.assertEqual(api.delete_calls, [])
 
         # Case 1: aspace-cli not alive
         with self.assertRaises(harness.Gate4MutationHandoffError):
@@ -483,6 +714,7 @@ class TestGate4MutationDuringPassHandoff(unittest.TestCase):
                 mutation_token="tok",
                 cli_launch_monotonic=0.0,
                 cli_launch_epoch=1795520000.0,
+                repo4_sentinel_uri=sentinel_uri,
                 min_delay_sec=0.0,
                 max_wait_sec=10.0,
                 find_cli_proc_fn=lambda _c: None,
@@ -502,12 +734,46 @@ class TestGate4MutationDuringPassHandoff(unittest.TestCase):
                 mutation_token="tok",
                 cli_launch_monotonic=0.0,
                 cli_launch_epoch=1795520000.0,
+                repo4_sentinel_uri=sentinel_uri,
                 min_delay_sec=0.0,
                 max_wait_sec=10.0,
                 find_cli_proc_fn=lambda _c: {"pid": 123, "comm": "aspace-cli"},
                 http_get_json=lambda _u: {"response": {"numFound": 1036427}},
                 sleep_fn=lambda _d: None,
                 monotonic_fn=lambda: 1.0,
+            )
+        self.assertEqual(api.post_calls, [])
+        self.assertEqual(api.delete_calls, [])
+
+        # Case 3: sentinel never enters candidate TLog before timeout -> zero mutations
+        clock = {"mono": 0.0}
+
+        def advance_sleep(dt: float) -> None:
+            clock["mono"] += dt
+
+        def tlog_missing_sentinel(url: str) -> dict:
+            if "/select?" in url:
+                return {"response": {"numFound": 0}}
+            if "archival_objects%2F2009" in url or "archival_objects%2F2010" in url:
+                return {"doc": {"id": "ok"}}
+            return {"doc": None}
+
+        with self.assertRaises(harness.Gate4MutationHandoffError):
+            harness.execute_guarded_mutations_during_pass(
+                api=api,
+                solr_host_url="http://127.0.0.1:28983/solr",
+                candidate_core=cand_core,
+                mutation_token="tok",
+                cli_launch_monotonic=0.0,
+                cli_launch_epoch=1795520000.0,
+                repo4_sentinel_uri=sentinel_uri,
+                min_delay_sec=0.0,
+                max_wait_sec=6.0,
+                poll_interval_sec=3.0,
+                find_cli_proc_fn=lambda _c: {"pid": 123, "comm": "aspace-cli"},
+                http_get_json=tlog_missing_sentinel,
+                sleep_fn=advance_sleep,
+                monotonic_fn=lambda: clock["mono"],
             )
         self.assertEqual(api.post_calls, [])
         self.assertEqual(api.delete_calls, [])

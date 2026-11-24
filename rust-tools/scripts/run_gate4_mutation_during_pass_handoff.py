@@ -22,7 +22,9 @@ stack 844ef09c ONLY:
 
 2. Fixed-reference candidate run + guarded delayed mutator:
    - Loads the 1,036,427 reference documents from fixed read-only native core
-     `stage_staff_20261124_010605_9807_36038e70_native`.
+     `stage_staff_20261124_010605_9807_36038e70_native` and derives the repo-4
+     AO progress sentinel URI (numerically smallest `/repositories/4/archival_objects/<id>`
+     verified present in the fixed native reference core).
    - Creates a fresh unique candidate core `stage_staff_<run_nonce>_candidate`.
    - Launches `aspace-cli staff-full-candidate` via `peak_rss.run_with_peak_rss`
      (which uses a clean exec helper so parent memory does not inflate child
@@ -32,9 +34,9 @@ stack 844ef09c ONLY:
    - The mutator waits until `aspace-cli` is alive, candidate core `/select`
      `numFound == 0` (uncommitted), Solr RealTime Get (`/get`) on the candidate
      core confirms repo-3 AOs 2009 and 2010 are already in the candidate core's
-     uncommitted transaction log, AND repo-4 AO `/repositories/4/archival_objects/1`
-     is in the transaction log (proving repo 3 is complete and the long repo-4
-     AO pass is underway).
+     uncommitted transaction log, AND the derived fixed-native repo-4 AO sentinel
+     (e.g. `/repositories/4/archival_objects/10000`) is in the transaction log
+     (proving repo 3 is complete and the long repo-4 AO pass is underway).
    - Saves mode-0600 before/after records and timestamps while applying exactly
      three repo-3 AO mutations via the API with `lock_version` checks:
        a) Update title on `/repositories/3/archival_objects/2009`
@@ -585,6 +587,160 @@ def solr_select_num_found(
     return num_found
 
 
+REPO4_ID = 4
+REPO4_AO_URI_RE = re.compile(r"^/repositories/4/archival_objects/([1-9][0-9]*)$")
+
+
+def validate_repo4_ao_sentinel_uri(
+    sentinel_uri: Any,
+    native_docs_by_id: Optional[Mapping[str, Any]] = None,
+) -> int:
+    """Validates a repo-4 archival_object sentinel URI and optionally confirms presence in native_docs_by_id."""
+    if not isinstance(sentinel_uri, str):
+        raise Gate4MutationHandoffError(
+            f"Repo-4 AO sentinel URI must be a string (got {sentinel_uri!r})"
+        )
+    match = REPO4_AO_URI_RE.fullmatch(sentinel_uri)
+    if not match:
+        raise Gate4MutationHandoffError(
+            f"Invalid repo-4 AO sentinel URI {sentinel_uri!r}; expected /repositories/4/archival_objects/<positive_int>"
+        )
+    ao_id = int(match.group(1))
+    if native_docs_by_id is not None:
+        if sentinel_uri not in native_docs_by_id or native_docs_by_id[sentinel_uri] is None:
+            raise Gate4MutationHandoffError(
+                f"Repo-4 AO sentinel URI {sentinel_uri!r} is missing from fixed native reference documents"
+            )
+        doc = native_docs_by_id[sentinel_uri]
+        if isinstance(doc, Mapping):
+            ptype = doc.get("primary_type")
+            repo = doc.get("repository")
+            doc_id = doc.get("id")
+            if ptype is not None and ptype != "archival_object":
+                raise Gate4MutationHandoffError(
+                    f"Repo-4 AO sentinel {sentinel_uri!r} has unexpected primary_type={ptype!r} in native reference"
+                )
+            if repo is not None and repo != f"/repositories/{REPO4_ID}":
+                raise Gate4MutationHandoffError(
+                    f"Repo-4 AO sentinel {sentinel_uri!r} has unexpected repository={repo!r} in native reference"
+                )
+            if doc_id is not None and doc_id != sentinel_uri:
+                raise Gate4MutationHandoffError(
+                    f"Repo-4 AO sentinel {sentinel_uri!r} has mismatched doc id={doc_id!r} in native reference"
+                )
+    return ao_id
+
+
+def select_repo4_ao_sentinel_uri(native_docs_by_id: Mapping[str, Any]) -> str:
+    """Derives the numerically smallest valid `/repositories/4/archival_objects/<id>` URI from `native_docs_by_id`."""
+    if not isinstance(native_docs_by_id, Mapping):
+        raise Gate4MutationHandoffError("native_docs_by_id must be a mapping")
+    candidates: List[Tuple[int, str]] = []
+    for uri, doc in native_docs_by_id.items():
+        if not isinstance(uri, str) or doc is None:
+            continue
+        match = REPO4_AO_URI_RE.fullmatch(uri)
+        if not match:
+            continue
+        if isinstance(doc, Mapping):
+            ptype = doc.get("primary_type")
+            repo = doc.get("repository")
+            doc_id = doc.get("id")
+            if ptype is not None and ptype != "archival_object":
+                continue
+            if repo is not None and repo != f"/repositories/{REPO4_ID}":
+                continue
+            if doc_id is not None and doc_id != uri:
+                continue
+        ao_id = int(match.group(1))
+        candidates.append((ao_id, uri))
+
+    if not candidates:
+        raise Gate4MutationHandoffError(
+            "No valid /repositories/4/archival_objects/<id> documents found in fixed native reference"
+        )
+    _, chosen_uri = min(candidates, key=lambda item: item[0])
+    validate_repo4_ao_sentinel_uri(chosen_uri, native_docs_by_id=native_docs_by_id)
+    return chosen_uri
+
+
+def verify_repo4_sentinel_in_fixed_native_core(
+    solr_host_url: str,
+    native_core: str,
+    http_get_json: Callable[[str], Dict[str, Any]] = gate4_base.default_http_get_json,
+) -> Dict[str, Any]:
+    """Read-only preflight probe that derives and verifies the repo-4 AO sentinel in the fixed native Solr core."""
+    clean_base = solr_host_url.rstrip("/")
+    params = [
+        ("q", "*:*"),
+        ("fq", f'repository:"/repositories/{REPO4_ID}" AND primary_type:archival_object'),
+        ("fl", "id,uri,title,primary_type,repository"),
+        ("sort", "id asc"),
+        ("rows", "25"),
+        ("wt", "json"),
+    ]
+    resp = http_get_json(f"{clean_base}/{native_core}/select?{urllib.parse.urlencode(params)}")
+    response_obj = resp.get("response") or {}
+    num_found = response_obj.get("numFound")
+    docs = response_obj.get("docs") or []
+    if type(num_found) is not int or num_found <= 0 or not docs:
+        raise Gate4MutationHandoffError(
+            f"Fixed native core '{native_core}' has no repo-4 archival_object docs (numFound={num_found!r})"
+        )
+    sample_by_id: Dict[str, Dict[str, Any]] = {}
+    for doc in docs:
+        if isinstance(doc, Mapping) and isinstance(doc.get("id"), str):
+            sample_by_id[doc["id"]] = dict(doc)
+    sentinel_uri = select_repo4_ao_sentinel_uri(sample_by_id)
+    sentinel_ao_id = validate_repo4_ao_sentinel_uri(sentinel_uri, native_docs_by_id=sample_by_id)
+    verified_doc = solr_select_single_doc(
+        solr_host_url, native_core, sentinel_uri, http_get_json=http_get_json
+    )
+    if not verified_doc:
+        raise Gate4MutationHandoffError(
+            f"Derived repo-4 sentinel {sentinel_uri!r} could not be fetched from fixed native core '{native_core}'"
+        )
+    validate_repo4_ao_sentinel_uri(sentinel_uri, native_docs_by_id={sentinel_uri: verified_doc})
+    return {
+        "native_reference_core": native_core,
+        "sentinel_uri": sentinel_uri,
+        "sentinel_ao_id": sentinel_ao_id,
+        "verified_in_fixed_native_core": True,
+        "repo4_archival_object_num_found": num_found,
+        "sentinel_title": verified_doc.get("title"),
+    }
+
+
+def extract_identity_nonce_from_repo2_doc(
+    docs_by_id: Mapping[str, Mapping[str, Any]],
+    label: str = "candidate",
+) -> str:
+    """Extracts and validates the 32-hex identity challenge nonce from `/repositories/2` stored JSON."""
+    repo2_doc = docs_by_id.get("/repositories/2")
+    if not isinstance(repo2_doc, Mapping):
+        raise Gate4MutationHandoffError(f"Missing /repositories/2 document in {label} core")
+    raw_json = repo2_doc.get("json")
+    if not isinstance(raw_json, str):
+        raise Gate4MutationHandoffError(f"Missing json string on /repositories/2 in {label} core")
+    try:
+        parsed = json.loads(raw_json)
+    except Exception as exc:
+        raise Gate4MutationHandoffError(
+            f"Malformed json on /repositories/2 in {label} core: {exc}"
+        ) from exc
+    name = parsed.get("name") or ""
+    if not isinstance(name, str) or not name.startswith(gate4_base.IDENTITY_NAME_PREFIX):
+        raise Gate4MutationHandoffError(
+            f"Unexpected /repositories/2 name in {label} core: {name!r}"
+        )
+    nonce = name[len(gate4_base.IDENTITY_NAME_PREFIX) :]
+    if not re.fullmatch(r"[0-9a-f]{32}", nonce):
+        raise Gate4MutationHandoffError(
+            f"Malformed 32-hex identity challenge nonce in {label} /repositories/2: {name!r}"
+        )
+    return nonce
+
+
 def solr_select_single_doc(
     solr_host_url: str,
     core_name: str,
@@ -607,6 +763,8 @@ def execute_guarded_mutations_during_pass(
     mutation_token: str,
     cli_launch_monotonic: float,
     cli_launch_epoch: float,
+    repo4_sentinel_uri: str,
+    native_docs_by_id: Optional[Mapping[str, Any]] = None,
     min_delay_sec: float = DEFAULT_MIN_MUTATION_DELAY_SEC,
     max_wait_sec: float = DEFAULT_MAX_MUTATION_WAIT_SEC,
     poll_interval_sec: float = DEFAULT_POLL_INTERVAL_SEC,
@@ -618,11 +776,13 @@ def execute_guarded_mutations_during_pass(
     mutations_evidence_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Waits relative to actual `aspace-cli` child launch, verifies guards, and applies 3 repo-3 AO mutations."""
+    repo4_sentinel_ao_id = validate_repo4_ao_sentinel_uri(
+        repo4_sentinel_uri, native_docs_by_id=native_docs_by_id
+    )
     update_uri = f"/repositories/{TARGET_REPO_ID}/archival_objects/{TARGET_UPDATE_AO_ID}"
     delete_uri = f"/repositories/{TARGET_REPO_ID}/archival_objects/{TARGET_DELETE_AO_ID}"
     parent_uri = f"/repositories/{TARGET_REPO_ID}/archival_objects/{TARGET_PARENT_AO_ID}"
     resource_uri = f"/repositories/{TARGET_REPO_ID}/resources/{TARGET_RESOURCE_ID}"
-    repo4_first_ao_uri = "/repositories/4/archival_objects/1"
 
     polls: List[Dict[str, Any]] = []
     ready_guard_snapshot: Optional[Dict[str, Any]] = None
@@ -632,7 +792,7 @@ def execute_guarded_mutations_during_pass(
         if elapsed > max_wait_sec:
             raise Gate4MutationHandoffError(
                 f"Timed out after {elapsed:.2f}s waiting for repo-3 completion / repo-4 AO active guard "
-                f"on candidate core {candidate_core}; zero mutations applied"
+                f"({repo4_sentinel_uri}) on candidate core {candidate_core}; zero mutations applied"
             )
         if elapsed < min_delay_sec:
             sleep_fn(min(poll_interval_sec, max(0.05, min_delay_sec - elapsed)))
@@ -660,8 +820,8 @@ def execute_guarded_mutations_during_pass(
         rt_ao_2010 = solr_realtime_get_doc(
             solr_host_url, candidate_core, delete_uri, http_get_json=http_get_json
         )
-        rt_repo4_ao1 = solr_realtime_get_doc(
-            solr_host_url, candidate_core, repo4_first_ao_uri, http_get_json=http_get_json
+        rt_repo4_sentinel = solr_realtime_get_doc(
+            solr_host_url, candidate_core, repo4_sentinel_uri, http_get_json=http_get_json
         )
 
         poll_entry = {
@@ -670,18 +830,20 @@ def execute_guarded_mutations_during_pass(
             "aspace_cli_vm_rss_kib": cli_proc.get("vm_rss_kib"),
             "aspace_cli_vm_hwm_kib": cli_proc.get("vm_hwm_kib"),
             "candidate_select_num_found": committed_num_found,
+            "repo4_sentinel_uri": repo4_sentinel_uri,
+            "repo4_sentinel_ao_id": repo4_sentinel_ao_id,
             "repo3_ao_2009_in_tlog": rt_ao_2009 is not None,
             "repo3_ao_2010_in_tlog": rt_ao_2010 is not None,
-            "repo4_ao_1_in_tlog": rt_repo4_ao1 is not None,
+            "repo4_sentinel_in_tlog": rt_repo4_sentinel is not None,
         }
         polls.append(poll_entry)
 
-        if rt_ao_2009 is not None and rt_ao_2010 is not None and rt_repo4_ao1 is not None:
+        if rt_ao_2009 is not None and rt_ao_2010 is not None and rt_repo4_sentinel is not None:
             ready_guard_snapshot = {
                 **poll_entry,
                 "repo3_ao_2009_tlog_title": rt_ao_2009.get("title"),
                 "repo3_ao_2010_tlog_title": rt_ao_2010.get("title"),
-                "repo4_ao_1_tlog_title": rt_repo4_ao1.get("title"),
+                "repo4_sentinel_tlog_title": rt_repo4_sentinel.get("title"),
             }
             break
 
@@ -860,6 +1022,8 @@ def execute_guarded_mutations_during_pass(
         "stack_id": EXPECTED_STACK_ID,
         "candidate_core": candidate_core,
         "mutation_token": mutation_token,
+        "repo4_sentinel_uri": repo4_sentinel_uri,
+        "repo4_sentinel_ao_id": repo4_sentinel_ao_id,
         "cli_launch_epoch_sec": round(cli_launch_epoch, 3),
         "mutation_started_epoch_sec": mutation_started_epoch,
         "mutation_started_iso": mutation_started_iso,
@@ -950,10 +1114,19 @@ def verify_candidate_missed_repo3_mutations(
     native_docs_by_id: Mapping[str, Mapping[str, Any]],
     cand_marker_leaks: List[str],
     mutation_result: Mapping[str, Any],
-    candidate_identity_nonce: str,
+    candidate_identity_nonce: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Verifies the Rust candidate matches the pre-mutation native reference (except the 2 nonce records)
     and therefore missed the three repo-3 mutations that occurred after repo 3 was indexed."""
+    doc_candidate_nonce = extract_identity_nonce_from_repo2_doc(cand_docs_by_id, label="candidate")
+    if candidate_identity_nonce is None:
+        candidate_identity_nonce = doc_candidate_nonce
+    elif candidate_identity_nonce != doc_candidate_nonce:
+        raise Gate4MutationHandoffError(
+            f"Provided candidate_identity_nonce {candidate_identity_nonce!r} does not match "
+            f"candidate /repositories/2 document nonce {doc_candidate_nonce!r}"
+        )
+
     parity = gate3_harness.run_slice_parity_comparison(
         dict(cand_docs_by_id),
         dict(native_docs_by_id),
@@ -1531,7 +1704,10 @@ def collect_process_snapshots(state: Mapping[str, Any]) -> Tuple[str, str, str]:
     return host_ps, backend_ps, app_ps
 
 
-def run_read_only_preflight(state_path: str) -> Tuple[Dict[str, Any], Dict[str, Any], AspaceApiSession]:
+def run_read_only_preflight(
+    state_path: str,
+    native_core: str = FIXED_NATIVE_CORE,
+) -> Tuple[Dict[str, Any], Dict[str, Any], AspaceApiSession]:
     git_branch = subprocess.run(
         ["git", "-C", REPO_ROOT, "rev-parse", "--abbrev-ref", "HEAD"],
         capture_output=True,
@@ -1622,6 +1798,11 @@ def run_read_only_preflight(state_path: str) -> Tuple[Dict[str, Any], Dict[str, 
         state["admin_password"],
     )
     repo3_targets = verify_repo3_mutation_targets_read_only(api)
+    repo4_sentinel_preflight = verify_repo4_sentinel_in_fixed_native_core(
+        solr_url,
+        native_core,
+        http_get_json=gate4_base.default_http_get_json,
+    )
 
     preflight_report = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1645,6 +1826,7 @@ def run_read_only_preflight(state_path: str) -> Tuple[Dict[str, Any], Dict[str, 
         "backend_time_zone": tz_out,
         "solr_cores_before": cores_snapshot,
         "repo3_mutation_targets": repo3_targets,
+        "repo4_progress_sentinel": repo4_sentinel_preflight,
     }
     return state, preflight_report, api
 
@@ -1701,7 +1883,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     mutation_token = f"20261124_{secrets.token_hex(4)}"
 
     print(f"=== Gate 4 Mutation-During-Pass & Ruby Handoff Harness (run_nonce={run_nonce}) ===", flush=True)
-    state, preflight_report, api = run_read_only_preflight(args.state)
+    state, preflight_report, api = run_read_only_preflight(args.state, native_core=args.native_core)
     preflight_path = os.path.join(
         args.output_dir,
         f"gate4_mutation_during_pass_preflight_{run_nonce}.json",
@@ -1731,8 +1913,17 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"Native reference core '{args.native_core}' returned {len(native_docs_by_id)} docs "
             f"(expected {EXPECTED_TOTAL_DOCS}), marker_leaks={len(native_marker_leaks)}"
         )
+    repo4_sentinel_uri = select_repo4_ao_sentinel_uri(native_docs_by_id)
+    validate_repo4_ao_sentinel_uri(repo4_sentinel_uri, native_docs_by_id=native_docs_by_id)
+    preflight_sentinel_uri = (preflight_report.get("repo4_progress_sentinel") or {}).get("sentinel_uri")
+    if preflight_sentinel_uri != repo4_sentinel_uri:
+        raise Gate4MutationHandoffError(
+            f"Preflight repo-4 sentinel {preflight_sentinel_uri!r} did not match full native reference "
+            f"derived sentinel {repo4_sentinel_uri!r}"
+        )
     print(
-        f"[STEP 1] Loaded {len(native_docs_by_id)} native reference docs in {t_nat_elapsed:.2f}s.",
+        f"[STEP 1] Loaded {len(native_docs_by_id)} native reference docs in {t_nat_elapsed:.2f}s; "
+        f"verified repo-4 AO sentinel '{repo4_sentinel_uri}' in fixed native reference.",
         flush=True,
     )
 
@@ -1811,6 +2002,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 mutation_token=mutation_token,
                 cli_launch_monotonic=cli_launch_monotonic,
                 cli_launch_epoch=cli_launch_epoch,
+                repo4_sentinel_uri=repo4_sentinel_uri,
+                native_docs_by_id=native_docs_by_id,
                 min_delay_sec=args.min_mutation_delay_sec,
                 max_wait_sec=args.max_mutation_wait_sec,
                 mutations_evidence_path=mutations_evidence_path,
@@ -1871,14 +2064,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"{mutation_result['mutation_started_epoch_sec']}!"
         )
 
-    # Read current /repositories/2 nonce (which aspace-cli's internal verifier wrote before capturing watermark_epoch)
-    repo2_now = gate4_base.default_http_get_json(f"{backend_host_url}/repositories/2")
-    repo2_name_now = repo2_now.get("name") or ""
-    if not repo2_name_now.startswith(gate4_base.IDENTITY_NAME_PREFIX):
-        raise Gate4MutationHandoffError(f"Unexpected /repositories/2 name after candidate pass: {repo2_name_now!r}")
-    candidate_identity_nonce = repo2_name_now[len(gate4_base.IDENTITY_NAME_PREFIX) :]
-
-    # 4. Stream candidate documents and verify candidate missed the 3 repo-3 mutations
+    # 4. Stream candidate documents, extract the rotated candidate identity nonce from candidate
+    #    /repositories/2 document (cross-checked against current GET /repositories/2), and verify
+    #    candidate missed the 3 repo-3 mutations.
     print(f"\n[STEP 4] Streaming candidate core '{cand_core}' and comparing with native reference...", flush=True)
     cand_docs_by_id, cand_marker_leaks = gate3_harness.stream_fetch_solr_core_documents(
         solr_host_url,
@@ -1886,6 +2074,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         fq=None,
         batch_size=1000,
     )
+    candidate_identity_nonce = extract_identity_nonce_from_repo2_doc(cand_docs_by_id, label="candidate")
+    repo2_now = gate4_base.default_http_get_json(f"{backend_host_url}/repositories/2")
+    repo2_name_now = repo2_now.get("name") or ""
+    if not repo2_name_now.startswith(gate4_base.IDENTITY_NAME_PREFIX):
+        raise Gate4MutationHandoffError(f"Unexpected /repositories/2 name after candidate pass: {repo2_name_now!r}")
+    api_identity_nonce_now = repo2_name_now[len(gate4_base.IDENTITY_NAME_PREFIX) :]
+    if api_identity_nonce_now != candidate_identity_nonce:
+        raise Gate4MutationHandoffError(
+            f"Candidate /repositories/2 doc nonce {candidate_identity_nonce!r} != post-run API nonce {api_identity_nonce_now!r}"
+        )
     pre_handoff_comparison = verify_candidate_missed_repo3_mutations(
         cand_docs_by_id=cand_docs_by_id,
         native_docs_by_id=native_docs_by_id,
@@ -1995,6 +2193,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "stack_id": EXPECTED_STACK_ID,
         "native_reference_core": args.native_core,
         "candidate_core": cand_core,
+        "repo4_sentinel_uri": repo4_sentinel_uri,
         "preflight_report_path": preflight_path,
         "mutations_report_path": mutations_evidence_path,
         "cli_summary": cli_summary,
