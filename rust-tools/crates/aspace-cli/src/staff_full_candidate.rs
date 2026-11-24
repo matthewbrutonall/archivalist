@@ -13,7 +13,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::staff_ao_candidate::fetch_and_build_ao_candidate_batch;
 use crate::staff_candidate_runner::{partition_ids_into_batches, CandidateBatchOutput};
@@ -223,6 +223,7 @@ pub struct FullStageSummary {
 
 #[derive(Serialize)]
 pub struct StaffFullCandidateSummary {
+    pub full_reindex_started_at_epoch_sec: u64,
     pub repository_ids: Vec<u32>,
     pub stages: Vec<FullStageSummary>,
     pub total_ids: usize,
@@ -694,6 +695,17 @@ async fn fetch_and_build_batch(
     extract_generic_documents(built.documents, spec, repo_id)
 }
 
+fn capture_full_reindex_started_at_epoch_sec(now: SystemTime) -> Result<u64> {
+    let secs = now
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs();
+    if secs == 0 {
+        bail!("full reindex start epoch must be positive");
+    }
+    Ok(secs)
+}
+
 pub async fn execute_staff_full_candidate(
     client: &Client,
     args: &StaffFullCandidateArgs,
@@ -702,6 +714,8 @@ pub async fn execute_staff_full_candidate(
     crate::profiling_stack::verify_profiling_stack(&args.state, client.base_url(), &args.solr_url)?;
     let mut writer = IsolatedSolrStaffAoWriter::new(&args.solr_url, &args.candidate_core)?;
     writer.verify_target_core_ready().await?;
+    let full_reindex_started_at_epoch_sec =
+        capture_full_reindex_started_at_epoch_sec(SystemTime::now())?;
     let dynamic_enums = Arc::new(client.dynamic_enum_fields_from_schemas().await?);
     let mut repositories = client.staff_repositories_raw().await?;
     repositories.sort_by_key(|repo| repo_id_from_record(repo).unwrap_or(u32::MAX));
@@ -842,6 +856,7 @@ pub async fn execute_staff_full_candidate(
     }
     writer.commit().await?;
     Ok(StaffFullCandidateSummary {
+        full_reindex_started_at_epoch_sec,
         repository_ids: repo_ids,
         stages,
         total_ids,
@@ -979,5 +994,40 @@ mod tests {
             }]
         });
         assert!(extract_generic_documents(vec![invalid], TYPES[2], 4).is_err());
+    }
+
+    #[test]
+    fn full_candidate_summary_serializes_positive_integer_start_watermark() {
+        use std::time::Duration;
+
+        let epoch = capture_full_reindex_started_at_epoch_sec(
+            UNIX_EPOCH + Duration::from_secs(1_795_473_955),
+        )
+        .unwrap();
+        assert_eq!(epoch, 1_795_473_955);
+        assert!(capture_full_reindex_started_at_epoch_sec(UNIX_EPOCH).is_err());
+        assert!(
+            capture_full_reindex_started_at_epoch_sec(UNIX_EPOCH - Duration::from_secs(1)).is_err()
+        );
+
+        let summary = StaffFullCandidateSummary {
+            full_reindex_started_at_epoch_sec: epoch,
+            repository_ids: vec![2, 3, 4],
+            stages: Vec::new(),
+            total_ids: 1_036_427,
+            total_documents: 1_036_427,
+            unique_uris: 1_036_427,
+            batches_completed: 41_463,
+            solr_update_requests_sent: 2_075,
+            wall_elapsed_sec: 12.345,
+            committed: true,
+            candidate_core: "stage_staff_20261124_000000_1_deadbeef_candidate".to_string(),
+        };
+        let serialized = serde_json::to_value(&summary).unwrap();
+        assert_eq!(
+            serialized["full_reindex_started_at_epoch_sec"],
+            json!(1_795_473_955_u64)
+        );
+        assert!(serialized["full_reindex_started_at_epoch_sec"].is_u64());
     }
 }
