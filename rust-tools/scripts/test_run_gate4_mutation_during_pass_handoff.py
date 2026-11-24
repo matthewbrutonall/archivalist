@@ -650,16 +650,57 @@ class TestGate4MutationDuringPassHandoff(unittest.TestCase):
         self.assertTrue(verified["verified_in_fixed_native_core"])
         self.assertTrue(verified["verified_in_full_native_reference_map"])
 
+        # Refuse if verified_in_fixed_native_core is absent or not True on an otherwise valid report
+        absent_flag_sentinel = dict(preflight_sentinel)
+        absent_flag_sentinel.pop("verified_in_fixed_native_core", None)
+        with self.assertRaisesRegex(
+            harness.Gate4MutationHandoffError,
+            "verified_in_fixed_native_core=True",
+        ):
+            harness.verify_preflight_repo4_sentinel_in_native_map(
+                {"repo4_progress_sentinel": absent_flag_sentinel},
+                full_native_docs_by_id,
+            )
+
+        for bad_flag in (False, None, 1, "true"):
+            false_flag_sentinel = dict(preflight_sentinel)
+            false_flag_sentinel["verified_in_fixed_native_core"] = bad_flag
+            with self.assertRaisesRegex(
+                harness.Gate4MutationHandoffError,
+                "verified_in_fixed_native_core=True",
+            ):
+                harness.verify_preflight_repo4_sentinel_in_native_map(
+                    {"repo4_progress_sentinel": false_flag_sentinel},
+                    full_native_docs_by_id,
+                )
+
         # Refuse if preflight has no sentinel or malformed sentinel
         for bad_preflight in (
             {},
             {"repo4_progress_sentinel": None},
             {"repo4_progress_sentinel": {}},
-            {"repo4_progress_sentinel": {"sentinel_uri": ""}},
-            {"repo4_progress_sentinel": {"sentinel_uri": "/repositories/3/archival_objects/10000"}},
+            {
+                "repo4_progress_sentinel": {
+                    "sentinel_uri": "",
+                    "verified_in_fixed_native_core": True,
+                }
+            },
+            {
+                "repo4_progress_sentinel": {
+                    "sentinel_uri": "/repositories/3/archival_objects/10000",
+                    "verified_in_fixed_native_core": True,
+                }
+            },
             {
                 "repo4_progress_sentinel": {
                     "sentinel_uri": "/repositories/4/archival_objects/10000",
+                    "sentinel_ao_id": 10000,
+                }
+            },
+            {
+                "repo4_progress_sentinel": {
+                    "sentinel_uri": "/repositories/4/archival_objects/10000",
+                    "sentinel_ao_id": 10000,
                     "verified_in_fixed_native_core": False,
                 }
             },
@@ -667,6 +708,7 @@ class TestGate4MutationDuringPassHandoff(unittest.TestCase):
                 "repo4_progress_sentinel": {
                     "sentinel_uri": "/repositories/4/archival_objects/10000",
                     "sentinel_ao_id": 2011,
+                    "verified_in_fixed_native_core": True,
                 }
             },
         ):

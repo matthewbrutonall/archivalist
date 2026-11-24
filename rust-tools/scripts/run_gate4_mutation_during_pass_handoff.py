@@ -743,10 +743,7 @@ def verify_preflight_repo4_sentinel_in_native_map(
         raise Gate4MutationHandoffError(
             "Preflight report is missing required 'repo4_progress_sentinel' mapping"
         )
-    if (
-        "verified_in_fixed_native_core" in sentinel_info
-        and sentinel_info.get("verified_in_fixed_native_core") is not True
-    ):
+    if sentinel_info.get("verified_in_fixed_native_core") is not True:
         raise Gate4MutationHandoffError(
             "Preflight repo-4 sentinel was not marked verified_in_fixed_native_core=True"
         )
