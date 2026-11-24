@@ -19,12 +19,15 @@ stack 844ef09c ONLY:
      (/repositories/3/archival_objects/2009, children=[], lock_version=0), and
      leaf delete target AO (/repositories/3/archival_objects/2010, children=[],
      lock_version=0, position=8).
+   - Samples the fixed native reference core (`sort=id asc`, `rows=25`) to
+     select and single-document verify a valid repo-4 archival_object progress
+     sentinel URI (e.g. `/repositories/4/archival_objects/10000`).
 
 2. Fixed-reference candidate run + guarded delayed mutator:
    - Loads the 1,036,427 reference documents from fixed read-only native core
-     `stage_staff_20261124_010605_9807_36038e70_native` and derives the repo-4
-     AO progress sentinel URI (numerically smallest `/repositories/4/archival_objects/<id>`
-     verified present in the fixed native reference core).
+     `stage_staff_20261124_010605_9807_36038e70_native` and validates that the
+     exact repo-4 AO progress sentinel URI sampled in preflight is present and
+     valid (type/repository/id) in the complete native reference mapping.
    - Creates a fresh unique candidate core `stage_staff_<run_nonce>_candidate`.
    - Launches `aspace-cli staff-full-candidate` via `peak_rss.run_with_peak_rss`
      (which uses a clean exec helper so parent memory does not inflate child
@@ -34,9 +37,10 @@ stack 844ef09c ONLY:
    - The mutator waits until `aspace-cli` is alive, candidate core `/select`
      `numFound == 0` (uncommitted), Solr RealTime Get (`/get`) on the candidate
      core confirms repo-3 AOs 2009 and 2010 are already in the candidate core's
-     uncommitted transaction log, AND the derived fixed-native repo-4 AO sentinel
-     (e.g. `/repositories/4/archival_objects/10000`) is in the transaction log
-     (proving repo 3 is complete and the long repo-4 AO pass is underway).
+     uncommitted transaction log, AND the verified fixed-native repo-4 AO
+     sentinel sampled in preflight (e.g. `/repositories/4/archival_objects/10000`)
+     is in the transaction log (proving repo 3 is complete and the long repo-4
+     AO pass is underway).
    - Saves mode-0600 before/after records and timestamps while applying exactly
      three repo-3 AO mutations via the API with `lock_version` checks:
        a) Update title on `/repositories/3/archival_objects/2009`
@@ -607,51 +611,63 @@ def validate_repo4_ao_sentinel_uri(
         )
     ao_id = int(match.group(1))
     if native_docs_by_id is not None:
+        if not isinstance(native_docs_by_id, Mapping):
+            raise Gate4MutationHandoffError("native_docs_by_id must be a mapping")
         if sentinel_uri not in native_docs_by_id or native_docs_by_id[sentinel_uri] is None:
             raise Gate4MutationHandoffError(
                 f"Repo-4 AO sentinel URI {sentinel_uri!r} is missing from fixed native reference documents"
             )
         doc = native_docs_by_id[sentinel_uri]
-        if isinstance(doc, Mapping):
-            ptype = doc.get("primary_type")
-            repo = doc.get("repository")
-            doc_id = doc.get("id")
-            if ptype is not None and ptype != "archival_object":
-                raise Gate4MutationHandoffError(
-                    f"Repo-4 AO sentinel {sentinel_uri!r} has unexpected primary_type={ptype!r} in native reference"
-                )
-            if repo is not None and repo != f"/repositories/{REPO4_ID}":
-                raise Gate4MutationHandoffError(
-                    f"Repo-4 AO sentinel {sentinel_uri!r} has unexpected repository={repo!r} in native reference"
-                )
-            if doc_id is not None and doc_id != sentinel_uri:
-                raise Gate4MutationHandoffError(
-                    f"Repo-4 AO sentinel {sentinel_uri!r} has mismatched doc id={doc_id!r} in native reference"
-                )
+        if not isinstance(doc, Mapping):
+            raise Gate4MutationHandoffError(
+                f"Repo-4 AO sentinel {sentinel_uri!r} entry in native reference is not a mapping"
+            )
+        ptype = doc.get("primary_type")
+        repo = doc.get("repository")
+        doc_id = doc.get("id")
+        doc_uri = doc.get("uri")
+        if ptype != "archival_object":
+            raise Gate4MutationHandoffError(
+                f"Repo-4 AO sentinel {sentinel_uri!r} has unexpected primary_type={ptype!r} in native reference"
+            )
+        if repo != f"/repositories/{REPO4_ID}":
+            raise Gate4MutationHandoffError(
+                f"Repo-4 AO sentinel {sentinel_uri!r} has unexpected repository={repo!r} in native reference"
+            )
+        if doc_id != sentinel_uri:
+            raise Gate4MutationHandoffError(
+                f"Repo-4 AO sentinel {sentinel_uri!r} has mismatched doc id={doc_id!r} in native reference"
+            )
+        if doc_uri is not None and doc_uri != sentinel_uri:
+            raise Gate4MutationHandoffError(
+                f"Repo-4 AO sentinel {sentinel_uri!r} has mismatched doc uri={doc_uri!r} in native reference"
+            )
     return ao_id
 
 
 def select_repo4_ao_sentinel_uri(native_docs_by_id: Mapping[str, Any]) -> str:
-    """Derives the numerically smallest valid `/repositories/4/archival_objects/<id>` URI from `native_docs_by_id`."""
+    """Selects the numerically smallest valid `/repositories/4/archival_objects/<id>` URI from a sampled or provided mapping."""
     if not isinstance(native_docs_by_id, Mapping):
         raise Gate4MutationHandoffError("native_docs_by_id must be a mapping")
     candidates: List[Tuple[int, str]] = []
     for uri, doc in native_docs_by_id.items():
-        if not isinstance(uri, str) or doc is None:
+        if not isinstance(uri, str) or not isinstance(doc, Mapping):
             continue
         match = REPO4_AO_URI_RE.fullmatch(uri)
         if not match:
             continue
-        if isinstance(doc, Mapping):
-            ptype = doc.get("primary_type")
-            repo = doc.get("repository")
-            doc_id = doc.get("id")
-            if ptype is not None and ptype != "archival_object":
-                continue
-            if repo is not None and repo != f"/repositories/{REPO4_ID}":
-                continue
-            if doc_id is not None and doc_id != uri:
-                continue
+        ptype = doc.get("primary_type")
+        repo = doc.get("repository")
+        doc_id = doc.get("id")
+        doc_uri = doc.get("uri")
+        if ptype != "archival_object":
+            continue
+        if repo != f"/repositories/{REPO4_ID}":
+            continue
+        if doc_id != uri:
+            continue
+        if doc_uri is not None and doc_uri != uri:
+            continue
         ao_id = int(match.group(1))
         candidates.append((ao_id, uri))
 
@@ -669,7 +685,7 @@ def verify_repo4_sentinel_in_fixed_native_core(
     native_core: str,
     http_get_json: Callable[[str], Dict[str, Any]] = gate4_base.default_http_get_json,
 ) -> Dict[str, Any]:
-    """Read-only preflight probe that derives and verifies the repo-4 AO sentinel in the fixed native Solr core."""
+    """Read-only preflight probe that samples and verifies a repo-4 AO progress sentinel in the fixed native Solr core."""
     clean_base = solr_host_url.rstrip("/")
     params = [
         ("q", "*:*"),
@@ -698,16 +714,69 @@ def verify_repo4_sentinel_in_fixed_native_core(
     )
     if not verified_doc:
         raise Gate4MutationHandoffError(
-            f"Derived repo-4 sentinel {sentinel_uri!r} could not be fetched from fixed native core '{native_core}'"
+            f"Sampled repo-4 sentinel {sentinel_uri!r} could not be fetched from fixed native core '{native_core}'"
         )
     validate_repo4_ao_sentinel_uri(sentinel_uri, native_docs_by_id={sentinel_uri: verified_doc})
     return {
         "native_reference_core": native_core,
         "sentinel_uri": sentinel_uri,
         "sentinel_ao_id": sentinel_ao_id,
+        "selection_provenance": "verified_sentinel_sampled_from_fixed_native_core",
+        "sample_sort": "id asc",
+        "sample_rows": 25,
         "verified_in_fixed_native_core": True,
         "repo4_archival_object_num_found": num_found,
         "sentinel_title": verified_doc.get("title"),
+    }
+
+
+def verify_preflight_repo4_sentinel_in_native_map(
+    preflight_report: Mapping[str, Any],
+    native_docs_by_id: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Validates the preflight-sampled repo-4 AO sentinel URI against the full `native_docs_by_id`
+    mapping without reselecting the full-map numeric minimum."""
+    if not isinstance(preflight_report, Mapping):
+        raise Gate4MutationHandoffError("preflight_report must be a mapping")
+    sentinel_info = preflight_report.get("repo4_progress_sentinel")
+    if not isinstance(sentinel_info, Mapping):
+        raise Gate4MutationHandoffError(
+            "Preflight report is missing required 'repo4_progress_sentinel' mapping"
+        )
+    if (
+        "verified_in_fixed_native_core" in sentinel_info
+        and sentinel_info.get("verified_in_fixed_native_core") is not True
+    ):
+        raise Gate4MutationHandoffError(
+            "Preflight repo-4 sentinel was not marked verified_in_fixed_native_core=True"
+        )
+    sentinel_uri = sentinel_info.get("sentinel_uri")
+    if not isinstance(sentinel_uri, str) or not sentinel_uri:
+        raise Gate4MutationHandoffError(
+            f"Preflight report is missing valid repo-4 sentinel_uri (got {sentinel_uri!r})"
+        )
+    if not isinstance(native_docs_by_id, Mapping):
+        raise Gate4MutationHandoffError("native_docs_by_id must be a mapping")
+    sentinel_ao_id = validate_repo4_ao_sentinel_uri(
+        sentinel_uri,
+        native_docs_by_id=native_docs_by_id,
+    )
+    recorded_ao_id = sentinel_info.get("sentinel_ao_id")
+    if recorded_ao_id is not None and recorded_ao_id != sentinel_ao_id:
+        raise Gate4MutationHandoffError(
+            f"Preflight repo-4 sentinel_ao_id={recorded_ao_id!r} does not match URI {sentinel_uri!r} "
+            f"(expected {sentinel_ao_id})"
+        )
+    native_doc = native_docs_by_id[sentinel_uri]
+    return {
+        "sentinel_uri": sentinel_uri,
+        "sentinel_ao_id": sentinel_ao_id,
+        "selection_provenance": "verified_sentinel_sampled_from_fixed_native_core",
+        "verified_in_fixed_native_core": True,
+        "verified_in_full_native_reference_map": True,
+        "primary_type": native_doc.get("primary_type"),
+        "repository": native_doc.get("repository"),
+        "sentinel_title": native_doc.get("title"),
     }
 
 
@@ -1024,6 +1093,7 @@ def execute_guarded_mutations_during_pass(
         "mutation_token": mutation_token,
         "repo4_sentinel_uri": repo4_sentinel_uri,
         "repo4_sentinel_ao_id": repo4_sentinel_ao_id,
+        "repo4_sentinel_provenance": "verified_sentinel_sampled_from_fixed_native_core",
         "cli_launch_epoch_sec": round(cli_launch_epoch, 3),
         "mutation_started_epoch_sec": mutation_started_epoch,
         "mutation_started_iso": mutation_started_iso,
@@ -1913,17 +1983,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"Native reference core '{args.native_core}' returned {len(native_docs_by_id)} docs "
             f"(expected {EXPECTED_TOTAL_DOCS}), marker_leaks={len(native_marker_leaks)}"
         )
-    repo4_sentinel_uri = select_repo4_ao_sentinel_uri(native_docs_by_id)
-    validate_repo4_ao_sentinel_uri(repo4_sentinel_uri, native_docs_by_id=native_docs_by_id)
-    preflight_sentinel_uri = (preflight_report.get("repo4_progress_sentinel") or {}).get("sentinel_uri")
-    if preflight_sentinel_uri != repo4_sentinel_uri:
-        raise Gate4MutationHandoffError(
-            f"Preflight repo-4 sentinel {preflight_sentinel_uri!r} did not match full native reference "
-            f"derived sentinel {repo4_sentinel_uri!r}"
-        )
+    repo4_sentinel_verification = verify_preflight_repo4_sentinel_in_native_map(
+        preflight_report,
+        native_docs_by_id,
+    )
+    repo4_sentinel_uri = repo4_sentinel_verification["sentinel_uri"]
     print(
         f"[STEP 1] Loaded {len(native_docs_by_id)} native reference docs in {t_nat_elapsed:.2f}s; "
-        f"verified repo-4 AO sentinel '{repo4_sentinel_uri}' in fixed native reference.",
+        f"validated preflight-sampled repo-4 AO sentinel '{repo4_sentinel_uri}' against full native reference map.",
         flush=True,
     )
 
@@ -2194,6 +2261,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         "native_reference_core": args.native_core,
         "candidate_core": cand_core,
         "repo4_sentinel_uri": repo4_sentinel_uri,
+        "repo4_progress_sentinel": {
+            **(preflight_report.get("repo4_progress_sentinel") or {}),
+            **repo4_sentinel_verification,
+        },
         "preflight_report_path": preflight_path,
         "mutations_report_path": mutations_evidence_path,
         "cli_summary": cli_summary,

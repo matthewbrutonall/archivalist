@@ -558,7 +558,179 @@ class TestGate4MutationDuringPassHandoff(unittest.TestCase):
         )
         self.assertEqual(info["sentinel_uri"], "/repositories/4/archival_objects/10000")
         self.assertEqual(info["sentinel_ao_id"], 10000)
+        self.assertEqual(
+            info["selection_provenance"],
+            "verified_sentinel_sampled_from_fixed_native_core",
+        )
         self.assertTrue(info["verified_in_fixed_native_core"])
+
+    def test_lexical_sample_sentinel_10000_retained_when_full_native_map_has_smaller_2011(self) -> None:
+        def fake_http_get_json(url: str) -> dict:
+            if "sort=id+asc" in url:
+                return {
+                    "response": {
+                        "numFound": 998970,
+                        "docs": [
+                            {
+                                "id": "/repositories/4/archival_objects/10000",
+                                "uri": "/repositories/4/archival_objects/10000",
+                                "title": "Repo 4 Lexical Sample AO 10000",
+                                "primary_type": "archival_object",
+                                "repository": "/repositories/4",
+                            },
+                            {
+                                "id": "/repositories/4/archival_objects/100000",
+                                "uri": "/repositories/4/archival_objects/100000",
+                                "title": "Repo 4 AO 100000",
+                                "primary_type": "archival_object",
+                                "repository": "/repositories/4",
+                            },
+                        ],
+                    }
+                }
+            if "id%3A%22%2Frepositories%2F4%2Farchival_objects%2F10000%22" in url:
+                return {
+                    "response": {
+                        "numFound": 1,
+                        "docs": [
+                            {
+                                "id": "/repositories/4/archival_objects/10000",
+                                "uri": "/repositories/4/archival_objects/10000",
+                                "title": "Repo 4 Lexical Sample AO 10000",
+                                "primary_type": "archival_object",
+                                "repository": "/repositories/4",
+                            }
+                        ],
+                    }
+                }
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        preflight_sentinel = harness.verify_repo4_sentinel_in_fixed_native_core(
+            "http://127.0.0.1:28983/solr",
+            harness.FIXED_NATIVE_CORE,
+            http_get_json=fake_http_get_json,
+        )
+        preflight_report = {"repo4_progress_sentinel": preflight_sentinel}
+
+        # Full native map also contains numerically smaller /repositories/4/archival_objects/2011
+        full_native_docs_by_id = {
+            "/repositories/3/archival_objects/2010": {
+                "id": "/repositories/3/archival_objects/2010",
+                "uri": "/repositories/3/archival_objects/2010",
+                "title": "Repo 3 Last AO 2010",
+                "primary_type": "archival_object",
+                "repository": "/repositories/3",
+            },
+            "/repositories/4/archival_objects/2011": {
+                "id": "/repositories/4/archival_objects/2011",
+                "uri": "/repositories/4/archival_objects/2011",
+                "title": "Repo 4 Numerically Smallest AO 2011",
+                "primary_type": "archival_object",
+                "repository": "/repositories/4",
+            },
+            "/repositories/4/archival_objects/10000": {
+                "id": "/repositories/4/archival_objects/10000",
+                "uri": "/repositories/4/archival_objects/10000",
+                "title": "Repo 4 Lexical Sample AO 10000",
+                "primary_type": "archival_object",
+                "repository": "/repositories/4",
+            },
+        }
+
+        verified = harness.verify_preflight_repo4_sentinel_in_native_map(
+            preflight_report,
+            full_native_docs_by_id,
+        )
+        self.assertEqual(verified["sentinel_uri"], "/repositories/4/archival_objects/10000")
+        self.assertEqual(verified["sentinel_ao_id"], 10000)
+        self.assertEqual(
+            verified["selection_provenance"],
+            "verified_sentinel_sampled_from_fixed_native_core",
+        )
+        self.assertTrue(verified["verified_in_fixed_native_core"])
+        self.assertTrue(verified["verified_in_full_native_reference_map"])
+
+        # Refuse if preflight has no sentinel or malformed sentinel
+        for bad_preflight in (
+            {},
+            {"repo4_progress_sentinel": None},
+            {"repo4_progress_sentinel": {}},
+            {"repo4_progress_sentinel": {"sentinel_uri": ""}},
+            {"repo4_progress_sentinel": {"sentinel_uri": "/repositories/3/archival_objects/10000"}},
+            {
+                "repo4_progress_sentinel": {
+                    "sentinel_uri": "/repositories/4/archival_objects/10000",
+                    "verified_in_fixed_native_core": False,
+                }
+            },
+            {
+                "repo4_progress_sentinel": {
+                    "sentinel_uri": "/repositories/4/archival_objects/10000",
+                    "sentinel_ao_id": 2011,
+                }
+            },
+        ):
+            with self.assertRaises(harness.Gate4MutationHandoffError):
+                harness.verify_preflight_repo4_sentinel_in_native_map(
+                    bad_preflight,
+                    full_native_docs_by_id,
+                )
+
+        # Refuse if sentinel is missing from full native map
+        missing_10000_map = {
+            k: v
+            for k, v in full_native_docs_by_id.items()
+            if k != "/repositories/4/archival_objects/10000"
+        }
+        with self.assertRaises(harness.Gate4MutationHandoffError):
+            harness.verify_preflight_repo4_sentinel_in_native_map(
+                preflight_report,
+                missing_10000_map,
+            )
+
+        # Refuse if sentinel in full native map has wrong/missing type, wrong/missing repo, or mismatched id/uri
+        for bad_doc in (
+            None,
+            "not-a-dict",
+            {
+                "id": "/repositories/4/archival_objects/10000",
+                "primary_type": "resource",
+                "repository": "/repositories/4",
+            },
+            {
+                "id": "/repositories/4/archival_objects/10000",
+                "primary_type": None,
+                "repository": "/repositories/4",
+            },
+            {
+                "id": "/repositories/4/archival_objects/10000",
+                "primary_type": "archival_object",
+                "repository": "/repositories/3",
+            },
+            {
+                "id": "/repositories/4/archival_objects/10000",
+                "primary_type": "archival_object",
+                "repository": None,
+            },
+            {
+                "id": "/repositories/4/archival_objects/2011",
+                "primary_type": "archival_object",
+                "repository": "/repositories/4",
+            },
+            {
+                "id": "/repositories/4/archival_objects/10000",
+                "uri": "/repositories/4/archival_objects/2011",
+                "primary_type": "archival_object",
+                "repository": "/repositories/4",
+            },
+        ):
+            corrupted_map = dict(full_native_docs_by_id)
+            corrupted_map["/repositories/4/archival_objects/10000"] = bad_doc  # type: ignore[assignment]
+            with self.assertRaises(harness.Gate4MutationHandoffError):
+                harness.verify_preflight_repo4_sentinel_in_native_map(
+                    preflight_report,
+                    corrupted_map,
+                )
 
     def test_extract_identity_nonce_from_repo2_doc_reads_candidate_doc_nonce(self) -> None:
         rotated_nonce = "852f279a5f0ba2945f5d0f2a3910550b"
@@ -586,12 +758,18 @@ class TestGate4MutationDuringPassHandoff(unittest.TestCase):
         cand_core = "stage_staff_20261124_132000_12345_cafebabe_candidate"
         sentinel_uri = "/repositories/4/archival_objects/10000"
         native_docs = {
+            "/repositories/4/archival_objects/2011": {
+                "id": "/repositories/4/archival_objects/2011",
+                "primary_type": "archival_object",
+                "repository": "/repositories/4",
+                "title": "Repo 4 Numerically Smallest AO 2011",
+            },
             sentinel_uri: {
                 "id": sentinel_uri,
                 "primary_type": "archival_object",
                 "repository": "/repositories/4",
                 "title": "Repo 4 First AO 10000",
-            }
+            },
         }
         clock = {"mono": 100.0, "epoch": 1795520000.0, "polls": 0}
         get_urls: list[str] = []
@@ -617,6 +795,7 @@ class TestGate4MutationDuringPassHandoff(unittest.TestCase):
                 get_urls.append(url)
                 self.assertNotIn("repositories%2F4%2Farchival_objects%2F1&", url)
                 self.assertNotIn("repositories%2F4%2Farchival_objects%2F1$", url)
+                self.assertNotIn("repositories%2F4%2Farchival_objects%2F2011", url)
                 clock["polls"] += 1
                 # First poll (3 requests): repo 3 is in tlog, but repo 4 sentinel 10000 not yet in tlog
                 if "archival_objects%2F2009" in url:
@@ -653,6 +832,10 @@ class TestGate4MutationDuringPassHandoff(unittest.TestCase):
             self.assertEqual(res["status"], "mutations_applied_and_audited")
             self.assertEqual(res["repo4_sentinel_uri"], sentinel_uri)
             self.assertEqual(res["repo4_sentinel_ao_id"], 10000)
+            self.assertEqual(
+                res["repo4_sentinel_provenance"],
+                "verified_sentinel_sampled_from_fixed_native_core",
+            )
             self.assertEqual(res["pre_mutation_guard"]["repo4_sentinel_uri"], sentinel_uri)
             self.assertTrue(res["pre_mutation_guard"]["repo4_sentinel_in_tlog"])
             self.assertEqual(
