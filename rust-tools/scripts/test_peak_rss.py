@@ -48,6 +48,24 @@ class TestRunWithPeakRss(unittest.TestCase):
         result = run_with_peak_rss([sys.executable, "-c", code])
         self.assertEqual(result.returncode, -15)
 
+    def test_large_parent_rss_does_not_inflate_small_child_peak_rss(self):
+        # Touch 350 MiB in the parent process before launching a tiny child (/bin/true).
+        # Without the clean exec helper, Linux fork()+execve() folds the parent's
+        # pre-exec mm hiwater_rss into the child's signal->maxrss, inflating ru_maxrss
+        # to hundreds of MiB.
+        parent_alloc_mib = 350
+        parent_block = bytearray(parent_alloc_mib * 1024 * 1024)
+        for i in range(0, len(parent_block), 4096):
+            parent_block[i] = 1
+        try:
+            result = run_with_peak_rss(["/bin/true"])
+            self.assertEqual(result.returncode, 0)
+            self.assertGreater(result.peak_rss_kib, 0)
+            # Must reflect only the clean helper/child floor (< 40 MiB), never the 350 MiB parent.
+            self.assertLess(result.peak_rss_kib, 40 * 1024)
+        finally:
+            del parent_block
+
 
 class TestComparePeakMemory(unittest.TestCase):
     def native(self, hwm):
