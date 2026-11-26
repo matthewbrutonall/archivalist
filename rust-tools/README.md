@@ -5,13 +5,28 @@ and accelerating selected archival-management operations.
 
 ## Components
 
-- `aspace-client`: typed HTTP client, validation models, and shadow-index query support.
+- `aspace-client`: typed HTTP client, validation models, shadow-index query support, and
+  `isolated_solr_writer` (bounded isolated Solr STAFF AO writer library infrastructure for
+  disposable benchmark candidate stage cores; defense-in-depth only, requiring caller harness
+  verification of stack state, Docker labels, and candidate core ownership; not connected to production indexer flags).
+  Provides `archival_object_ids_modified_since(repo_id, Option<u64>)` for wire-contract
+  alignment with native indexer discovery (`all_ids=true`, `modified_since=0`).
+  Provides `Client::dynamic_enum_fields_from_schemas()` for dynamic enum field discovery via
+  backend `GET /schemas` (the authoritative source), deriving fields via breadth-first queue extraction
+  matching Ruby `IndexerCommon#enum_fields`. The enum list serves as an explicit one-time control input
+  for candidate runs without mutating index builder defaults or sidecar semantics; this discovery helper
+  makes no claim of parity across arbitrary unvalidated schemas or production indexer environments
+  (failing closed on malformed schema shapes).
 - `aspace-cli`: command-line validation, performance probes, shadow-index utilities,
   and the `aspace-shadow-sidecar` binary.
 
 The application API remains authoritative. The tools do not write directly to the
-application database or primary Solr collection. The index-document endpoint only
-returns prepared JSON to the Ruby indexer, which remains the sole Solr writer.
+application database or primary Solr collection. The sidecar `/index/documents` endpoint
+remains JSON-only, returning prepared JSON to the Ruby production indexer, which remains
+authoritative for production Solr writes. The only Solr write exceptions are the isolated
+experimental CLI commands (`staff-ao-candidate`, `staff-resource-candidate`, `staff-combined-candidate`, and `staff-ao-builder`), which write exclusively
+to disposable candidate stage cores under verified profiling-stack isolation. Writing to the
+primary Solr core or application database is strictly forbidden and blocked.
 
 ## Build and test
 
@@ -52,6 +67,14 @@ cargo run -p aspace-cli -- --url http://localhost:4567 \
 
 cargo run -p aspace-cli -- --url http://localhost:4567 \
   perf health --repo REPOSITORY_ID --json
+
+# Against isolated profiling stack backend (default port 14567; caveat: actual stack state overrides if customized):
+cargo run -p aspace-cli -- --url http://127.0.0.1:14567 \
+  staff-ao-probe --repo REPOSITORY_ID --batch-size 25 --concurrency 4 --json
+
+# Or dynamically derived from validated profiling stack state file:
+cargo run -p aspace-cli -- --url "$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["backend_host_url"])' /path/to/profiling_stack_state.json)" \
+  staff-ao-probe --repo REPOSITORY_ID --batch-size 25 --concurrency 4 --json
 ```
 
 ## Shadow index
@@ -105,6 +128,12 @@ Endpoints:
 The example systemd unit in `deploy/` binds to loopback by default. Put authentication
 and transport security in front of the sidecar before exposing it beyond the local
 host.
+
+`--index-timing` (or `ARCHIVALIST_SIDECAR_INDEX_TIMING=1`) adds a `Server-Timing` header to
+successful `/index/documents` responses with `receive`, `parse`, `build`, `serialize` and
+`total` durations in milliseconds. `total` runs from the start of reading the request to just
+before the response is written, so it excludes writing the response. It is off by default and
+never changes the JSON body.
 
 Release archives can be built reproducibly with
 `scripts/package_sidecar_release.sh`. See `deploy/CANARY.md` for the staged
@@ -262,6 +291,235 @@ Scripts under `scripts/` are code-only harnesses:
   median shows profiling overhead; `compare_all_staff_docs.py` checks ALL stored STAFF docs
   (the repository comparator alone excludes profile docs). JVM `-Xss` is raised for the whole
   run because wrapped recursive validators otherwise overflow JRuby's 512K stack cap.
+  The sidecar is the **release** build, rebuilt on the host with
+  `cargo build --release --locked` before every run (`SIDECAR_BUILD=0` skips the rebuild). Its
+  SHA-256 is passed to the harness, which refuses a mismatching file and also hashes the
+  running `/proc/<pid>/exe`. `SIDECAR_BINARY=<container path>` is an explicit override (no build
+  or expected hash; its path-inferred build mode is recorded). Binary path, SHA-256, build mode,
+  Git commit, dirty status and dirty paths go into `<prefix>_<ts>.build.json`, the `step4_sidecar`
+  checkpoint and the final report. Runs before this change used the debug sidecar and are not
+  a performance verdict on optimized Rust.
+  `WARMUP_PASSES` (default 1) sets untimed warmups per mode; their wall times are recorded.
+  `PUI_ABLATION=1` adds a no-profiler PUI ablation into a dedicated `stage_pui_<run>_ablation`
+  core: an adjacent native baseline, builder only, document preparation, preparation plus
+  inheritance candidate, common metadata alone and with preparation, auxiliary documents, and
+  all capabilities. Deltas are against the adjacent native median and are not additive; a
+  configuration whose projections fall back natively is reported `valid_measurement: false`.
+  `PAYLOAD_ACCOUNTING=1` (`archivalist_payload_accounting.rb`) adds dedicated STAFF and PUI
+  passes that count request/response bytes per call kind, per field and per projection, and
+  repeated URIs and identical ancestor entries. It stores aggregates only, and its pass wall
+  times are recorded as not comparable.
+  `SIDECAR_INDEX_TIMING=1` (`archivalist_sidecar_timing.rb`) starts the stage sidecar with its
+  `Server-Timing` header and, for every candidate and ablation pass, records `rust_server_ms`
+  (the sum of server `total`, split into receive, parse, build and serialize), `round_trip_ms`
+  (Ruby-side wall time of the sidecar HTTP calls), `transport_and_http_ms` (the difference,
+  including the server's response write) and `outside_sidecar_ms` (pass wall time minus the
+  round trips). It records per-pass values and medians; the cost per call is one header parse
+  and two clock reads. A run with timing requested but no header returned fails.
+  `RUBY_SIDE_TIMING=1` (`archivalist_ruby_side_timing.rb`, use with `PROFILE_MODE=off`) adds
+  coarse exclusive timers to every timed pass, native included: request JSON encoding, reply
+  JSON decoding, builder checks (`validate_*`, `compute_expected_*`, `reconstruct_expected_*`),
+  `apply_rust_pui_*`, `RecordInheritance.merge`/`build_plan`, input preparation, the sidecar round
+  trip and other JSON work. The remainder is `unattributed_ms`. Recursive helpers are not wrapped
+  (their time lands in their caller), keeping it to roughly ten thousand timer calls per PUI pass.
+  The overhead is estimated from a calibration loop and reported, never subtracted. The stdout
+  prints a native-versus-candidate table per mode.
+- `profiling_stack.py`: provisions and proves a DISPOSABLE profiling stack for full-round
+  profiling. `setup --app-container <name>` starts NEW containers only, without restarting or
+  modifying existing ones: a MySQL on a new labelled volume, a Solr with the repository configset
+  plus an identity core, and a backend from the app container's image with the source checkout
+  mounted read-only, its own build volume (seeded by a one-shot container that sees the app's
+  mounts read-only) and its own data volume. The backend runs the `db:migrate` and
+  `backend:devserver` commands directly, so nothing writes to the checkout. Both created
+  containers' mounts are checked with `docker inspect` before start, and setup fails if any
+  writable mount is shared with the app or is not one of the stack's own volumes. They are labelled `archivalist.profiling-stack=<id>`, join the app's
+  network under `archivalist-profiling-{db,solr,backend}` aliases, publish ports on 127.0.0.1
+  only, and the state file goes under `benchmarks/` with mode 0600. `verify` proves database
+  identity by challenge and response: it writes a fresh nonce directly into the stack database
+  and requires the target backend to return it from an anonymous `GET /repositories/<id>`,
+  which writes nothing to the backend being checked. It also requires the stack's Solr identity
+  core. `teardown` removes only containers carrying the stack's label and keeps the stack's db,
+  build and data volumes unless `--delete-volumes` is given.
+- `seed_large_repository.py`: creates a large, deterministic test repository through the API.
+  It requires `--stack-state` and runs the stack identity proof before any login or write, so a
+  main or shared test backend is rejected untouched. It sends each collection tree (resource,
+  series, files, items with notes, dates, extents, subject/agent links, top-container instances
+  and some digital objects) as one `/batch_imports` request. Presets are `small` (~1.2k
+  archival objects), `medium` (~24k) and `large` (~70k), and each count can be overridden.
+- `native_indexing_profile.rb` + `run_native_indexing_profile.sh`: complete native
+  `run_index_round`s for STAFF and PUI from an empty index state into fresh run-scoped stage
+  cores in the stack's Solr, with all Rust flags forced off, so backend fetching and Solr writes
+  are measured. The wrapper requires `STACK_STATE`, runs `profiling_stack.py verify`, and passes
+  the nonce and the stack's in-network URLs to the profiler. The profiler
+  (`archivalist_profiling_stack.rb`) re-checks the same nonce through its own backend URL and the
+  identity core through its own Solr URL before any login, core creation or indexing.
+  `archivalist_ruby_side_timing.rb` attributes the time to backend HTTP, record fetching,
+  document preparation, JSON, Solr update/commit/delete HTTP, PUI tree work and the coordinating
+  thread's waiting. Timers are per-thread, so with several indexer threads the categories sum
+  thread time and can exceed wall time. `TIMERS=0` gives wall time only (compare medians for
+  overhead); `REPEATS`, `MODES`, `STAFF_THREADS`, `PUI_THREADS`, `PUI_FETCH_AUDIT`, `PUI_TREE_BATCH_SIZE`, `PUI_RECORDS_PER_THREAD` and `APP_CONTAINER` are forwarded.
+  `PUI_FETCH_AUDIT=1` (`archivalist_pui_fetch_audit.rb`, default off; installs no wrapper when off)
+  adds observational accounting of actual backend `/repositories/:repo_id/archival_objects` batch
+  `GET` requests (`id_set`, excluding `all_ids`) during the PUI pass only (never during pre-pass
+  inventory or STAFF passes). It attributes calls by execution context (`PUIIndexer#fetch_records`
+  for `ordinary_indexing` versus `PUIIndexer#index_round_complete` for `tree_discovery`, not merely
+  `resolve[]` query values), records successful and failed calls, unique and total IDs requested by
+  successful HTTP 200 calls (`unique_successful_requested_ids`, `successful_requested_ids_total`,
+  without parsing JSON response bodies to verify which requested records were returned),
+  response-body bytes, summed call duration across threads (`call_duration_sum_ms`, not wall time),
+  and per-repository/round intersection and phase-only counts of successful-request ID sets
+  (`test_archivalist_pui_fetch_audit.rb`).
+  This accounting is strictly observational and cannot imply safe cache reuse or deduplication
+  across phases because records and ancestor trees may change between ordinary indexing and tree
+  discovery or across checkpoints.
+  `PUI_TREE_BATCH_SIZE=<n>` overrides the PUI tree-discovery batch size during profiler runs
+  (sets `AppConfig[:pui_tree_discovery_batch_size]`, clamped to safe range 1..200; invalid, zero, or
+  negative values fail closed to baseline `pui_indexer_records_per_thread`). The report records
+  `pui_tree_batch_size` so future comparison is attributable. Caveat: fewer backend GET calls and
+  reduced GET call duration are a hypothesis until verified by an isolated 25-vs-200 full-round
+  comparison; do not claim speedup.
+  `PUI_RECORDS_PER_THREAD=<n>` overrides the ordinary PUI batch size during profiler runs
+  (sets `AppConfig[:pui_indexer_records_per_thread]`, validated in range 1..200; invalid values fail
+  before stack mutation). The report records `pui_records_per_thread` in results and metadata.
+  Always-on low-overhead resource measurements capture CPU, process memory, and Solr heap metrics
+  outside the monotonic wall timing region without altering timing boundaries or measured workload:
+  `cpu_user_ms` and `cpu_system_ms` record `Process.times` user/system CPU deltas across `run_index_round`.
+  `process_memory` captures Linux `/proc/self/status` `VmRSS` and `VmHWM` snapshots in KiB before and
+  after each pass; `VmHWM` represents the process-lifetime high-water mark (not a per-pass peak; later
+  repeats inherit earlier highs), and unavailable proc metrics record null with a diagnostic without
+  failing indexing. `solr_jvm_heap` captures isolated Solr JVM heap `used_bytes`, `committed_bytes`,
+  and `max_bytes` before and after each pass via the bounded read-only Solr system API
+  (`/admin/info/system?wt=json`) after stack identity verification, recording null and a sanitized
+  diagnostic on error. All memory snapshots are point-in-time boundary measurements, not continuous
+  samples of peak heap or per-pass RSS.
+- `native_archival_object_profile.rb` + `run_native_archival_object_profile.sh`: Isolated Gate 2
+  Step 2 native baseline profiling harness for strictly repository 4's `:archival_object` IDs.
+  Invokes the real `PeriodicIndexer#start_worker_thread` native worker path into run-scoped stage cores
+  (`stage_staff_<run_id>_native`) with all seven Rust flags forced off, no sidecar, and no profiler wrappers
+  or category timers. Requires `STACK_STATE` and verifies profiling stack database and Solr identity before
+  any core creation, login, or indexing (fails closed on mismatch). Rejects foreign repositories or record
+  types before indexing. The timed measurement envelope strictly measures AO ID enumeration (`:all_ids => true`,
+  `:modified_since => 0`), 25-id batched backend fetching with full `resolved_attributes`, native document
+  mapping (`index_records`), Solr updates, and final hard commit (`indexer.send_commit(:hard)`). Backend login,
+  Solr stage core provisioning, and pre-pass memory snapshots are excluded from the timed region; repository
+  and non-AO document preamble is strictly excluded. Executes 4 repeats (repeat 1 = warmup, repeats 2-4 =
+  measured) and outputs JSON report containing raw wall and CPU times, medians over measured repeats, Solr
+  document and AO counts, stack ID, repo ID, git commit/dirty provenance, Java/JRuby versions, core names,
+  process RSS/HWM snapshots (`/proc/self/status`, labeled with process-lifetime high-water mark semantics),
+  Solr JVM heap snapshots (`/admin/info/system`), and parity comparison plan targeting `compare_staff_index_parity.py`.
+  Document counts alone do not establish document parity. Aligns required constant setup sequence with proven
+  launchers (`native_indexing_profile.rb`, `indexer/app/main.rb`) by loading `rust_index_document_builder`,
+  `periodic_indexer`, `pui_indexer`, `large_tree_doc_indexer`, and `index_batch`, ensuring constants such as
+  `PUIIndexer` are defined before worker document prepare hooks execute (`IndexerCommon` line 1130).
+  Offline tests: `test_native_archival_object_profile.rb` (verifies harness dispatch contract via test double
+  under MRI, validates missing, nil, and configured sidecar endpoint fail-closed safety, executes actual
+  `PeriodicIndexer#start_worker_thread` under JRuby without backend/Solr writes, and verifies real
+  `PeriodicIndexer` instantiates with `PUIIndexer` constant defined before executing staff AO document rules).
+- `benchmark_native_search_and_tree.py`: Small Gate 1 read-only backend API latency
+  probe against the isolated profiling stack from `profiling_stack.py`. Discloses preflight
+  setup mutation (`verify_identity` writes an isolated challenge nonce to the profiling DB
+  repository record to prove backend connectivity) while all benchmark measurement and
+  discovery requests are strictly read-only HTTP GETs (preceded by an admin login POST).
+  Measures a fixed backend API query set against caller-specified `--repo-id` and `--resource-id`:
+  2 repository searches (wildcard `q=*` and keyword `q=papers`) and 3 resource tree routes
+  (root, waypoint 0, and node URI discovered from root `precomputed_waypoints` or waypoint 0).
+  Because the isolated profiling stack provisions backend, Solr, and database containers but lacks
+  Rails staff and public UI tiers, timings are backend API proxy measurements only (measuring connection,
+  request dispatch, response headers, and full response body transfer via `resp.read()`, excluding client-side
+  JSON decode); user-facing UI routes remain unmeasured. Outputs pure JSON containing stack ID, git commit/dirty provenance,
+  host load, route parameters, raw warmup and repeat durations, p50/p95 percentiles (defaulting to
+  >=20 measured samples), status/blocker details, and response result counts. Network/HTTP errors
+  are captured per route to preserve completed measurements and partial route durations. Offline tests: `test_benchmark_native_search_and_tree.py`.
+- `staff-ao-probe` (`aspace-cli` subcommand): Bounded, read-only Rust STAFF archival-object
+  hydration probe that exercises `Client::fetch_staff_archival_objects_by_ids` over all AO IDs
+  for one repository against an explicitly isolated backend instance.
+  Exact command (derive URL from validated profiling stack state, or use explicit default `http://127.0.0.1:14567` with caveat actual state overrides):
+  ```bash
+  # Explicit default isolated profiling stack backend URL (port 14567; caveat: actual stack state overrides if customized):
+  cargo run -p aspace-cli -- --url http://127.0.0.1:14567 \
+    staff-ao-probe --repo REPOSITORY_ID --batch-size 25 --concurrency 4 --json
+
+  # Or dynamically derived from validated profiling stack state file:
+  cargo run -p aspace-cli -- --url "$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["backend_host_url"])' /path/to/profiling_stack_state.json)" \
+    staff-ao-probe --repo REPOSITORY_ID --batch-size 25 --concurrency 4 --json
+  ```
+  Inputs: repository ID, batch size (default 25, maximum 25), and worker concurrency (default 4,
+  bounded to maximum 32). Fetches the full repository AO ID list, then all records in bounded
+  batches using the full STAFF indexer resolve list (`resolve[]`). Safely aggregates out-of-order
+  completions, tracks exact returned IDs, unique URIs, batch counts, failures, and wall clock elapsed
+  time covering the ID list and all batch fetches (excludes authentication; `aspace-cli` logs in first).
+  Aborts non-zero on any missing, duplicate, or unexpected IDs or batch request failures without printing
+  record payloads or secrets.
+  Emits human-readable summary by default, or machine-readable JSON summary (`--json`), with explicit note
+  that no Solr build or write is measured.
+  **Scope caveat:** This is strictly a source-fetch timing and validity experiment, NOT an
+  indexer or parity/speedup claim. No Solr documents are built or written.
+- `staff-ao-candidate` (`aspace-cli` subcommand): Full-repository STAFF archival-object candidate
+  pipeline that fetches, prepares, and writes index documents into a dedicated disposable stage core.
+  **Safety Guard:** Requires `--state <path_to_profiling_stack_state.json>` on every invocation.
+  Runs `rust-tools/scripts/profiling_stack.py verify` via subprocess argument arrays before any Solr
+  write or core readiness check, failing closed if verification fails, state is missing, the repository
+  verifier is absent, or endpoints/labels mismatch. Marker removal is mandatory; `--strip-markers false`
+  is strictly rejected in write mode.
+- `staff-resource-candidate` (`aspace-cli` subcommand): Full-repository STAFF resource candidate
+  pipeline that discovers repository-scoped resource IDs using the native full-reindex contract
+  (`all_ids=true`, `modified_since=0`), hydrates bounded `id_set` batches with `IndexerCommonConfig.resolved_attributes`,
+  prepares documents via `build_index_document_batch` with dynamic enum fields derived from backend `/schemas` and
+  authoritative ARKs enablement, extracts synthetic `collection_management` child documents in native hook order
+  (parent then child docs) before stripping markers, strips all top-level `_archivalist_*` private markers from both
+  parent and child documents, validates exact child identity and structural envelope invariants offline, and streams
+  documents to a disposable candidate stage core (`stage_staff_<nonce>_candidate`). Live type-strict stored-document
+  parity (including byte-for-byte embedded JSON equality) against native reference cores is independently established
+  and measured for parent resource documents by dedicated stage comparison harnesses (`rust-tools/scripts/run_gate3_resource_candidate.py`).
+  Those earlier slice runs had no `collection_management` children; the later mixed full-STAFF fixture covers
+  resource, digital-object, and accession children.
+  **Safety Guard:** Requires `--state <path_to_profiling_stack_state.json>` on every invocation. Runs
+  `rust-tools/scripts/profiling_stack.py verify` via subprocess argument arrays before any Solr write or core readiness check,
+  failing closed if verification fails, state is missing, the repository verifier is absent, endpoints/labels mismatch,
+  or child envelope/markers are malformed. Marker removal is mandatory; `--strip-markers false` is strictly rejected.
+  Outputs JSON metrics reporting separate source IDs, parent docs, child docs, committed status, and error details.
+  **Scope caveat:** This is an isolated bounded candidate vertical slice; fresh-core full rebuild only. No incremental
+  deletes, checkpointing, production indexing, or full-STAFF speed claims.
+- `staff-combined-candidate` (`aspace-cli` subcommand, alias `staff-candidate`): Full-repository STAFF composite candidate
+  pipeline combining `archival_objects` and `resources` (including synthetic `collection_management` child document support;
+  the earlier combined-slice run had no child records)
+  under a single verified isolated writer and atomic hard commit. Discovers repository-scoped IDs for both types using
+  native full-reindex contracts (`all_ids=true`, `modified_since=0`), hydrates bounded `id_set` batches with
+  `IndexerCommonConfig.resolved_attributes`, prepares documents via `build_index_document_batch` with dynamic enum
+  fields derived from backend `/schemas`, extracts resource `collection_management` child docs in native hook order
+  (parent then child docs) before stripping markers, enforces per-type exact IDs and cross-type URI deduplication,
+  strips all private `_archivalist_*` markers, streams documents into a single disposable candidate stage core
+  (`stage_staff_<nonce>_candidate`), and executes exactly one final hard commit only when all batches and sanity invariants pass.
+  **Safety Guard:** Requires `--state <path_to_profiling_stack_state.json>` on every invocation. Runs
+  `rust-tools/scripts/profiling_stack.py verify` via subprocess argument arrays BEFORE any Solr write or core readiness check,
+  failing closed without touching Solr or the candidate core if verification fails, state is missing, or the repository
+  verifier is absent (no CWD or PATH fallback). Fails closed without hard commit on any missing/duplicate/unexpected IDs,
+  cross-type duplicate URIs, or batch errors. Marker removal is mandatory; `--strip-markers false` is strictly rejected.
+  Outputs structured per-type breakdowns (IDs, parent docs, child docs, batches, failures) and overall metrics (total docs,
+  unique URIs, timings, committed status).
+  **Scope caveat:** This is an isolated bounded candidate vertical slice; fresh-core full rebuild only. No incremental
+  deletes, checkpointing, production indexing, or full-STAFF speed claims.
+- `staff-full-candidate` (`aspace-cli` subcommand): Isolated full STAFF rebuild over the native 19-type order,
+  all repositories and global authorities. It uses a single verified stage core and writer, checks exact IDs and
+  URIs, strips private markers, and hard-commits only after all batches succeed. Global container/location
+  profiles are built once per URI in this full-rebuild candidate. The `--job-locale-file` and `--job-time-zone`
+  inputs are required when jobs exist; job titles, timestamps, output files and job data use the API plus a
+  small bundled Ruby compatibility projection. Accession years use Ruby `Date.parse` to preserve the native
+  parser's broader accepted syntax. This is not yet a pure-Rust implementation or a production switch.
+  `run_gate3_combined_candidate.py --full --fresh-native --require-mixed-types --concurrency 8` compares every
+  stored field and embedded JSON string against a fresh native STAFF core on the same disposable stack, and
+  requires all 19 types plus collection-management children for all three parent kinds. The fixture creator
+  `seed_gate3_mixed_records.py` requires stack identity verification and records each created URI in a private
+  mode-0600 manifest. The harness retains every core and does not promote a candidate. Incremental updates,
+  arbitrary plugin hooks, alternate locales/timezones, and release deployment remain outside this gate.
+- `staff-ao-builder` (`aspace-cli` subcommand): Targeted STAFF archival-object builder for single or
+  batch document inspection and stage core testing.
+  - Preview mode (default, no `--solr-url` / `--candidate-core`): outputs documents to stdout or `--output`,
+    permits explicit `--strip-markers false`, and does not require a state file.
+  - Write mode (when `--solr-url` and `--candidate-core` are supplied): requires `--state <path>`, executes
+    the repository's `profiling_stack.py verify` identity check before any Solr write or core readiness check,
+    strictly rejects `--strip-markers false`, makes marker removal mandatory before writing/committing, and
+    rejects `--output` to prevent document leakage.
 - Helpers that query records require the caller to provide test-specific values
   through environment variables such as `RESOURCE_URI` and `QUERY`.
 

@@ -9,7 +9,16 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use serde::Serialize;
 use std::{collections::BTreeMap, io};
 
+pub mod profiling_stack;
+pub mod pui_tree_spike;
 pub mod shadow;
+pub mod staff_ao_builder;
+pub mod staff_ao_candidate;
+pub mod staff_ao_probe;
+pub mod staff_candidate_runner;
+pub mod staff_combined_candidate;
+pub mod staff_full_candidate;
+pub mod staff_resource_candidate;
 
 #[derive(Serialize)]
 struct PerfPingReport {
@@ -305,6 +314,22 @@ enum Commands {
         #[command(subcommand)]
         target: ValidateTarget,
     },
+    #[command(name = "staff-ao-probe", alias = "staff-ao-hydration-probe")]
+    StaffAoProbe(staff_ao_probe::StaffAoProbeArgs),
+    #[command(name = "staff-ao-candidate")]
+    StaffAoCandidate(staff_ao_candidate::StaffAoCandidateArgs),
+    #[command(name = "staff-resource-candidate")]
+    StaffResourceCandidate(staff_resource_candidate::StaffResourceCandidateArgs),
+    #[command(name = "staff-combined-candidate", alias = "staff-candidate")]
+    StaffCombinedCandidate(staff_combined_candidate::StaffCombinedCandidateArgs),
+    #[command(name = "staff-full-candidate")]
+    StaffFullCandidate(staff_full_candidate::StaffFullCandidateArgs),
+    #[command(name = "pui-tree-spike")]
+    PuiTreeSpike(pui_tree_spike::PuiTreeSpikeArgs),
+    #[command(name = "staff-ao-builder")]
+    StaffAoBuilder(staff_ao_builder::StaffAoBuilderArgs),
+    #[command(name = "build-index-document")]
+    BuildIndexDocument(staff_ao_builder::BuildIndexDocumentArgs),
 }
 
 #[derive(Subcommand)]
@@ -476,6 +501,8 @@ enum PerfTarget {
     RecordTypes(PerfRecordTypesArgs),
     SearchCheck(PerfSearchCheckArgs),
     SolrCheck(PerfSolrCheckArgs),
+    #[command(name = "staff-ao-probe", alias = "staff-ao-hydration-probe")]
+    StaffAoProbe(staff_ao_probe::StaffAoProbeArgs),
 }
 
 #[derive(clap::Args)]
@@ -737,6 +764,11 @@ async fn main() -> Result<()> {
                 run_shadow_query_search(args.clone()).await?;
             }
         }
+        return Ok(());
+    }
+
+    if let Commands::BuildIndexDocument(args) = &cli.command {
+        staff_ao_builder::run_build_index_document(args)?;
         return Ok(());
     }
 
@@ -1124,7 +1156,34 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
+                PerfTarget::StaffAoProbe(args) => {
+                    staff_ao_probe::run_staff_ao_probe(&client, args.clone()).await?;
+                }
             }
+        }
+        Commands::StaffAoProbe(args) => {
+            staff_ao_probe::run_staff_ao_probe(&client, args.clone()).await?;
+        }
+        Commands::StaffAoCandidate(args) => {
+            staff_ao_candidate::run_staff_ao_candidate(&client, args.clone()).await?;
+        }
+        Commands::StaffResourceCandidate(args) => {
+            staff_resource_candidate::run_staff_resource_candidate(&client, args.clone()).await?;
+        }
+        Commands::StaffCombinedCandidate(args) => {
+            staff_combined_candidate::run_staff_combined_candidate(&client, args.clone()).await?;
+        }
+        Commands::StaffFullCandidate(args) => {
+            staff_full_candidate::run_staff_full_candidate(&client, args).await?;
+        }
+        Commands::PuiTreeSpike(args) => {
+            pui_tree_spike::run_pui_tree_spike(&client, args).await?;
+        }
+        Commands::BuildIndexDocument(_) => {
+            unreachable!("build-index-document returns before API login")
+        }
+        Commands::StaffAoBuilder(args) => {
+            staff_ao_builder::run_staff_ao_builder(&client, args.clone()).await?;
         }
         Commands::Validate { target } => match target {
             ValidateTarget::Repositories => {
@@ -2056,6 +2115,285 @@ mod tests {
     #[test]
     fn verify_cli() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn staff_ao_probe_cli_parsing() {
+        let cli =
+            Cli::try_parse_from(["aspace", "staff-ao-probe", "--repo", "2", "--json"]).unwrap();
+        match cli.command {
+            Commands::StaffAoProbe(args) => {
+                assert_eq!(args.repo, 2);
+                assert_eq!(args.batch_size, 25);
+                assert_eq!(args.concurrency, 4);
+                assert!(args.json);
+                assert!(args.validate().is_ok());
+            }
+            _ => panic!("Expected Commands::StaffAoProbe"),
+        }
+
+        let cli_alias = Cli::try_parse_from([
+            "aspace",
+            "staff-ao-hydration-probe",
+            "--repo-id",
+            "3",
+            "--batch-size",
+            "10",
+            "--concurrency",
+            "8",
+        ])
+        .unwrap();
+        match cli_alias.command {
+            Commands::StaffAoProbe(args) => {
+                assert_eq!(args.repo, 3);
+                assert_eq!(args.batch_size, 10);
+                assert_eq!(args.concurrency, 8);
+                assert!(!args.json);
+                assert!(args.validate().is_ok());
+            }
+            _ => panic!("Expected Commands::StaffAoProbe"),
+        }
+
+        let cli_perf =
+            Cli::try_parse_from(["aspace", "perf", "staff-ao-probe", "--repo", "2"]).unwrap();
+        match cli_perf.command {
+            Commands::Perf {
+                target: PerfTarget::StaffAoProbe(args),
+            } => {
+                assert_eq!(args.repo, 2);
+                assert_eq!(args.batch_size, 25);
+                assert_eq!(args.concurrency, 4);
+                assert!(args.validate().is_ok());
+            }
+            _ => panic!("Expected PerfTarget::StaffAoProbe"),
+        }
+
+        let cli_candidate = Cli::try_parse_from([
+            "aspace",
+            "staff-ao-candidate",
+            "--repo",
+            "4",
+            "--batch-size",
+            "25",
+            "--concurrency",
+            "4",
+            "--solr-url",
+            "http://127.0.0.1:18983/solr",
+            "--candidate-core",
+            "stage_staff_20261026_candidate",
+            "--arks-enabled",
+            "false",
+            "--strip-markers",
+            "true",
+            "--state",
+            "/benchmarks/profiling_stack_state.json",
+            "--json",
+        ])
+        .unwrap();
+        match cli_candidate.command {
+            Commands::StaffAoCandidate(args) => {
+                assert_eq!(args.repo, 4);
+                assert_eq!(args.batch_size, 25);
+                assert_eq!(args.concurrency, 4);
+                assert_eq!(args.solr_url, "http://127.0.0.1:18983/solr");
+                assert_eq!(args.candidate_core, "stage_staff_20261026_candidate");
+                assert!(!args.arks_enabled);
+                assert!(args.strip_markers);
+                assert_eq!(
+                    args.state,
+                    Some(std::path::PathBuf::from(
+                        "/benchmarks/profiling_stack_state.json"
+                    ))
+                );
+                assert!(args.json);
+                assert_eq!(args.fail_after_batches, None);
+                assert!(args.validate().is_ok());
+            }
+            _ => panic!("Expected Commands::StaffAoCandidate"),
+        }
+
+        let cli_candidate_fail = Cli::try_parse_from([
+            "aspace",
+            "staff-ao-candidate",
+            "--repo",
+            "4",
+            "--solr-url",
+            "http://127.0.0.1:18983/solr",
+            "--candidate-core",
+            "stage_staff_20261026_candidate",
+            "--state",
+            "/benchmarks/profiling_stack_state.json",
+            "--fail-after-batches",
+            "5",
+        ])
+        .unwrap();
+        match cli_candidate_fail.command {
+            Commands::StaffAoCandidate(args) => {
+                assert_eq!(args.fail_after_batches, Some(5));
+                assert_eq!(
+                    args.state,
+                    Some(std::path::PathBuf::from(
+                        "/benchmarks/profiling_stack_state.json"
+                    ))
+                );
+                assert!(args.validate().is_ok());
+            }
+            _ => panic!("Expected Commands::StaffAoCandidate"),
+        }
+
+        let cli_resource_candidate = Cli::try_parse_from([
+            "aspace",
+            "staff-resource-candidate",
+            "--repo",
+            "4",
+            "--batch-size",
+            "25",
+            "--concurrency",
+            "4",
+            "--solr-url",
+            "http://127.0.0.1:18983/solr",
+            "--candidate-core",
+            "stage_staff_20261027_candidate",
+            "--arks-enabled",
+            "false",
+            "--strip-markers",
+            "true",
+            "--state",
+            "/benchmarks/profiling_stack_state.json",
+            "--json",
+        ])
+        .unwrap();
+        match cli_resource_candidate.command {
+            Commands::StaffResourceCandidate(args) => {
+                assert_eq!(args.repo, 4);
+                assert_eq!(args.batch_size, 25);
+                assert_eq!(args.concurrency, 4);
+                assert_eq!(args.solr_url, "http://127.0.0.1:18983/solr");
+                assert_eq!(args.candidate_core, "stage_staff_20261027_candidate");
+                assert!(!args.arks_enabled);
+                assert!(args.strip_markers);
+                assert_eq!(
+                    args.state,
+                    Some(std::path::PathBuf::from(
+                        "/benchmarks/profiling_stack_state.json"
+                    ))
+                );
+                assert!(args.json);
+                assert_eq!(args.fail_after_batches, None);
+                assert!(args.validate().is_ok());
+            }
+            _ => panic!("Expected Commands::StaffResourceCandidate"),
+        }
+
+        let cli_combined_candidate = Cli::try_parse_from([
+            "aspace",
+            "staff-combined-candidate",
+            "--repo",
+            "4",
+            "--batch-size",
+            "25",
+            "--concurrency",
+            "4",
+            "--solr-url",
+            "http://127.0.0.1:18983/solr",
+            "--candidate-core",
+            "stage_staff_20261027_candidate",
+            "--arks-enabled",
+            "false",
+            "--strip-markers",
+            "true",
+            "--state",
+            "/benchmarks/profiling_stack_state.json",
+            "--json",
+        ])
+        .unwrap();
+        match cli_combined_candidate.command {
+            Commands::StaffCombinedCandidate(args) => {
+                assert_eq!(args.repo, 4);
+                assert_eq!(args.batch_size, 25);
+                assert_eq!(args.concurrency, 4);
+                assert_eq!(args.solr_url, "http://127.0.0.1:18983/solr");
+                assert_eq!(args.candidate_core, "stage_staff_20261027_candidate");
+                assert!(!args.arks_enabled);
+                assert!(args.strip_markers);
+                assert_eq!(
+                    args.state,
+                    Some(std::path::PathBuf::from(
+                        "/benchmarks/profiling_stack_state.json"
+                    ))
+                );
+                assert!(args.json);
+                assert_eq!(args.fail_after_batches, None);
+                assert!(args.validate().is_ok());
+            }
+            _ => panic!("Expected Commands::StaffCombinedCandidate"),
+        }
+
+        let cli_builder = Cli::try_parse_from([
+            "aspace",
+            "staff-ao-builder",
+            "--repo",
+            "4",
+            "--ids",
+            "1221,2229",
+            "--arks-enabled",
+        ])
+        .unwrap();
+        match cli_builder.command {
+            Commands::StaffAoBuilder(args) => {
+                assert_eq!(args.repo, 4);
+                assert_eq!(args.ids, vec![1221, 2229]);
+                assert!(args.arks_enabled);
+                assert!(args.strip_markers);
+                assert_eq!(args.state, None);
+                assert!(args.validate().is_ok());
+            }
+            _ => panic!("Expected Commands::StaffAoBuilder"),
+        }
+
+        let cli_builder_write_output = Cli::try_parse_from([
+            "aspace",
+            "staff-ao-builder",
+            "--repo",
+            "4",
+            "--ids",
+            "1221,2229",
+            "--solr-url",
+            "http://127.0.0.1:18983/solr",
+            "--candidate-core",
+            "stage_staff_20261026_candidate",
+            "--state",
+            "/benchmarks/profiling_stack_state.json",
+            "--output",
+            "/tmp/should_be_rejected.json",
+        ])
+        .unwrap();
+        match cli_builder_write_output.command {
+            Commands::StaffAoBuilder(args) => {
+                let err = args.validate().unwrap_err();
+                assert!(err.to_string().contains("--output"));
+            }
+            _ => panic!("Expected Commands::StaffAoBuilder"),
+        }
+
+        let cli_build_doc = Cli::try_parse_from([
+            "aspace",
+            "build-index-document",
+            "--input",
+            "/tmp/test_input.json",
+            "--strip-markers",
+        ])
+        .unwrap();
+        match cli_build_doc.command {
+            Commands::BuildIndexDocument(args) => {
+                assert_eq!(
+                    args.input,
+                    Some(std::path::PathBuf::from("/tmp/test_input.json"))
+                );
+                assert!(args.strip_markers);
+            }
+            _ => panic!("Expected Commands::BuildIndexDocument"),
+        }
     }
 
     #[test]

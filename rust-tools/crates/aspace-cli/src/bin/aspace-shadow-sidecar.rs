@@ -50,6 +50,16 @@ struct SidecarArgs {
         default_value = DEFAULT_SHADOW_COLLECTION
     )]
     collection: String,
+
+    /// Add a Server-Timing header (receive, parse, build, serialize, total) to successful
+    /// /index/documents responses. Off by default; the JSON body is unchanged either way.
+    #[arg(
+        long,
+        env = "ARCHIVALIST_SIDECAR_INDEX_TIMING",
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    index_timing: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -586,6 +596,18 @@ struct AppState {
     client: aspace_client::ShadowSolrClient,
     readiness_client: reqwest::Client,
     metrics: Arc<SidecarMetrics>,
+    index_timing: bool,
+}
+
+/// Formats /index/documents phase durations as a Server-Timing header line (milliseconds).
+/// `total` spans from the start of reading the request to just before the response is written,
+/// so it excludes the time to write the response itself.
+pub fn index_server_timing_header(phases: &[(&str, Duration)]) -> String {
+    let metrics: Vec<String> = phases
+        .iter()
+        .map(|(name, duration)| format!("{name};dur={:.3}", duration.as_secs_f64() * 1000.0))
+        .collect();
+    format!("Server-Timing: {}\r\n", metrics.join(", "))
 }
 
 struct SidecarMetrics {
@@ -736,9 +758,11 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>
 }
 
 async fn handle_connection(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {
+    let received_at = Instant::now();
     let Some(request) = read_http_request(&mut stream).await? else {
         return Ok(());
     };
+    let receive = received_at.elapsed();
     let _request_guard = ActiveRequestGuard::begin(Arc::clone(&state.metrics));
 
     let route = match route_request(&request.method, &request.full_path) {
@@ -757,6 +781,7 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<AppState>) -> Resul
 
     match route {
         SidecarRoute::IndexDocuments => {
+            let parse_started = Instant::now();
             let batch = match serde_json::from_slice::<aspace_client::IndexDocumentBatchRequest>(
                 &request.body,
             ) {
@@ -773,12 +798,28 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<AppState>) -> Resul
                     return Ok(());
                 }
             };
+            let parse = parse_started.elapsed();
+            let build_started = Instant::now();
             match aspace_client::build_index_document_batch(batch) {
                 Ok(output) => {
+                    let build = build_started.elapsed();
+                    let serialize_started = Instant::now();
                     let response_body = serde_json::to_string(&output)?;
+                    let serialize = serialize_started.elapsed();
+                    let timing_header = if state.index_timing {
+                        index_server_timing_header(&[
+                            ("receive", receive),
+                            ("parse", parse),
+                            ("build", build),
+                            ("serialize", serialize),
+                            ("total", received_at.elapsed()),
+                        ])
+                    } else {
+                        String::new()
+                    };
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        response_body.len(), response_body
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n{}",
+                        response_body.len(), timing_header, response_body
                     );
                     stream.write_all(response.as_bytes()).await?;
                 }
@@ -1312,11 +1353,15 @@ async fn main() -> Result<()> {
         client: warm_client,
         readiness_client,
         metrics: Arc::new(SidecarMetrics::new()),
+        index_timing: args.index_timing,
     });
 
     println!(
-        "aspace-shadow-sidecar listening on http://{} (target: {}/{})",
-        bind_addr, state.solr_url, state.collection
+        "aspace-shadow-sidecar listening on http://{} (target: {}/{}, index timing header: {})",
+        bind_addr,
+        state.solr_url,
+        state.collection,
+        if state.index_timing { "on" } else { "off" }
     );
 
     loop {
@@ -1835,6 +1880,46 @@ mod tests {
         assert_eq!(resp.served_by, "aspace-shadow-sidecar");
         assert_eq!(resp.solr_url, "http://localhost:8985/solr");
         assert_eq!(resp.collection, "archivesspace_shadow");
+    }
+
+    #[test]
+    fn test_index_server_timing_header_format() {
+        let header = index_server_timing_header(&[
+            ("receive", Duration::from_micros(1500)),
+            ("parse", Duration::from_micros(250)),
+            ("build", Duration::from_millis(12)),
+            ("serialize", Duration::ZERO),
+            ("total", Duration::from_micros(13_750)),
+        ]);
+        assert_eq!(
+            header,
+            "Server-Timing: receive;dur=1.500, parse;dur=0.250, build;dur=12.000, serialize;dur=0.000, total;dur=13.750\r\n"
+        );
+    }
+
+    #[test]
+    fn test_index_timing_flag_and_env() {
+        // The only test that reads or sets ARCHIVALIST_SIDECAR_INDEX_TIMING; the cases run in
+        // sequence here because the environment is shared by tests running in parallel.
+        std::env::remove_var("ARCHIVALIST_SIDECAR_INDEX_TIMING");
+        let args = SidecarArgs::try_parse_from(["aspace-shadow-sidecar"]).unwrap();
+        assert!(!args.index_timing, "off by default");
+        let args =
+            SidecarArgs::try_parse_from(["aspace-shadow-sidecar", "--index-timing"]).unwrap();
+        assert!(args.index_timing);
+
+        for (value, expected) in [
+            ("1", true),
+            ("true", true),
+            ("on", true),
+            ("0", false),
+            ("false", false),
+        ] {
+            std::env::set_var("ARCHIVALIST_SIDECAR_INDEX_TIMING", value);
+            let args = SidecarArgs::try_parse_from(["aspace-shadow-sidecar"]).unwrap();
+            assert_eq!(args.index_timing, expected, "value {value}");
+        }
+        std::env::remove_var("ARCHIVALIST_SIDECAR_INDEX_TIMING");
     }
 
     #[test]

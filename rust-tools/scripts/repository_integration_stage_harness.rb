@@ -55,6 +55,13 @@ if __FILE__ == $PROGRAM_NAME
   end
   REPO_ID = repo_id_raw.to_i
   REPEATS = (ENV['REPEATS'] || '3').to_i
+  # Untimed warmup passes before each measured mode (their wall times are still recorded).
+  WARMUP_PASSES = (ENV['WARMUP_PASSES'] || '1').to_i
+  raise "Safety violation: WARMUP_PASSES must be >= 1" unless WARMUP_PASSES >= 1
+  # Opt-in PUI feature ablation: each Rust PUI capability measured on its own, no profiler.
+  PUI_ABLATION_ENABLED = ENV['ARCHIVALIST_PUI_ABLATION'] == '1'
+  # Opt-in byte accounting on dedicated extra passes whose wall times are not comparable.
+  PAYLOAD_ACCOUNTING_ENABLED = ENV['ARCHIVALIST_PAYLOAD_ACCOUNTING'] == '1'
 
   BENCHMARK_DIR = File.expand_path('../benchmarks', __dir__)
   REPORT_DIR = File.expand_path('../reports/stage_runs', __dir__)
@@ -77,10 +84,13 @@ if __FILE__ == $PROGRAM_NAME
   CORE_PUI_CANDIDATE   = ArchivalistHarnessSafety.stage_core_name(RUN_ID, 'candidate', 'pui')
   CORE_PUI_FALLBACK    = ArchivalistHarnessSafety.stage_core_name(RUN_ID, 'fallback', 'pui')
 
+  CORE_PUI_ABLATION    = PUI_ABLATION_ENABLED ? ArchivalistHarnessSafety.stage_core_name(RUN_ID, 'ablation', 'pui') : nil
+
   ALL_STAGE_CORES = [
     CORE_STAFF_NATIVE, CORE_STAFF_CANDIDATE, CORE_STAFF_FALLBACK,
-    CORE_PUI_NATIVE, CORE_PUI_CANDIDATE, CORE_PUI_FALLBACK
-  ].freeze
+    CORE_PUI_NATIVE, CORE_PUI_CANDIDATE, CORE_PUI_FALLBACK,
+    CORE_PUI_ABLATION
+  ].compact.freeze
 
   AUXILIARY_PRIMARY_TYPES = [
     'resource_ordered_records',
@@ -106,7 +116,11 @@ if __FILE__ == $PROGRAM_NAME
   puts "Backend URL: #{BACKEND_BASE}"
   puts "Solr Base: #{SOLR_BASE}"
   puts "Target Repository ID: #{REPO_ID}"
-  puts "Warm Repeats: #{REPEATS}"
+  puts "Warm Repeats: #{REPEATS} (warmup passes per mode: #{WARMUP_PASSES})"
+  puts "PUI Ablation: #{PUI_ABLATION_ENABLED ? "enabled (core #{CORE_PUI_ABLATION})" : 'disabled'}"
+  puts "Payload Accounting: #{PAYLOAD_ACCOUNTING_ENABLED ? 'enabled (dedicated untimed passes)' : 'disabled'}"
+  puts "Ruby-side Timing: #{ENV['ARCHIVALIST_RUBY_SIDE_TIMING'].to_s =~ /\A(1|true|yes|on)\z/i ? 'enabled (coarse exclusive timers, all timed passes)' : 'disabled'}"
+  puts "Sidecar Index Timing: #{ENV['ARCHIVALIST_SIDECAR_INDEX_TIMING'].to_s =~ /\A(1|true|yes|on)\z/i ? 'enabled (Server-Timing header aggregated per pass)' : 'disabled'}"
   puts "Sidecar URL: #{SIDECAR_URL}"
   puts "Target Staff Cores: #{CORE_STAFF_NATIVE}, #{CORE_STAFF_CANDIDATE}, #{CORE_STAFF_FALLBACK}"
   puts "Target PUI Cores:   #{CORE_PUI_NATIVE}, #{CORE_PUI_CANDIDATE}, #{CORE_PUI_FALLBACK}"
@@ -119,6 +133,13 @@ if __FILE__ == $PROGRAM_NAME
   unless ArchivalistHarnessSafety.valid_solr_url?(SOLR_BASE)
     raise "Safety violation: Invalid or unapproved Solr URL '#{SOLR_BASE}'"
   end
+
+  # Resolve and fingerprint the sidecar binary before any core is created (fails closed).
+  SIDECAR_BINARY = ArchivalistHarnessSafety.resolve_sidecar_binary
+  SOURCE_PROVENANCE = ArchivalistHarnessSafety.source_provenance
+  puts "Sidecar Binary: #{SIDECAR_BINARY['path']} (#{SIDECAR_BINARY['build_mode']}#{SIDECAR_BINARY['override'] ? ', override' : ''})"
+  puts "Sidecar SHA-256: #{SIDECAR_BINARY['sha256']} (expected: #{SIDECAR_BINARY['expected_sha256'] || 'not supplied'})"
+  puts "Source: commit #{SOURCE_PROVENANCE['git_commit']}, dirty=#{SOURCE_PROVENANCE['git_dirty']}"
 
   # Helper to save incremental evidence immediately
   def save_incremental_step(step_name, data)
@@ -148,6 +169,29 @@ if __FILE__ == $PROGRAM_NAME
   require 'periodic_indexer'
   require 'pui_indexer'
   require 'large_tree_doc_indexer'
+  require_relative 'archivalist_sidecar_timing'
+
+  # Opt-in sidecar Server-Timing aggregation (ARCHIVALIST_SIDECAR_INDEX_TIMING=1). The stage
+  # sidecar inherits the variable and emits the header; this hook only reads it and times each
+  # HTTP round trip. Off by default: nothing is installed.
+  SIDECAR_TIMING_ENABLED = ArchivalistSidecarTiming.enabled?
+  ArchivalistSidecarTiming.install!(RustIndexDocumentBuilder) if SIDECAR_TIMING_ENABLED
+
+  # Opt-in coarse Ruby-side timers (ARCHIVALIST_RUBY_SIDE_TIMING=1): exclusive wall time per
+  # category for every timed pass, native passes included. Off by default: nothing is installed.
+  require_relative 'archivalist_ruby_side_timing'
+  RUBY_SIDE_TIMING_ENABLED = ArchivalistRubySideTiming.enabled?
+  if RUBY_SIDE_TIMING_ENABLED
+    if ENV['ARCHIVALIST_PROFILE'] == '1'
+      raise 'ARCHIVALIST_RUBY_SIDE_TIMING and ARCHIVALIST_PROFILE wrap the same methods; run them separately'
+    end
+    RUBY_SIDE_TIMING_HOOKS = ArchivalistRubySideTiming.install!(
+      builder_class: RustIndexDocumentBuilder, indexer_common: IndexerCommon, pui_indexer: PUIIndexer,
+      record_inheritance: RecordInheritance, asutils: ASUtils
+    )
+    puts "Ruby-side timing hooks: #{RUBY_SIDE_TIMING_HOOKS.transform_values(&:length).inspect}; " \
+         "calibrated #{(ArchivalistRubySideTiming::CALIBRATION[:per_call_ms] * 1000.0).round(2)} us per timer call"
+  end
 
   # Opt-in aggregate profiling (ARCHIVALIST_PROFILE=1). Off by default: nothing is wrapped and
   # no timing/behavior changes unless explicitly enabled.
@@ -426,9 +470,9 @@ if __FILE__ == $PROGRAM_NAME
   save_incremental_step('step1_fetch_provenance', fetch_provenance)
 
   # ============================================================================
-  # STEP 2: Initialize 6 Stage-Owned Unique Solr Cores
+  # STEP 2: Initialize Stage-Owned Unique Solr Cores (6, plus 1 ablation core when enabled)
   # ============================================================================
-  puts "\n--- Step 2: Initializing 6 Stage-Owned Unique Solr Cores ---"
+  puts "\n--- Step 2: Initializing #{ALL_STAGE_CORES.length} Stage-Owned Unique Solr Cores ---"
   ALL_STAGE_CORES.each do |core|
     ArchivalistHarnessSafety.ensure_stage_core(core, RUN_ID, solr_base: SOLR_BASE)
     puts "  [Core] Verified isolated stage core created: #{core}"
@@ -471,7 +515,9 @@ if __FILE__ == $PROGRAM_NAME
     if options[:builder_enabled]
       RustIndexDocumentBuilder.define_method(:build) do |inputs|
         instrumentation['builder_calls'] += 1
-        res = profile_measure('builder_build') { orig_builder_build.bind(self).call(inputs) }
+        res = ArchivalistRubySideTiming.measure('builder_build') do
+          profile_measure('builder_build') { orig_builder_build.bind(self).call(inputs) }
+        end
         instrumentation['builder_projections_received'] += res.length if res.is_a?(Hash)
         res
       end
@@ -521,6 +567,11 @@ if __FILE__ == $PROGRAM_NAME
     end
 
     profile_snapshot = nil
+    sidecar_timing_on = SIDECAR_TIMING_ENABLED && options[:builder_enabled]
+    timing_calls = nil
+    ArchivalistSidecarTiming.start! if sidecar_timing_on
+    ruby_timing_raw = nil
+    ArchivalistRubySideTiming.start! if RUBY_SIDE_TIMING_ENABLED
     start_wall = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     begin
       _, profile_snapshot = run_with_optional_profile do
@@ -529,10 +580,14 @@ if __FILE__ == $PROGRAM_NAME
         end
       end
     ensure
+      timing_calls = ArchivalistSidecarTiming.stop! if sidecar_timing_on
+      ruby_timing_raw = ArchivalistRubySideTiming.stop! if RUBY_SIDE_TIMING_ENABLED
       RustIndexDocumentBuilder.define_method(:build, orig_builder_build)
     end
     end_wall = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     wall_ms = ((end_wall - start_wall) * 1000.0).round(2)
+    sidecar_timing = timing_calls && ArchivalistSidecarTiming.summarize(timing_calls, wall_ms)
+    ruby_side_timing = ruby_timing_raw && ArchivalistRubySideTiming.summarize(ruby_timing_raw, wall_ms)
 
     if options[:builder_enabled]
       instrumentation['accepted_builder_mappings'] = records_input.length - instrumentation['native_fallbacks']
@@ -547,6 +602,8 @@ if __FILE__ == $PROGRAM_NAME
       'doc_count' => docs.length,
       'docs' => docs,
       'instrumentation' => instrumentation,
+      'sidecar_timing' => sidecar_timing,
+      'ruby_side_timing' => ruby_side_timing,
       'profile_snapshot' => profile_snapshot
     }
   end
@@ -590,14 +647,18 @@ if __FILE__ == $PROGRAM_NAME
     if options[:builder_enabled]
       RustIndexDocumentBuilder.define_method(:build) do |inputs|
         instrumentation['builder_calls'] += 1
-        res = profile_measure('builder_build') { orig_builder_build.bind(self).call(inputs) }
+        res = ArchivalistRubySideTiming.measure('builder_build') do
+          profile_measure('builder_build') { orig_builder_build.bind(self).call(inputs) }
+        end
         instrumentation['builder_projections_received'] += res.length if res.is_a?(Hash)
         res
       end
 
       RustIndexDocumentBuilder.define_method(:build_pui_auxiliary) do |inputs|
         instrumentation['auxiliary_builder_calls'] += 1
-        res = profile_measure('builder_build_pui_auxiliary') { orig_builder_aux.bind(self).call(inputs) }
+        res = ArchivalistRubySideTiming.measure('builder_build') do
+          profile_measure('builder_build_pui_auxiliary') { orig_builder_aux.bind(self).call(inputs) }
+        end
         instrumentation['auxiliary_docs_received'] += res.length if res.is_a?(Array)
         res
       end
@@ -664,6 +725,11 @@ if __FILE__ == $PROGRAM_NAME
     end
 
     profile_snapshot = nil
+    sidecar_timing_on = SIDECAR_TIMING_ENABLED && options[:builder_enabled]
+    timing_calls = nil
+    ArchivalistSidecarTiming.start! if sidecar_timing_on
+    ruby_timing_raw = nil
+    ArchivalistRubySideTiming.start! if RUBY_SIDE_TIMING_ENABLED
     start_wall = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     begin
       _, profile_snapshot = run_with_optional_profile do
@@ -685,11 +751,15 @@ if __FILE__ == $PROGRAM_NAME
         end
       end
     ensure
+      timing_calls = ArchivalistSidecarTiming.stop! if sidecar_timing_on
+      ruby_timing_raw = ArchivalistRubySideTiming.stop! if RUBY_SIDE_TIMING_ENABLED
       RustIndexDocumentBuilder.define_method(:build, orig_builder_build)
       RustIndexDocumentBuilder.define_method(:build_pui_auxiliary, orig_builder_aux)
     end
     end_wall = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     wall_ms = ((end_wall - start_wall) * 1000.0).round(2)
+    sidecar_timing = timing_calls && ArchivalistSidecarTiming.summarize(timing_calls, wall_ms)
+    ruby_side_timing = ruby_timing_raw && ArchivalistRubySideTiming.summarize(ruby_timing_raw, wall_ms)
 
     commit_solr(target_core)
     all_docs = fetch_all_solr_docs(target_core)
@@ -720,20 +790,31 @@ if __FILE__ == $PROGRAM_NAME
       'auxiliary_docs' => auxiliary_docs,
       'other_ordinary_docs' => other_ordinary_docs,
       'instrumentation' => instrumentation,
+      'sidecar_timing' => sidecar_timing,
+      'ruby_side_timing' => ruby_side_timing,
       'profile_snapshot' => profile_snapshot
     }
   end
 
-  def benchmark_mode(label, repeats: 3, &block)
-    # Warmup pass
-    puts "    [#{label}] Warmup pass..."
-    block.call
+  def benchmark_mode(label, repeats: 3, warmups: WARMUP_PASSES, profile: true, &block)
+    # Warmup passes: excluded from the median, but their wall times are recorded so JIT
+    # warm-up effects stay visible in the evidence.
+    warmup_timings = []
+    warmups.times do |iter|
+      wres = block.call
+      warmup_timings << wres['wall_ms']
+      puts "    [#{label}] Warmup #{iter + 1}/#{warmups}: #{wres['wall_ms']} ms (excluded)"
+    end
 
     timings = []
+    sidecar_timings = []
+    ruby_side_timings = []
     last_res = nil
     repeats.times do |iter|
       res = block.call
       timings << res['wall_ms']
+      sidecar_timings << res['sidecar_timing'] if res['sidecar_timing']
+      ruby_side_timings << res['ruby_side_timing'] if res['ruby_side_timing']
       last_res = res
       puts "    [#{label}] Repeat #{iter + 1}/#{repeats}: #{res['wall_ms']} ms"
     end
@@ -743,7 +824,7 @@ if __FILE__ == $PROGRAM_NAME
     # Optional profiled repeats AFTER the uninstrumented measurements (same warm process, same
     # snapshot). They rewrite identical documents into the same stage core; `last_res` (used for
     # parity) is always from an uninstrumented repeat.
-    if PROFILE_ENABLED
+    if PROFILE_ENABLED && profile
       profiled = []
       PROFILE_REPEATS.times do |iter|
         PROFILE_STATE[:profile_this_pass] = true
@@ -773,8 +854,14 @@ if __FILE__ == $PROGRAM_NAME
     {
       'label' => label,
       'repeats' => repeats,
+      'warmups' => warmups,
+      'warmup_timings' => warmup_timings,
       'raw_timings' => timings,
       'median_ms' => median,
+      'sidecar_timing_raw' => sidecar_timings,
+      'sidecar_timing_median' => ArchivalistSidecarTiming.median_summary(sidecar_timings),
+      'ruby_side_timing_raw' => ruby_side_timings,
+      'ruby_side_timing_median' => ArchivalistRubySideTiming.median_summary(ruby_side_timings),
       'last_result' => last_res
     }
   end
@@ -815,9 +902,13 @@ if __FILE__ == $PROGRAM_NAME
     port: SIDECAR_PORT,
     solr_url: SOLR_BASE,
     collection: CORE_PUI_CANDIDATE,
-    run_id: RUN_ID
+    run_id: RUN_ID,
+    binary_path: SIDECAR_BINARY['path'],
+    expected_sha256: SIDECAR_BINARY['sha256']
   )
+  SIDECAR_BINARY.merge!(JSON.parse(File.read(stage_state_file))['launched_binary'])
   puts "Stage sidecar spawned on port #{SIDECAR_PORT} (State: #{stage_state_file})"
+  puts "Launched sidecar verified: #{SIDECAR_BINARY['launched_exe']} sha256=#{SIDECAR_BINARY['launched_sha256']}"
 
   health_uri = URI("#{SIDECAR_URL}/health")
   health_res = Net::HTTP.get_response(health_uri)
@@ -833,6 +924,8 @@ if __FILE__ == $PROGRAM_NAME
   save_incremental_step('step4_sidecar', {
     'sidecar_url' => SIDECAR_URL,
     'sidecar_port' => SIDECAR_PORT,
+    'sidecar_binary' => SIDECAR_BINARY,
+    'source_provenance' => SOURCE_PROVENANCE,
     'state_file' => stage_state_file,
     'health' => health_json,
     'initial_requests_total' => initial_req_total
@@ -867,6 +960,33 @@ if __FILE__ == $PROGRAM_NAME
     run_pui_indexing_pass(CORE_PUI_CANDIDATE, pui_records_snapshot, resource_uris, tree_uris, pui_candidate_options)
   end
   puts "PUI Candidate Median: #{pui_cand_bench['median_ms']} ms"
+  [['STAFF', staff_cand_bench], ['PUI', pui_cand_bench]].each do |mode, bench|
+    st = bench['sidecar_timing_median']
+    next unless st
+
+    phases = st['server_phase_ms'].map { |k, v| "#{k}=#{v}" }.join(' ')
+    puts "#{mode} Candidate Sidecar Timing (medians): #{st['calls']} calls; rust_server=#{st['rust_server_ms']} ms (#{phases}); " \
+         "round_trip=#{st['round_trip_ms']} ms; transport+http=#{st['transport_and_http_ms']} ms; outside_sidecar=#{st['outside_sidecar_ms']} ms"
+  end
+  [['STAFF', staff_native_bench, staff_cand_bench], ['PUI', pui_native_bench, pui_cand_bench]].each do |mode, native, cand|
+    nt = native['ruby_side_timing_median']
+    ct = cand['ruby_side_timing_median']
+    next unless nt && ct
+
+    puts "#{mode} Ruby-side timing (exclusive ms, medians): category | native | candidate | delta"
+    (ct['category_ms'].keys | nt['category_ms'].keys).each do |cat|
+      n = nt['category_ms'].fetch(cat, 0.0)
+      c = ct['category_ms'].fetch(cat, 0.0)
+      puts format('  %-32s %10.1f %10.1f %+10.1f', cat, n, c, c - n)
+    end
+    # Single-threaded passes report unattributed_ms; if worker threads appear, use the coordinating
+    # thread's wall remainder instead (summed thread time has no single wall remainder).
+    nu = nt['unattributed_ms'] || nt['main_thread_unattributed_ms'] || 0.0
+    cu = ct['unattributed_ms'] || ct['main_thread_unattributed_ms'] || 0.0
+    puts format('  %-32s %10.1f %10.1f %+10.1f', 'unattributed', nu, cu, cu - nu)
+    puts "  estimated timer overhead: native #{nt['estimated_timer_overhead_ms']} ms (#{nt['timer_calls']} calls), " \
+         "candidate #{ct['estimated_timer_overhead_ms']} ms (#{ct['timer_calls']} calls)"
+  end
 
   post_cand_metrics = get_sidecar_metrics
   post_cand_req_total = post_cand_metrics['archivalist_sidecar_requests_total'] || 0
@@ -928,8 +1048,105 @@ if __FILE__ == $PROGRAM_NAME
     'pui_median_ms' => pui_cand_bench['median_ms'],
     'pui_raw_timings' => pui_cand_bench['raw_timings'],
     'pui_instrumentation' => pui_inst,
+    'staff_sidecar_timing_median' => staff_cand_bench['sidecar_timing_median'],
+    'staff_ruby_side_timing_median' => { 'native' => staff_native_bench['ruby_side_timing_median'], 'candidate' => staff_cand_bench['ruby_side_timing_median'] },
+    'pui_ruby_side_timing_median' => { 'native' => pui_native_bench['ruby_side_timing_median'], 'candidate' => pui_cand_bench['ruby_side_timing_median'] },
+    'pui_sidecar_timing_median' => pui_cand_bench['sidecar_timing_median'],
+    'staff_sidecar_timing_raw' => staff_cand_bench['sidecar_timing_raw'],
+    'pui_sidecar_timing_raw' => pui_cand_bench['sidecar_timing_raw'],
     'sidecar_delta' => sidecar_delta
   })
+
+  # ============================================================================
+  # STEP 5a (opt-in): PUI Feature Ablation, no profiler
+  # ============================================================================
+  # Each configuration runs the full PUI pass with a subset of Rust capabilities, measured with
+  # the same warmups/repeats as the main modes and an adjacent native baseline, all writing to
+  # the dedicated ablation core. Deltas are against that adjacent native median and are NOT
+  # guaranteed to be additive. The inheritance candidate only activates together with document
+  # preparation (IndexerCommon#rust_pui_record_inheritance_candidate_enabled?). Ablation is
+  # diagnostic: a configuration whose projections are rejected (native fallback) is recorded with
+  # valid_measurement=false instead of aborting the gate; a document-count mismatch still aborts.
+  pui_ablation = nil
+  if PUI_ABLATION_ENABLED
+    puts "\n--- Step 5a: PUI Feature Ablation (no profiler) ---"
+    sidecar_on = { builder_enabled: true, sidecar_url: SIDECAR_URL }
+    ablation_configs = [
+      ['native', { builder_enabled: false }],
+      ['builder_only', sidecar_on],
+      ['document_preparation', sidecar_on.merge(pui_prep_enabled: true)],
+      ['document_preparation+inheritance_candidate', sidecar_on.merge(pui_prep_enabled: true, candidate_enabled: true)],
+      ['common_metadata', sidecar_on.merge(common_meta_enabled: true)],
+      ['document_preparation+common_metadata', sidecar_on.merge(pui_prep_enabled: true, common_meta_enabled: true)],
+      ['auxiliary_documents', sidecar_on.merge(aux_enabled: true)],
+      ['all', pui_candidate_options]
+    ]
+    pui_ablation = { 'core' => CORE_PUI_ABLATION, 'configs' => {} }
+    ablation_configs.each do |name, options|
+      puts "  Ablation config: #{name}"
+      bench = benchmark_mode("pui_ablation_#{name}", repeats: REPEATS, profile: false) do
+        run_pui_indexing_pass(CORE_PUI_ABLATION, pui_records_snapshot, resource_uris, tree_uris, options)
+      end
+      inst = bench['last_result']['instrumentation']
+      doc_count = bench['last_result']['doc_count']
+      puts "    WARNING: #{inst['rejections']} projections rejected (native fallback); not a valid measurement" unless inst['rejections'] == 0
+      unless doc_count == pui_native_bench['last_result']['doc_count']
+        raise "PUI ablation #{name}: doc count #{doc_count} != native #{pui_native_bench['last_result']['doc_count']}"
+      end
+      pui_ablation['configs'][name] = {
+        'flags' => options.reject { |k, _| k == :sidecar_url }.transform_keys(&:to_s),
+        'median_ms' => bench['median_ms'],
+        'raw_timings' => bench['raw_timings'],
+        'warmup_timings' => bench['warmup_timings'],
+        'builder_calls' => inst['builder_calls'],
+        'auxiliary_builder_calls' => inst['auxiliary_builder_calls'],
+        'rejections' => inst['rejections'],
+        'valid_measurement' => inst['rejections'] == 0,
+        'sidecar_timing_median' => bench['sidecar_timing_median'],
+        'ruby_side_timing_median' => bench['ruby_side_timing_median'],
+        'doc_count' => doc_count
+      }
+    end
+    ablation_native = pui_ablation['configs']['native']['median_ms'].to_f
+    pui_ablation['configs'].each do |name, cfg|
+      cfg['delta_vs_adjacent_native_ms'] = (cfg['median_ms'].to_f - ablation_native).round(2)
+      cfg['ratio_vs_adjacent_native'] = (cfg['median_ms'].to_f / ablation_native).round(2)
+      flag = cfg['valid_measurement'] ? '' : '  [INVALID: native fallback]'
+      puts "  #{name.ljust(44)} median #{cfg['median_ms']} ms  delta #{cfg['delta_vs_adjacent_native_ms']} ms  (#{cfg['ratio_vs_adjacent_native']}x)#{flag}"
+    end
+    save_incremental_step('step5a_pui_ablation', pui_ablation)
+  end
+
+  # ============================================================================
+  # STEP 5b (opt-in): Payload Byte Accounting on dedicated untimed passes
+  # ============================================================================
+  # Installed only here, after every timed candidate measurement. Each accounting pass re-parses
+  # all request/response bodies, so its wall time is recorded only as not comparable. The
+  # inactive hook remains installed for the outage-fallback passes (one extra method frame per
+  # sidecar call attempt; documented, not measured).
+  payload_accounting = nil
+  if PAYLOAD_ACCOUNTING_ENABLED
+    puts "\n--- Step 5b: Payload Byte Accounting (dedicated passes, timings not comparable) ---"
+    require_relative 'archivalist_payload_accounting'
+    ArchivalistPayloadAccounting.install!(RustIndexDocumentBuilder)
+    payload_accounting = {}
+    [
+      ['staff_candidate', -> { run_staff_indexing_pass(CORE_STAFF_CANDIDATE, staff_records_snapshot, staff_candidate_options) }],
+      ['pui_candidate', -> { run_pui_indexing_pass(CORE_PUI_CANDIDATE, pui_records_snapshot, resource_uris, tree_uris, pui_candidate_options) }]
+    ].each do |label, pass|
+      res, summary = ArchivalistPayloadAccounting.capture { pass.call }
+      raise "Payload accounting #{label}: rejections detected" unless res['instrumentation']['rejections'] == 0
+      summary['accounting_pass_wall_ms_not_comparable'] = res['wall_ms']
+      payload_accounting[label] = summary
+      puts "  #{label}: #{summary['calls']} calls, request #{summary['request_bytes']} B, response #{summary['response_bytes']} B"
+      top = summary['request_field_bytes'].first(3).map { |k, v| "#{k}=#{v}" }.join(', ')
+      puts "    top request fields: #{top}"
+      dup = summary['duplicates']
+      puts "    inputs #{dup['inputs_with_uri']} for #{dup['distinct_uris']} URIs (max #{dup['max_sends_per_uri']} sends); " \
+           "ancestor entries #{dup['ancestor_entries']} (#{dup['distinct_ancestor_entries']} distinct, #{dup['redundant_identical_ancestor_bytes']} redundant B)"
+    end
+    save_incremental_step('step5b_payload_accounting', payload_accounting)
+  end
 
   # ============================================================================
   # STEP 6: Verified Process Stop & Outage Fallback Indexing
@@ -1276,6 +1493,8 @@ if __FILE__ == $PROGRAM_NAME
     'jruby_description' => RUBY_DESCRIPTION,
     'solr_base' => SOLR_BASE,
     'backend_base' => BACKEND_BASE,
+    'sidecar_binary' => SIDECAR_BINARY,
+    'source_provenance' => SOURCE_PROVENANCE,
     'repository' => {
       'id' => REPO_ID,
       'uri' => repo_uri,
@@ -1305,8 +1524,13 @@ if __FILE__ == $PROGRAM_NAME
         'repeats' => REPEATS,
         'native_median_ms' => staff_native_bench['median_ms'],
         'native_raw_timings' => staff_native_bench['raw_timings'],
+        'native_warmup_timings' => staff_native_bench['warmup_timings'],
         'candidate_median_ms' => staff_cand_bench['median_ms'],
         'candidate_raw_timings' => staff_cand_bench['raw_timings'],
+        'candidate_warmup_timings' => staff_cand_bench['warmup_timings'],
+        'candidate_sidecar_timing_median' => staff_cand_bench['sidecar_timing_median'],
+        'native_ruby_side_timing_median' => staff_native_bench['ruby_side_timing_median'],
+        'candidate_ruby_side_timing_median' => staff_cand_bench['ruby_side_timing_median'],
         'fallback_median_ms' => staff_fallback_bench['median_ms'],
         'fallback_raw_timings' => staff_fallback_bench['raw_timings'],
         'candidate_to_native_ratio' => staff_ratio
@@ -1319,13 +1543,21 @@ if __FILE__ == $PROGRAM_NAME
         'repeats' => REPEATS,
         'native_median_ms' => pui_native_bench['median_ms'],
         'native_raw_timings' => pui_native_bench['raw_timings'],
+        'native_warmup_timings' => pui_native_bench['warmup_timings'],
         'candidate_median_ms' => pui_cand_bench['median_ms'],
         'candidate_raw_timings' => pui_cand_bench['raw_timings'],
+        'candidate_warmup_timings' => pui_cand_bench['warmup_timings'],
+        'candidate_sidecar_timing_median' => pui_cand_bench['sidecar_timing_median'],
+        'native_ruby_side_timing_median' => pui_native_bench['ruby_side_timing_median'],
+        'candidate_ruby_side_timing_median' => pui_cand_bench['ruby_side_timing_median'],
         'fallback_median_ms' => pui_fallback_bench['median_ms'],
         'fallback_raw_timings' => pui_fallback_bench['raw_timings'],
         'candidate_to_native_ratio' => pui_ratio
-      }
+      },
+      'warmup_passes_per_mode' => WARMUP_PASSES
     },
+    'pui_ablation' => pui_ablation || 'disabled',
+    'payload_accounting' => payload_accounting || 'disabled',
     'sidecar_verification' => {
       'port' => SIDECAR_PORT,
       'requests_delta' => sidecar_delta,
